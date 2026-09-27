@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Full-Duplex Voice Demo</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+  body { max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.3rem; }
+  #status { font-size: 0.95rem; margin: 1rem 0; }
+  button { padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer; }
+  .mic-on { color: #7CFC00; }
+  .duck { color: #FFB347; }
+  .aborted { color: #FF6B6B; }
+  .row { display: flex; gap: 0.5rem; margin: 1rem 0; }
+  input[type="text"] { flex: 1; padding: 0.5rem; font-size: 1rem; }
+  #log { border: 1px solid #444; border-radius: 8px; padding: 0.5rem 1rem;
+         height: 200px; overflow-y: auto; font-size: 0.85rem; }
+  #log div { white-space: pre-wrap; }
+  .hint { color: #888; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>Full-Duplex Korean Voice Demo</h1>
+<p id="status">idle</p>
+<button id="start">Start session</button>
+<div class="row">
+  <input id="inject" type="text" placeholder="개발용 텍스트 주입 (dev.allow_text_injection 필요)" />
+  <button id="send">Send</button>
+</div>
+<div id="log"></div>
+<p class="hint">
+  Audio: capture at the browser's real rate, 20 ms frames, i16le over WebSocket.
+  Playback: 24 kHz. The server resamples to 16 kHz for the recognizer.
+  The server ducks on mic onset, confirms intent, and resumes or aborts.
+</p>
+
+<script>
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const startBtn = document.getElementById('start');
+const injectInput = document.getElementById('inject');
+const sendBtn = document.getElementById('send');
+
+function log(text) {
+  const line = document.createElement('div');
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || '';
+}
+
+let ws = null;
+let mediaStream = null;
+let captureCtx = null;
+let playbackCtx = null;
+let gainNode = null;
+let running = false;
+
+const playback = {
+  speechId: null,
+  speechEpoch: 0,
+  sampleRate: 24000,
+  doneSignaled: false,
+  queue: [],
+  nextTime: 0,
+  playedSamples: 0,
+  startedAt: 0,
+};
+
+function toInt16(view) {
+  const out = new Int16Array(view.length);
+  for (let i = 0; i < view.length; i++) {
+    const s = Math.max(-1, Math.min(1, view[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return out;
+}
+
+const workletCode = `
+class CaptureProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.sequence = 0;
+    // Frame size follows the context's real sample rate: browsers are free to
+    // ignore the requested rate, and a hardcoded 960 would silently change the
+    // frame duration the server's VAD hysteresis is tuned for.
+    const frameSamples = (options && options.processorOptions && options.processorOptions.frameSamples) || 960;
+    this.buffer = new Float32Array(frameSamples);
+    this.offset = 0;
+  }
+
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input[0]) {
+      const channel = input[0];
+      for (let i = 0; i < channel.length && this.offset < this.buffer.length; i++) {
+        this.buffer[this.offset++] = channel[i];
+      }
+
+      if (this.offset === this.buffer.length) {
+        const header = new ArrayBuffer(8);
+        new DataView(header).setBigUint64(0, BigInt(++this.sequence), true);
+        const pcm = new Int16Array(this.buffer.length);
+        for (let i = 0; i < this.buffer.length; i++) {
+          const s = Math.max(-1, Math.min(1, this.buffer[i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        const merged = new Uint8Array(8 + pcm.length * 2);
+        merged.set(new Uint8Array(header), 0);
+        merged.set(new Uint8Array(pcm.buffer), 8);
+        this.port.postMessage(merged, [merged.buffer]);
+        this.offset = 0;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor('capture-processor', CaptureProcessor);
+`;
+
+function sendControl(message) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(message));
+  }
+}
+
+function scheduleChunk(pcmInt16, sequence) {
+  if (!playbackCtx) return;
+
+  const floats = new Float32Array(pcmInt16.length);
+  for (let i = 0; i < pcmInt16.length; i++) floats[i] = pcmInt16[i] / 32768.0;
+
+  const buffer = playbackCtx.createBuffer(1, floats.length, playback.sampleRate);
+  buffer.copyToChannel(floats, 0);
+
+  if (playback.nextTime < playbackCtx.currentTime) {
+    playback.nextTime = playbackCtx.currentTime;
+  }
+
+  const source = playbackCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(gainNode);
+
+  const startAt = playback.nextTime;
+  source.start(startAt);
+  playback.nextTime = startAt + floats.length / playback.sampleRate;
+
+  const speechId = playback.speechId;
+  const speechEpoch = playback.speechEpoch;
+
+  source.onended = () => {
+    const index = playback.queue.indexOf(source);
+    if (index >= 0) playback.queue.splice(index, 1);
+
+    // source.stop() during an abort also fires onended. The active speech id
+    // has already changed in that case, so do not emit a false completion.
+    if (playback.speechId !== speechId) return;
+
+    playback.playedSamples += floats.length;
+    sendControl({
+      type: 'playback_chunk_completed',
+      speech_id: speechId,
+      speech_epoch: speechEpoch,
+      sequence,
+      played_samples: playback.playedSamples,
+    });
+
+    if (playback.doneSignaled && playback.queue.length === 0) {
+      sendControl({
+        type: 'playback_completed',
+        speech_id: speechId,
+        speech_epoch: speechEpoch,
+      });
+      playback.speechId = null;
+      playback.doneSignaled = false;
+      setStatus('listening', 'mic-on');
+    }
+  };
+
+  playback.queue.push(source);
+}
+
+function clearPlayback(interrupted) {
+  for (const source of playback.queue) {
+    try { source.stop(); } catch (e) {}
+  }
+  playback.queue.length = 0;
+  playback.nextTime = 0;
+
+  if (interrupted && playback.speechId) {
+    sendControl({
+      type: 'playback_interrupted',
+      speech_id: playback.speechId,
+      speech_epoch: playback.speechEpoch,
+      played_samples: playback.playedSamples,
+    });
+    setStatus('speech interrupted', 'aborted');
+  }
+
+  playback.speechId = null;
+  playback.doneSignaled = false;
+  playback.playedSamples = 0;
+}
+
+function handleServerMessage(event) {
+  if (typeof event.data === 'string') {
+    const message = JSON.parse(event.data);
+    switch (message.type) {
+      case 'speech_started':
+        playback.speechId = message.speech_id;
+        playback.speechEpoch = message.speech_epoch;
+        playback.sampleRate = message.sample_rate || 24000;
+        playback.doneSignaled = false;
+        playback.playedSamples = 0;
+        playback.nextTime = 0;
+        setStatus('assistant speaking', 'mic-on');
+        log(`speech started ${message.speech_id}`);
+        break;
+
+      case 'speech_done':
+        playback.doneSignaled = true;
+        if (playback.queue.length === 0 && playback.speechId) {
+          sendControl({
+            type: 'playback_completed',
+            speech_id: playback.speechId,
+            speech_epoch: playback.speechEpoch,
+          });
+          playback.speechId = null;
+          playback.doneSignaled = false;
+        }
+        break;
+
+      case 'playback_duck': {
+        const target = message.gain ?? 0.15;
+        const fade = (message.fade_ms ?? 60) / 1000;
+        gainNode.gain.cancelScheduledValues(playbackCtx.currentTime);
+        gainNode.gain.setTargetAtTime(target, playbackCtx.currentTime, fade / 3);
+        setStatus('ducked (user speaking?)', 'duck');
+        log(`duck gain=${target}`);
+        break;
+      }
+
+      case 'playback_resume': {
+        const target = message.gain ?? 1.0;
+        const fade = (message.fade_ms ?? 60) / 1000;
+        gainNode.gain.cancelScheduledValues(playbackCtx.currentTime);
+        gainNode.gain.setTargetAtTime(target, playbackCtx.currentTime, fade / 3);
+        setStatus('assistant speaking', 'mic-on');
+        log('resume');
+        break;
+      }
+
+      case 'playback_abort':
+        clearPlayback(true);
+        log(`abort reason=${message.reason}`);
+        break;
+
+      case 'playback_clear':
+        clearPlayback(false);
+        break;
+
+      case 'session_stopped':
+        setStatus('session stopped');
+        break;
+
+      case 'injection_rejected':
+        log(`injection rejected: ${message.reason}`);
+        break;
+
+      default:
+        log(`server: ${event.data}`);
+    }
+    return;
+  }
+
+  const buffer = event.data;
+  const view = new DataView(buffer);
+  const sequence = Number(view.getBigUint64(0, true));
+  const pcm = new Int16Array(buffer, 8, (buffer.byteLength - 8) / 2);
+  scheduleChunk(pcm, sequence);
+}
+
+async function startSession() {
+  if (running) return;
+  running = true;
+  startBtn.disabled = true;
+
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${protocol}//${location.host}/api/voice/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = handleServerMessage;
+  ws.onclose = () => { setStatus('disconnected'); running = false; startBtn.disabled = false; };
+
+  await new Promise((resolve) => { ws.onopen = resolve; });
+
+  playbackCtx = new AudioContext({ sampleRate: 24000 });
+  gainNode = playbackCtx.createGain();
+  gainNode.connect(playbackCtx.destination);
+
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      sampleRate: 48000,
+    },
+    video: false,
+  });
+
+  captureCtx = new AudioContext({ sampleRate: 48000 });
+
+  // The browser may have ignored the requested rate. Everything downstream
+  // (frame size, server-side resampling) must follow the real one.
+  const captureRate = captureCtx.sampleRate;
+  const frameSamples = Math.round(captureRate * 0.02);
+  if (captureRate !== 48000) {
+    log(`capture rate is ${captureRate} Hz (requested 48000)`);
+  }
+
+  const source = captureCtx.createMediaStreamSource(mediaStream);
+  const blobUrl = URL.createObjectURL(
+    new Blob([workletCode], { type: 'application/javascript' })
+  );
+  await captureCtx.audioWorklet.addModule(blobUrl);
+  const worklet = new AudioWorkletNode(captureCtx, 'capture-processor', {
+    processorOptions: { frameSamples },
+  });
+
+  worklet.port.onmessage = (event) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(event.data);
+    }
+  };
+
+  source.connect(worklet);
+  worklet.connect(captureCtx.destination);
+
+  sendControl({
+    type: 'session_start',
+    input_sample_rate: captureRate,
+    channels: 1,
+  });
+
+  setStatus('listening', 'mic-on');
+  log(`session started; mic open at ${captureRate} Hz, ${frameSamples} samples/frame`);
+}
+
+window.addEventListener('beforeunload', () => {
+  sendControl({ type: 'session_stop' });
+});
+
+startBtn.onclick = startSession;
+
+sendBtn.onclick = () => {
+  const text = injectInput.value.trim();
+  if (!text) return;
+  sendControl({ type: 'inject_user_text', text });
+  log(`injected: ${text}`);
+  injectInput.value = '';
+};
+
+injectInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') sendBtn.onclick();
+});
+</script>
+</body>
+</html>

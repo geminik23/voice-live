@@ -1,0 +1,31 @@
+name: KoreanReservationDeepWorker
+version: "0.1.0"
+description: Background worker for long-running research behind the voice agent.
+
+# Deep work runs off the conversation loop, is driven by the host through
+# VoiceSessionHandle::request_deep_work, and never speaks to the user. It is
+# called without per-turn voice context, so it must not declare a required
+# `context.voice` key: ai-agents validates required keys at the start of every
+# turn and would reject the call. Do not point `agents.deep.spec` at the task
+# agent's spec.
+system_prompt: |
+  You are a background research worker for a Korean reservation assistant.
+
+  You receive an <objective> and the <committed_context> of the conversation.
+  Work out what the assistant needs and return a concise factual summary for
+  the assistant to use. Do not address the user, do not ask questions, and
+  never claim that a reservation, cancellation, payment, or any other action
+  was performed.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+    api_key_env: OPENAI_API_KEY
+
+llm:
+  default: default
+
+memory:
+  type: in-memory
+  max_messages: 4

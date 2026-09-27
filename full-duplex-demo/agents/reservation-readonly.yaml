@@ -1,0 +1,30 @@
+name: KoreanReservationReadOnlyAgent
+version: "0.1.0"
+description: Read-only speculative reservation availability agent.
+
+system_prompt: |
+  You are a read-only Korean reservation availability worker.
+
+  You may only call search_availability. Never claim that a reservation,
+  cancellation, payment, message, or any other write operation succeeded.
+  Use partial input only to prefetch likely availability and return a concise
+  internal summary for the authoritative task agent. Do not address the user.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+    api_key_env: OPENAI_API_KEY
+
+llm:
+  default: default
+
+streaming:
+  enabled: true
+  buffer_size: 128
+  include_tool_events: true
+  include_state_events: false
+
+memory:
+  type: in-memory
+  max_messages: 2

@@ -1,0 +1,6 @@
+/target
+
+# Private working material: design discussions, implementation plans, session
+# summaries, and onboarding drafts. Anything a future reader needs belongs in
+# ./docs instead. See AGENTS.md.
+temp/

@@ -1,0 +1,135 @@
+# Full-duplex Korean voice runtime configuration.
+#
+# Providers: "together" (Nemotron streaming ASR), "qwen" (DashScope realtime
+# TTS), "inject" (dev text injection), "mock" (offline fakes).
+# API keys are resolved from the environment, never from this file.
+
+version: 1
+
+session:
+  control_tick_ms: 40
+
+audio:
+  input_sample_rate_hz: 16000
+  output_sample_rate_hz: 24000
+  frame_ms: 20
+
+asr:
+  # `inject` is the keyless default: a silent recognizer plus the browser text
+  # box. Switch to `together` once TOGETHER_API_KEY is set.
+  provider: inject
+  model: nvidia/nemotron-3.5-asr-streaming-0.6b
+  endpoint: wss://api.together.xyz/realtime/v1/audio/transcriptions
+  api_key_env: TOGETHER_API_KEY
+  chunk_ms: 160
+  manual_commit: false
+  locale: ko-KR
+  partials:
+    enabled: true
+    stable_after_ms: 320
+    stable_revisions: 2
+
+tts:
+  provider: mock
+  model: qwen3-tts-flash
+  endpoint: wss://dashscope.aliyuncs.com/api/v1/inference/qwen3-tts/realtime
+  api_key_env: DASHSCOPE_API_KEY
+  # Leave blank: the voice id is read from `voice_env` so it stays out of the
+  # committed config.
+  voice: ""
+  voice_env: QWEN_VOICE_ID
+  sample_rate_hz: 24000
+  chunk_ms: 60
+  premade:
+    enabled: true
+    phrases:
+      - "네"
+      - "네, 확인했어요."
+
+turn_control:
+  soft_silence_ms: 500
+  hard_silence_ms: 1100
+  require_semantic_completion: true
+  barge_in:
+    duck_immediately: true
+    duck_gain: 0.15
+    duck_fade_ms: 60
+    confirm_ms: 240
+  backchannel:
+    enabled: true
+    minimum_interval_ms: 2500
+    maximum_per_user_turn: 2
+  # "아니" is deliberately absent: it is a common discourse marker and is
+  # classified as a correction cue instead of an immediate abort.
+  hard_stop_phrases:
+    - 잠깐
+    - 잠깐만
+    - 그만
+    - 멈춰
+    - 멈추세요
+    - 취소
+    - 취소해
+    - 정정할게
+
+agents:
+  interaction:
+    enabled: false
+    spec: ../agents/voice-interaction.yaml
+    minimum_interval_ms: 250
+    timeout_ms: 900
+  task:
+    spec: ../agents/reservation.yaml
+    timeout_ms: 30000
+  deep:
+    enabled: false
+    # A dedicated spec: the task agent's spec requires per-turn voice context,
+    # which deep work does not have.
+    spec: ../agents/deep-worker.yaml
+    timeout_ms: 60000
+  speculative:
+    enabled: false
+    spec: ../agents/reservation-readonly.yaml
+    allowed_tools:
+      - search_availability
+    minimum_intent_confidence: 0.85
+    maximum_parallel_tasks: 1
+    timeout_ms: 5000
+    allow_pure_read: true
+
+speech:
+  hard_stop_ack_text: "네, 멈췄어요."
+  # Speech state only advances on a client playback ACK; this releases the
+  # queue if a client disconnects mid-utterance.
+  playback_ack_timeout_ms: 15000
+  # Recent clauses kept for self-echo detection and the session summary.
+  # Durable history lives in the agent's memory, rewritten to what was heard.
+  audible_history_max_clauses: 64
+  progress_templates:
+    search_availability:
+      text: "조건에 맞는 곳을 확인하고 있어요."
+      minimum_expected_latency_ms: 1200
+      expire_after_ms: 4000
+
+tools:
+  effects:
+    search_availability: pure_read
+    reserve_restaurant: transactional_write
+
+vad:
+  onset_frames: 3
+  offset_frames: 12
+  onset_ratio: 4.0
+  offset_ratio: 2.0
+
+echo:
+  enabled: true
+  similarity_threshold: 0.82
+  min_chars: 4
+
+observability:
+  event_log: true
+  event_log_dir: target/voice-traces
+  include_sensitive_payloads: false
+
+dev:
+  allow_text_injection: true

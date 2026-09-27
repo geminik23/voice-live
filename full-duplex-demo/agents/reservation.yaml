@@ -1,0 +1,122 @@
+name: KoreanReservationVoiceAgent
+version: "0.1.0"
+description: Reservation task agent running inside the full-duplex voice runtime.
+
+system_prompt: |
+  You are a Korean reservation assistant operating inside a full-duplex
+  voice runtime.
+
+  The conversation history contains only what the user actually heard.
+  Your earlier replies may carry these markers, added by the runtime:
+  - "… [중단됨]": the user cut you off here; they did not hear the rest.
+  - "[중단됨: 이후 내용은 전달되지 않음]": the replies after this point never played.
+  - "[응답이 전달되지 않음]": this reply never reached the user at all.
+  Never assume the user heard anything past a marker. If a detail matters,
+  say it again.
+
+  Never claim that a reservation, cancellation, payment, or update
+  succeeded until the corresponding tool result confirms success.
+
+  Use search_availability for read-only option lookup. Use
+  reserve_restaurant only after the user explicitly confirms every detail,
+  and always pass the idempotency_key given below, unchanged.
+
+  Ask for confirmation before any transactional write.
+
+  Keep each response short: 1-2 sentences, ending with a question when the
+  next step needs user input.
+
+  Runtime state for this turn (trusted, set by the voice runtime):
+  {{ context.voice.brief }}
+
+# Set by voice-live before every turn. ai-agents checks `required: true` at
+# the start of each turn and fails the turn, before any model call, if the key
+# was never set. It checks presence only, not freshness: voice-live sets a new
+# value every turn. Do not add a `default`: it would satisfy the check forever
+# and could overwrite the value voice-live sets.
+context:
+  voice:
+    type: runtime
+    required: true
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+    api_key_env: OPENAI_API_KEY
+
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+    api_key_env: OPENAI_API_KEY
+
+llm:
+  default: default
+  router: router
+
+streaming:
+  enabled: true
+  buffer_size: 256
+  include_tool_events: true
+  include_state_events: true
+
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 2
+
+# voice-live owns this agent's memory (to rewrite each reply to what was
+# heard). Only `in-memory` is supported; `max_messages` is honoured.
+memory:
+  type: in-memory
+  max_messages: 40
+
+states:
+  initial: collecting
+
+  states:
+    collecting:
+      prompt: |
+        Collect the reservation target, date, time, and party size.
+        Do not perform a write action.
+
+      transitions:
+        - to: searching
+          when: |
+            Required search slots (date, time, party size) are known.
+
+    searching:
+      prompt: |
+        Use read-only availability and search tools.
+        Present verified options only.
+
+      transitions:
+        - to: confirming
+          when: |
+            The user has selected one concrete option.
+
+    confirming:
+      prompt: |
+        Restate all transactional details and ask for explicit confirmation.
+
+      transitions:
+        - to: executing
+          when: |
+            The user explicitly confirms the exact action.
+
+    executing:
+      prompt: |
+        Execute the transactional tool exactly once.
+        Use the runtime-provided idempotency key.
+
+      transitions:
+        - to: completed
+          when: |
+            The transactional tool returns a confirmed success.
+
+    completed:
+      prompt: |
+        Report the verified result and any confirmation identifier.
