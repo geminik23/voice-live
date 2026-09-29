@@ -115,6 +115,10 @@ All keys remain in the Rust gateway and are not sent to the browser.
 
 Docker is an **optional Linux-container deployment method**, not a replacement for native multiplatform support. The current Dockerfile uses Linux builder and runtime images. It can run on Windows/macOS with a Linux container engine such as Docker Desktop or a remote Linux engine. A successful Docker build does not validate native Windows/macOS builds or browser/microphone behavior; the Dockerfile itself also requires a separate build check.
 
+The runtime image includes `/app/LICENSE` for this project's Apache-2.0
+license. Third-party components retain their own licenses; review their
+notices when distributing images.
+
 Use one-line commands to avoid shell-specific line-continuation syntax.
 
 ```sh

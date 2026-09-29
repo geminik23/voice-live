@@ -97,6 +97,14 @@ for details and path rules.
 - [Testing](docs/testing.md) - test layers and scenario DSL
 - [Deployment](docs/deployment.md) - demo startup, environment, and Docker
 
+## License
+
+Copyright 2026 Jaemin Kim.
+
+The `voice-live` library and `full-duplex-demo` are licensed under the
+[Apache License, Version 2.0](LICENSE). Third-party dependencies retain their
+respective licenses.
+
 ## Core principles
 
 1. An STT partial is a revision, not an append.

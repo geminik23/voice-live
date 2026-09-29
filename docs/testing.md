@@ -91,12 +91,12 @@ The test applies `node --check` to the actual inline script in `full-duplex-demo
 
 ### Evidence available so far
 
-These are local Windows results from 2026-09-27; they do not validate subsequent changes. The CI matrix has been added, but results from actual GitHub Actions runs have not yet been obtained.
+The automated checks below ran locally on Windows; a user additionally reported the Windows Edge browser check on 2026-09-29. These results do not validate subsequent changes. The CI matrix has been added, but results from actual GitHub Actions runs have not yet been obtained.
 
 | Environment | Evidence available | Not yet verified |
 |---|---|---|
 | Linux | Basic checks were reported passing in a previous environment | Rerun on the current revision; compatibility by distribution and target |
-| Windows `x86_64-pc-windows-msvc` | Basic checks passed with Rust 1.93.1: workspace 115 passed / 2 ignored; core 101 passed / 2 ignored. Script syntax and mock binary playback tests: 2 passed with Node 24 | CI results with Node 20; real browser/microphone E2E; other Windows targets |
+| Windows `x86_64-pc-windows-msvc` | Basic checks passed with Rust 1.93.1: workspace 115 passed / 2 ignored; core 101 passed / 2 ignored. Script syntax and mock binary playback tests: 2 passed with Node 24. On 2026-09-29, a user reported Edge receiving `speech_started`, binary PCM and `speech_done`, sending both playback ACKs after text injection, with no Console errors; the browser reported 48 kHz capture and the server initialized 48 kHz → 16 kHz resampling | CI results with Node 20; microphone VAD/recognition, audible speech, other Windows targets and browsers |
 | macOS | Supported target, but no native execution results | Build, lint, tests, Intel and Apple Silicon targets, browser/microphone E2E |
 
 Passing on one operating system or CPU architecture does not validate another target. Successful cross-compilation does not replace execution checks; a Linux Docker build does not validate native Windows or macOS.
