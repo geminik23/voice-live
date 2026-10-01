@@ -29,9 +29,10 @@ pub fn decode_client_audio(bytes: &[u8]) -> Result<AudioFrame> {
         anyhow::bail!("audio payload has odd length");
     }
 
-    let pcm = sample_bytes
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+    let (samples, _) = sample_bytes.as_chunks::<2>();
+    let pcm = samples
+        .iter()
+        .map(|sample| i16::from_le_bytes(*sample))
         .collect();
 
     Ok(AudioFrame { sequence, pcm })
@@ -341,12 +342,36 @@ mod tests {
 
     #[test]
     fn frame_codec_round_trips() {
-        let pcm = vec![100, -200, 30_000];
-        let encoded = encode_client_audio(7, &pcm);
-        let frame = decode_client_audio(&encoded).unwrap();
+        for pcm in [vec![], vec![100, -200, 30_000]] {
+            let encoded = encode_client_audio(7, &pcm);
+            let frame = decode_client_audio(&encoded).unwrap();
 
-        assert_eq!(frame.sequence, 7);
-        assert_eq!(frame.pcm, pcm);
+            assert_eq!(frame.sequence, 7);
+            assert_eq!(frame.pcm, pcm);
+        }
+    }
+
+    #[test]
+    fn frame_decoder_reads_little_endian_samples() {
+        let bytes = [
+            8, 7, 6, 5, 4, 3, 2, 1, 0x00, 0x80, 0xff, 0x7f, 0xfe, 0xff, 0x00, 0x00,
+        ];
+        let frame = decode_client_audio(&bytes).unwrap();
+
+        assert_eq!(frame.sequence, 0x0102_0304_0506_0708);
+        assert_eq!(frame.pcm, [i16::MIN, i16::MAX, -2, 0]);
+    }
+
+    #[test]
+    fn frame_decoder_rejects_malformed_frames() {
+        assert_eq!(
+            decode_client_audio(&[0; 7]).unwrap_err().to_string(),
+            "audio frame shorter than header"
+        );
+        assert_eq!(
+            decode_client_audio(&[0; 9]).unwrap_err().to_string(),
+            "audio payload has odd length"
+        );
     }
 
     #[test]

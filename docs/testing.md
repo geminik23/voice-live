@@ -91,13 +91,15 @@ The test applies `node --check` to the actual inline script in `full-duplex-demo
 
 ### Evidence available so far
 
-The automated checks below ran locally on Windows; a user additionally reported the Windows Edge browser check on 2026-09-29. These results do not validate subsequent changes. The CI matrix has been added, but results from actual GitHub Actions runs have not yet been obtained.
+The automated checks below ran locally on Windows; a user additionally reported the Windows Edge browser check on 2026-09-29. A subsequent Windows GitHub Actions lint run using Rust 1.98 reported `chunks_exact_to_as_chunks` as an error under `-D warnings`. The PCM decoder now uses `as_chunks::<2>()` without suppressing the lint. Local workspace Clippy passed with Rust 1.93.1 and 1.97.0 after this change; Rust 1.98 and the complete three-OS CI matrix still require a rerun.
 
 | Environment | Evidence available | Not yet verified |
 |---|---|---|
 | Linux | Basic checks were reported passing in a previous environment | Rerun on the current revision; compatibility by distribution and target |
-| Windows `x86_64-pc-windows-msvc` | Basic checks passed with Rust 1.93.1: workspace 115 passed / 2 ignored; core 101 passed / 2 ignored. Script syntax and mock binary playback tests: 2 passed with Node 24. On 2026-09-29, a user reported Edge receiving `speech_started`, binary PCM and `speech_done`, sending both playback ACKs after text injection, with no Console errors; the browser reported 48 kHz capture and the server initialized 48 kHz → 16 kHz resampling | CI results with Node 20; microphone VAD/recognition, audible speech, other Windows targets and browsers |
+| Windows `x86_64-pc-windows-msvc` | Basic checks passed with Rust 1.93.1: workspace 115 passed / 2 ignored; core 101 passed / 2 ignored. Script syntax and mock binary playback tests: 2 passed with Node 24. On 2026-09-29, a user reported Edge receiving `speech_started`, binary PCM and `speech_done`, sending both playback ACKs after text injection, with no Console errors; the browser reported 48 kHz capture and the server initialized 48 kHz → 16 kHz resampling | Rust 1.98 CI rerun and Node 20 results; microphone VAD/recognition, audible speech, other Windows targets and browsers |
 | macOS | Supported target, but no native execution results | Build, lint, tests, Intel and Apple Silicon targets, browser/microphone E2E |
+
+After the decoder lint fix, local Windows tests passed with 117 workspace tests and 103 framework-free tests (2 paid contract tests ignored in each run). Decoder tests cover explicit little-endian sample values, empty payloads, short headers, and odd-length payload rejection. These tests preserve the existing wire contract; they do not replace checking the reported lint on the CI toolchain.
 
 Passing on one operating system or CPU architecture does not validate another target. Successful cross-compilation does not replace execution checks; a Linux Docker build does not validate native Windows or macOS.
 
