@@ -4,8 +4,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
-use super::{AsrEvent, AsrSession, AsrSessionConfig, StreamingAsr};
+use super::{
+    AsrDuplexLimits, AsrDuplexSession, AsrEvent, AsrEventStream, AsrOpenError, AsrSession,
+    AsrSessionConfig, StreamingAsr,
+};
+use crate::ids::INJECTION_UTTERANCE_ID_BASE;
 
 /// One session's pending injected utterances.
 ///
@@ -13,9 +19,10 @@ use super::{AsrEvent, AsrSession, AsrSessionConfig, StreamingAsr};
 /// final so the whole commit -> agent -> claim gate -> TTS -> playback path
 /// runs without a paid speech provider. The queue is owned per session so a
 /// multi-session gateway routes each injection to the client that sent it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct InjectionQueue {
     pending: Mutex<VecDeque<String>>,
+    notify: Notify,
 }
 
 impl InjectionQueue {
@@ -27,18 +34,25 @@ impl InjectionQueue {
         let text = text.into();
         if !text.trim().is_empty() {
             self.pending.lock().push_back(text);
+            self.notify.notify_one();
         }
     }
 
-    fn pop(&self) -> Option<String> {
+    pub fn pop(&self) -> Option<String> {
         self.pending.lock().pop_front()
+    }
+
+    /// Wakes when a push arrived. One wake drains every pending item, so a
+    /// burst of pushes behind a single stored permit is still delivered.
+    pub async fn wait(&self) {
+        self.notify.notified().await;
     }
 }
 
 /// Decorates any streaming ASR source with a text-injection channel.
 ///
-/// The inner provider keeps working normally; injected text is merged into the
-/// same event stream as synthetic finals. This is what makes the mock demo
+/// The inner provider keeps working normally; injected text is merged into
+/// the same event stream as synthetic finals. This is what makes the mock demo
 /// usable: `MockAsr::quiet()` alone never emits anything.
 pub struct InjectableAsr {
     inner: Arc<dyn StreamingAsr>,
@@ -59,8 +73,36 @@ impl StreamingAsr for InjectableAsr {
             queue: Arc::clone(&self.queue),
             // Injected finals must not collide with the inner provider's
             // utterance ids, which start at zero and count up.
-            next_utterance: u64::MAX / 2,
+            next_utterance: INJECTION_UTTERANCE_ID_BASE,
         }))
+    }
+
+    fn supports_duplex(&self) -> bool {
+        self.inner.supports_duplex()
+    }
+
+    /// Adapter-level merge for standalone hosts: injected finals join the
+    /// inner provider's events from their own id domain. The runtime instead
+    /// drains its queue at the media layer, which keeps typed finals flowing
+    /// through provider reconnects; both paths allocate ids from the same
+    /// base, so downstream provenance is identical.
+    async fn open_duplex(
+        &self,
+        config: AsrSessionConfig,
+        limits: AsrDuplexLimits,
+        cancellation: CancellationToken,
+    ) -> Result<AsrDuplexSession, AsrOpenError> {
+        let inner = self.inner.open_duplex(config, limits, cancellation).await?;
+
+        Ok(AsrDuplexSession {
+            input: inner.input,
+            events: Box::new(InjectionMergeStream {
+                inner: inner.events,
+                queue: Arc::clone(&self.queue),
+                next_utterance: INJECTION_UTTERANCE_ID_BASE,
+            }),
+            control: inner.control,
+        })
     }
 }
 
@@ -109,6 +151,37 @@ impl AsrSession for InjectableAsrSession {
     }
 }
 
+/// Merges injected finals into a duplex event stream.
+struct InjectionMergeStream {
+    inner: Box<dyn AsrEventStream>,
+    queue: Arc<InjectionQueue>,
+    next_utterance: u64,
+}
+
+#[async_trait]
+impl AsrEventStream for InjectionMergeStream {
+    /// Injection keeps an explicit source identity rather than masquerading as a provider final.
+    async fn next_event(&mut self) -> anyhow::Result<Option<AsrEvent>> {
+        loop {
+            if let Some(text) = self.queue.pop() {
+                self.next_utterance += 1;
+                return Ok(Some(AsrEvent::InjectedFinal {
+                    utterance_id: self.next_utterance,
+                    text,
+                }));
+            }
+
+            tokio::select! {
+                biased;
+
+                event = self.inner.next_event() => return event,
+
+                _ = tokio::time::sleep(Duration::from_millis(20)) => continue,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +192,14 @@ mod tests {
             sample_rate_hz: 16_000,
             locale: "ko-KR".into(),
             manual_commit: false,
+        }
+    }
+
+    fn limits() -> AsrDuplexLimits {
+        AsrDuplexLimits {
+            sample_budget: 1_600,
+            command_budget: 64,
+            write_timeout: Duration::from_secs(2),
         }
     }
 
@@ -154,5 +235,44 @@ mod tests {
         let queue = InjectionQueue::new();
         queue.push("   ");
         assert!(queue.pop().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_wakes_after_a_push() {
+        let queue = InjectionQueue::new();
+        queue.push("안녕");
+
+        let drain = tokio::time::timeout(Duration::from_millis(50), queue.wait());
+        drain.await.expect("a stored permit must wake the waiter");
+
+        assert_eq!(queue.pop().as_deref(), Some("안녕"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplex_merge_delivers_injection_and_inner_events() {
+        let queue = InjectionQueue::new();
+        let asr = InjectableAsr::new(Arc::new(MockAsr::from_text("안녕하세요")), queue.clone());
+
+        let mut session = asr
+            .open_duplex(session_config(), limits(), CancellationToken::new())
+            .await
+            .unwrap();
+        queue.push("주말에 예약할게요");
+
+        let injected = session.events.next_event().await.unwrap().unwrap();
+        let AsrEvent::InjectedFinal {
+            utterance_id: injected_id,
+            text,
+        } = injected
+        else {
+            panic!("expected an injected final");
+        };
+        assert_eq!(text, "주말에 예약할게요");
+        assert!(injected_id >= INJECTION_UTTERANCE_ID_BASE);
+
+        let inner = session.events.next_event().await.unwrap().unwrap();
+        let AsrEvent::Partial { .. } = inner else {
+            panic!("expected the inner provider partial");
+        };
     }
 }

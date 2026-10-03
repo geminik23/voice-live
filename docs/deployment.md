@@ -96,6 +96,14 @@ cargo test --test provider_contracts -- --ignored
 
 For an unverified provider combination, start diagnosis with the `provider_error` events in the logs and `target/voice-traces/<date>/<session>/events.jsonl`.
 
+## Host-supplied speech providers
+
+A host can inject `Arc<dyn StreamingAsr>` and `Arc<dyn StreamingTts>` through `SpeechProviders` and `VoiceRuntime::build_with_providers`. See [injected settings and migration](configuration.md#injected-provider-settings-and-migration) and the [module contracts](modules.md#asr-tts). Factories are shared but each session/response has its own stream and control owner. No web framework, provider registry, or dynamic plugin loader is added to the library.
+
+Legacy serial ASR implementations still compile for standalone `open`, but runtime injection requires a real independent duplex boundary. Legacy whole-text TTS factories are bridged once as `Buffered`; a native provider reports `Incremental` and implements append/finish with bounded input, owner-enforced absolute deadlines, cancellation-safe output, and Drop cleanup. `synthesize_via_text_stream` preserves a native provider's control owner for standalone whole-text calls. Standalone provider audio is not an evidence-authorized runtime speech path: runtime acts must still pass the Claim Gate.
+
+Together uses its documented `session.created` readiness and JSON/base64 PCM protocol at `wss://api.together.ai/v1/realtime`. The previous explicit endpoint string in older config files must be updated. Documentation conformance and local socket tests are not paid-provider verification. Qwen keeps its whole-text/buffered behavior; no native text append support is asserted.
+
 ## Environment variables
 
 | Variable | Purpose | Default |
@@ -137,7 +145,9 @@ Microphone permissions require HTTPS in production, so terminate TLS at a revers
   - The writer drains the event channel until it closes, recording the final SessionClosed event.
 - **Metrics**: `Metrics` counters and latency series (P50/P95/P99) are recorded within each session under `voice_*` names.
 - When the browser WebSocket disconnects, the session supervisor is canceled and all tasks and TTS are cleaned up.
-- When the ASR socket disconnects, a `provider_error` event is logged and reconnection uses exponential backoff from 250 ms to 8 s, replaying roughly the most recent 1.5 seconds of PCM.
+- When the ASR socket disconnects, a `provider_error` and internal `asr_stream_reset` are logged and reconnection uses exponential backoff from 250 ms to 8 s. Reconnect is fresh: pending PCM is discarded and audio during the disconnected interval may be lost; no lossless replay is claimed. Authentication/config rejections stop the recognizer without infinite retries, while enabled text injection remains usable.
+- ASR input saturation reports `voice_asr_input_overflow_total`; client or supervisor output saturation terminates the session rather than blocking VAD/control processing indefinitely. Built-in client output waits at most one second; external hosts still own the capacity and consumption of their channels.
+- A failed TTS reply discards its queued clauses; partial playback is aborted and conservatively settled before an independent act may replace the ledger. Every supervisor exit performs owned worker cleanup and main-turn resolution.
 
 ## Multiple sessions
 

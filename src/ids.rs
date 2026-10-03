@@ -52,3 +52,13 @@ impl fmt::Display for Revision {
         write!(f, "{}", self.0)
     }
 }
+
+/// Runtime utterance ids at or above this base belong to the injected-text
+/// source. The two sources never collide, so slot candidates can carry their
+/// provenance with the id alone.
+pub const INJECTION_UTTERANCE_ID_BASE: u64 = u64::MAX / 2;
+
+/// Whether an utterance id belongs to the injected-text source.
+pub fn is_injection_utterance(utterance_id: u64) -> bool {
+    utterance_id >= INJECTION_UTTERANCE_ID_BASE
+}

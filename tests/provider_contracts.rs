@@ -1,117 +1,167 @@
-//! Paid provider contract tests. These are ignored by default and validate
-//! the real Together ASR and Qwen TTS wire adapters when credentials exist.
-//! Run with: cargo test --test provider_contracts --
-//! --ignored
+//! Paid provider contracts; ignored by default and bounded across open, I/O, and cleanup.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use voice_live::asr::together::TogetherNemotronAsr;
-use voice_live::asr::{AsrConfig, AsrEvent, AsrSessionConfig, StreamingAsr};
-use voice_live::ids::SpeechId;
+use voice_live::asr::{AsrDuplexLimits, AsrEvent, AsrSessionConfig, StreamingAsr};
 use voice_live::speech::ClaimClass;
+use voice_live::tts::buffered::BufferedTtsAdapter;
 use voice_live::tts::qwen::QwenRealtimeTts;
-use voice_live::tts::{StreamingTts, TtsEvent, TtsRequest};
-
-fn asr_config() -> AsrConfig {
-    AsrConfig::default()
-}
+use voice_live::tts::{StreamingTts, TtsEvent, TtsInputLimits, TtsSessionOptions};
 
 #[tokio::test]
-#[ignore = "requires paid Together API key"]
+#[ignore = "requires paid Together API key and consented WAV fixture"]
 async fn together_nemotron_korean_contract() {
-    let key_present = std::env::var("TOGETHER_API_KEY").is_ok();
-    assert!(key_present, "TOGETHER_API_KEY must be set");
-
-    let asr = TogetherNemotronAsr::from_config(&asr_config()).unwrap();
-    let config = AsrSessionConfig {
-        sample_rate_hz: 16_000,
-        locale: "ko-KR".into(),
-        manual_commit: false,
-    };
-
-    let mut session = asr.open(config).await.expect("asr session opens");
-
     let fixture_path = std::env::var("VOICE_KOREAN_FIXTURE")
-        .expect("VOICE_KOREAN_FIXTURE must point to a Korean 16 kHz PCM WAV");
+        .expect("set VOICE_KOREAN_FIXTURE to a consented mono PCM16 WAV");
     let mut reader = hound::WavReader::open(fixture_path).expect("fixture opens");
     let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    assert_eq!(spec.bits_per_sample, 16, "fixture must be signed PCM16");
+    assert_eq!(
+        (spec.channels, spec.sample_rate, spec.bits_per_sample),
+        (1, 16_000, 16)
+    );
+    assert_eq!(spec.sample_format, hound::SampleFormat::Int);
     let fixture: Vec<i16> = reader
         .samples::<i16>()
         .collect::<Result<_, _>>()
-        .expect("fixture samples decode");
-
-    for frame in fixture.chunks(320) {
-        session.push_audio(frame).await.expect("push audio");
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    session.commit_audio().await.expect("commit");
-
-    let start = std::time::Instant::now();
-    let mut saw_event = false;
-
-    while start.elapsed() < std::time::Duration::from_secs(20) {
-        match session.next_event().await.expect("asr event") {
-            Some(AsrEvent::Partial { text, .. }) => {
-                saw_event = true;
-                assert!(!text.trim().is_empty(), "partial text must be non-empty");
-            }
-            Some(AsrEvent::Final { text, .. }) => {
-                saw_event = true;
-                assert!(!text.trim().is_empty(), "final text must be non-empty");
-                break;
-            }
-            Some(AsrEvent::Error { message, .. }) => {
-                panic!("asr provider error: {message}");
-            }
-            None => break,
+        .expect("PCM samples");
+    assert!(!fixture.is_empty());
+    let asr = TogetherNemotronAsr::from_config(&voice_live::config::AsrConfig::default())
+        .expect("ASR credentials");
+    let token = CancellationToken::new();
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(15),
+        asr.open_duplex(
+            AsrSessionConfig {
+                sample_rate_hz: 16_000,
+                locale: "ko-KR".into(),
+                manual_commit: true,
+            },
+            AsrDuplexLimits {
+                sample_budget: 16_000,
+                command_budget: 64,
+                write_timeout: Duration::from_secs(2),
+            },
+            token.clone(),
+        ),
+    )
+    .await
+    .expect("bounded ASR open")
+    .expect("ready ASR session");
+    let feed = async {
+        for frame in fixture.chunks(320) {
+            let admitted = session.input.push_audio(frame.to_vec()).await?;
+            anyhow::ensure!(
+                matches!(admitted, voice_live::asr::AsrAudioPush::Accepted),
+                "fixture frame rejected"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    assert!(saw_event, "expected at least one transcript event");
-    session.close().await.expect("close");
+        session.input.commit_utterance().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let drain = async {
+        while let Some(event) = session.events.next_event().await? {
+            match event {
+                AsrEvent::Final { text, .. } => {
+                    anyhow::ensure!(!text.trim().is_empty(), "empty final");
+                    return Ok(());
+                }
+                AsrEvent::Partial { text, .. } => {
+                    anyhow::ensure!(!text.trim().is_empty(), "empty partial")
+                }
+                AsrEvent::InjectedFinal { .. } => {
+                    anyhow::bail!("provider contract cannot use injected text")
+                }
+                AsrEvent::Error { message, .. } => anyhow::bail!(message),
+            }
+        }
+        anyhow::bail!("ASR closed without a final")
+    };
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::try_join!(feed, drain)
+    })
+    .await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(2), session.control.close())
+        .await
+        .expect("bounded ASR cleanup")
+        .expect("ASR cleanup");
+    result
+        .expect("bounded ASR contract")
+        .expect("fixture must reach an authoritative final");
 }
 
 #[tokio::test]
-#[ignore = "requires paid Qwen TTS API key"]
+#[ignore = "requires paid Qwen TTS API key and voice"]
 async fn qwen_tts_korean_streaming_contract() {
-    let key_present = std::env::var("DASHSCOPE_API_KEY").is_ok();
-    assert!(key_present, "DASHSCOPE_API_KEY must be set");
-
-    let tts = QwenRealtimeTts::from_config(&voice_live::config::TtsConfig::default())
-        .expect("tts builds");
-
-    let request = TtsRequest {
-        speech_id: SpeechId::new(),
-        speech_epoch: 1,
-        text: "토요일 저녁 일곱 시로 확인해볼게요.".into(),
-        language: "Korean".into(),
-        voice: std::env::var("QWEN_VOICE_ID").unwrap_or_default(),
-        claim_class: ClaimClass::Factual,
-    };
-
-    let mut stream = tts
-        .synthesize(request, CancellationToken::new())
-        .await
-        .expect("tts session opens");
-
-    let start = std::time::Instant::now();
-    let mut bytes = 0usize;
-    let mut saw_done = false;
-
-    while start.elapsed() < std::time::Duration::from_secs(20) {
-        match stream.next_event().await.expect("tts event") {
-            Some(TtsEvent::Audio { pcm_s16le, .. }) => bytes += pcm_s16le.len(),
-            Some(TtsEvent::AudioDone { .. }) => {
-                saw_done = true;
-                break;
+    let config = voice_live::config::TtsConfig::default();
+    let tts = BufferedTtsAdapter::new(Arc::new(
+        QwenRealtimeTts::from_config(&config).expect("TTS credentials"),
+    ));
+    let token = CancellationToken::new();
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(15),
+        tts.open_text_stream(
+            TtsSessionOptions {
+                speech_id: voice_live::SpeechId::new(),
+                speech_epoch: 1,
+                language: "Korean".into(),
+                voice: std::env::var("QWEN_VOICE_ID").expect("QWEN_VOICE_ID"),
+                claim_class: ClaimClass::Factual,
+                preferred_sample_rate_hz: Some(24_000),
+            },
+            TtsInputLimits {
+                max_input_bytes: 65_536,
+                request_timeout: Duration::from_secs(30),
+            },
+            token.clone(),
+        ),
+    )
+    .await
+    .expect("bounded TTS open")
+    .expect("TTS buffered session");
+    session
+        .input
+        .push_text("토요일 저녁 일곱 시로 확인해볼게요.".into())
+        .expect("input");
+    session.input.finish_input().expect("finish");
+    let result = tokio::time::timeout(Duration::from_secs(35), async {
+        let mut bytes = 0usize;
+        let mut rate = None;
+        while let Some(event) = session.events.next_event().await? {
+            match event {
+                TtsEvent::Audio {
+                    sample_rate,
+                    pcm_s16le,
+                    ..
+                } => {
+                    anyhow::ensure!(
+                        sample_rate > 0 && pcm_s16le.len().is_multiple_of(2),
+                        "invalid PCM"
+                    );
+                    anyhow::ensure!(rate.is_none_or(|rate| rate == sample_rate), "rate changed");
+                    rate = Some(sample_rate);
+                    bytes += pcm_s16le.len();
+                }
+                TtsEvent::AudioDone { .. } => {
+                    anyhow::ensure!(bytes > 0, "no audio");
+                    return Ok(());
+                }
+                TtsEvent::Error { message, .. } => anyhow::bail!(message),
             }
-            Some(TtsEvent::Error { message, .. }) => panic!("tts provider error: {message}"),
-            None => break,
         }
-    }
-
-    assert!(bytes > 0, "expected audio bytes");
-    assert!(saw_done, "expected audio done event");
+        anyhow::bail!("TTS closed without terminal")
+    })
+    .await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(2), session.control.close())
+        .await
+        .expect("bounded TTS cleanup")
+        .expect("TTS cleanup");
+    result
+        .expect("bounded TTS contract")
+        .expect("audio and terminal required");
 }

@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 use tokio_util::sync::CancellationToken;
 
 use super::{StreamingTts, TtsEvent, TtsRequest, TtsStream};
@@ -36,90 +38,118 @@ impl StreamingTts for QwenRealtimeTts {
         request: TtsRequest,
         cancellation: CancellationToken,
     ) -> anyhow::Result<Box<dyn TtsStream>> {
-        let url = self.config.endpoint.clone();
+        let setup = async {
+            let mut http_request = self.config.endpoint.as_str().into_client_request()?;
+            http_request
+                .headers_mut()
+                .insert("Authorization", format!("Bearer {}", self.api_key).parse()?);
+            http_request
+                .headers_mut()
+                .insert("X-DashScope-DataInspection", "false".parse()?);
 
-        let http_request = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("X-DashScope-DataInspection", "false")
-            .body(())
-            .map_err(|e| anyhow::anyhow!("tts request build failed: {e}"))?;
+            let (socket, _) = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    anyhow::bail!("tts connect cancelled");
+                }
+                connected = tokio_tungstenite::connect_async_with_config(http_request, Some(socket_config()), false) => {
+                    connected.map_err(|e| anyhow::anyhow!("tts connect failed: {e}"))?
+                }
+            };
 
-        let (socket, _) = tokio_tungstenite::connect_async(http_request)
-            .await
-            .map_err(|e| anyhow::anyhow!("tts connect failed: {e}"))?;
+            // The request carries the resolved voice (config value, else the
+            // `tts.voice_env` environment variable); the config field alone is
+            // usually blank because voice ids are account scoped.
+            let voice = if request.voice.trim().is_empty() {
+                self.config.voice.clone()
+            } else {
+                request.voice.clone()
+            };
 
-        // The request carries the resolved voice (config value, else the
-        // `tts.voice_env` environment variable); the config field alone is
-        // usually blank because voice ids are account scoped.
-        let voice = if request.voice.trim().is_empty() {
-            self.config.voice.clone()
-        } else {
-            request.voice.clone()
-        };
+            let (mut sink, mut stream) = socket.split();
 
-        let (mut sink, mut stream) = socket.split();
+            let session_create = serde_json::json!({
+                "type": "session.create",
+                "session": {
+                    "model": self.config.model,
+                    "voice": voice,
+                    "output_audio_format": "pcm16",
+                    "sample_rate_hz": self.config.sample_rate_hz,
+                }
+            });
 
-        let session_create = serde_json::json!({
-            "type": "session.create",
-            "session": {
-                "model": self.config.model,
-                "voice": voice,
-                "output_audio_format": "pcm16",
-                "sample_rate_hz": self.config.sample_rate_hz,
-            }
-        });
+            sink.send(Message::Text(session_create.to_string().into()))
+                .await
+                .map_err(|e| anyhow::anyhow!("tts session create failed: {e}"))?;
 
-        sink.send(Message::Text(session_create.to_string().into()))
-            .await
-            .map_err(|e| anyhow::anyhow!("tts session create failed: {e}"))?;
-
-        // Drain until session.created so the first response starts on a warm
-        // session; errors simply surface on the first audio event instead.
-        while let Some(message) = stream.next().await {
-            match message {
-                Ok(Message::Text(text)) => {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if value.get("type").and_then(|t| t.as_str()) == Some("session.created") {
-                            break;
-                        }
-                        if value.get("type").and_then(|t| t.as_str()) == Some("error") {
-                            let message = value
-                                .get("message")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("tts session error");
-                            anyhow::bail!("tts session error: {message}");
+            // Drain until session.created so the first response starts on a warm
+            // session. Cancellation is checked from setup onward; errors surface
+            // as a synthesis failure rather than hanging the open.
+            let mut ready = false;
+            while let Some(message) = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    anyhow::bail!("tts setup cancelled");
+                }
+                message = stream.next() => message,
+            } {
+                match message {
+                    Ok(Message::Text(text)) => {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if value.get("type").and_then(|t| t.as_str()) == Some("session.created")
+                            {
+                                ready = true;
+                                break;
+                            }
+                            if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+                                let message = value
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("tts session error");
+                                anyhow::bail!("tts session error: {message}");
+                            }
                         }
                     }
+                    Ok(Message::Close(_)) | Err(_) => anyhow::bail!("tts session closed early"),
+                    _ => {}
                 }
-                Ok(Message::Close(_)) | Err(_) => anyhow::bail!("tts session closed early"),
-                _ => {}
             }
+
+            anyhow::ensure!(ready, "tts session ended before readiness");
+            let response_create = serde_json::json!({
+                "type": "response.create",
+                "response": {
+                    "input_text": request.text,
+                    "language": request.language,
+                    "voice": voice,
+                }
+            });
+
+            sink.send(Message::Text(response_create.to_string().into()))
+                .await
+                .map_err(|e| anyhow::anyhow!("tts response create failed: {e}"))?;
+
+            Ok(Box::new(QwenTtsStream {
+                sink,
+                stream,
+                response_id: request.speech_id.to_string(),
+                sample_rate: self.config.sample_rate_hz,
+                sequence: 0,
+                finished: false,
+                cancellation: cancellation.clone(),
+            }) as Box<dyn TtsStream>)
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => anyhow::bail!("tts setup cancelled"),
+            result = tokio::time::timeout(Duration::from_millis(self.config.open_timeout_ms), setup) => result.map_err(|_| anyhow::anyhow!("tts setup timed out"))?,
         }
-
-        let response_create = serde_json::json!({
-            "type": "response.create",
-            "response": {
-                "input_text": request.text,
-                "language": request.language,
-                "voice": voice,
-            }
-        });
-
-        sink.send(Message::Text(response_create.to_string().into()))
-            .await
-            .map_err(|e| anyhow::anyhow!("tts response create failed: {e}"))?;
-
-        Ok(Box::new(QwenTtsStream {
-            sink,
-            stream,
-            response_id: request.speech_id.to_string(),
-            sample_rate: self.config.sample_rate_hz,
-            sequence: 0,
-            finished: false,
-            cancellation,
-        }))
     }
+}
+
+fn socket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size = Some(262_144);
+    config.max_frame_size = Some(262_144);
+    config
 }
 
 pub struct QwenTtsStream {
@@ -154,7 +184,6 @@ impl TtsStream for QwenTtsStream {
                     // The documented realtime client events expose no direct
                     // response.cancel, so cancellation drops the socket; the
                     // speech epoch drop keeps audible output correct anyway.
-                    let _ = self.sink.send(Message::Close(None)).await;
                     self.finished = true;
                     return Ok(None);
                 }
@@ -188,6 +217,7 @@ impl TtsStream for QwenTtsStream {
                                         continue;
                                     }
 
+                                    anyhow::ensure!(delta.len() <= 87_384, "encoded tts audio exceeds byte budget");
                                     let pcm = base64::engine::general_purpose::STANDARD
                                         .decode(delta)
                                         .map_err(|e| anyhow::anyhow!("tts audio decode failed: {e}"))?;
@@ -203,7 +233,7 @@ impl TtsStream for QwenTtsStream {
 
                                 "response.done" | "response.completed" | "tts_audio.done" => {
                                     self.finished = true;
-                                    let _ = self.sink.send(Message::Close(None)).await;
+                                    // Return the terminal before cleanup; dropping the response closes its socket.
                                     return Ok(Some(TtsEvent::AudioDone {
                                         response_id: self.response_id.clone(),
                                     }));
@@ -236,7 +266,12 @@ impl TtsStream for QwenTtsStream {
                         }
 
                         Ok(Message::Ping(data)) => {
-                            let _ = self.sink.send(Message::Pong(data)).await;
+                            tokio::select! {
+                                _ = self.cancellation.cancelled() => { self.finished = true; return Ok(None); }
+                                result = tokio::time::timeout(Duration::from_millis(1_000), self.sink.send(Message::Pong(data))) => {
+                                    result.map_err(|_| anyhow::anyhow!("tts pong timed out"))??;
+                                }
+                            }
                         }
 
                         Ok(Message::Close(_)) | Err(_) => {

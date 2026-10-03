@@ -2,7 +2,7 @@
 name = "voice-live"
 version = "0.1.0"
 edition = "2024"
-description = "Full-duplex Korean voice interaction runtime"
+description = "Full-duplex voice interaction runtime"
 license = "Apache-2.0"
 
 [workspace]
@@ -13,7 +13,7 @@ default = ["framework"]
 framework = ["dep:ai-agents"]
 
 [dependencies]
-ai-agents = { version = "1.0.10", default-features = false, optional = true }
+ai-agents = { version = "1.0.11", default-features = false, optional = true }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -40,6 +40,6 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 # MockLLMProvider, for framework-backed memory tests without an API key.
-ai-agents-llm = "1.0.10"
+ai-agents-llm = "1.0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["test-util"] }

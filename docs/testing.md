@@ -68,6 +68,14 @@ After setting the environment variable, run:
 cargo test --test provider_contracts -- --ignored
 ```
 
+## Duplex provider regressions
+
+`cargo test --test duplex_providers` drives public provider traits and runtime injection with virtual-time test-local fakes. It covers capability dispatch, strict injected task-spec probing, provider/session isolation, actual PCM admission, fatal/transient open behavior, input saturation, typed injection during reconnect, native audio before finish, buffered finish/byte limits, standalone native convenience ownership, cache hits in the actual runtime, and Drop behavior. Output-unconsumed tests verify absolute native deadlines and buffered timeout delivery through a separate terminal slot even with a full audio queue.
+
+Supervisor regressions directly assert metadata/absence-preserving journal rollback, host/candidate interleaving, matching closure and stale extraction rejection, failed-reply disposal, partial-audio Abort and ACK settlement, exactly-once resolutions, ownerless new-turn fast settlement, stale ACK/watchdog isolation, Never protection after synthesis completes, preserved deferred commit context, latest deferred supersession, watchdog-driven release, and owned worker cleanup. Provider normalization rejects zero/changeable rates, odd/oversized PCM, and invalid sequences while bounding output chunks.
+
+Paid contracts are still ignored by default. They use actual outer timeouts across open and I/O, require an authoritative ASR Final, transmit fixture audio concurrently with transcript drain, and require valid TTS audio plus successful terminal and bounded cleanup. Official provider docs and local fakes are not evidence that a real account/model/locale combination works.
+
 ## Platform validation
 
 **The supported targets are native Linux, Windows, and macOS runtimes.** Changing development hosts does not remove support for other operating systems or make WSL/Docker a substitute for native execution. Validate both the default `framework` feature and the `--no-default-features` core.
@@ -212,9 +220,11 @@ expect:
 
 ### Timeline event types
 
-`local_speech_started`, `local_speech_ended`, `asr_partial`,
-`asr_final`, `interaction_decision`, `tool_started`, `tool_completed`,
-`tool_executed`, `agent_final`, `deep_work_requested`, `deep_result`
+`local_speech_started`, `local_speech_ended`, `asr_partial`, `asr_final`, `asr_stream_reset`, `interaction_decision`, `tool_started`, `tool_completed`, `tool_executed`, `agent_final`, `deep_work_requested`, `deep_result`.
+
+`asr_partial` and `asr_final` accept an optional `utterance_id` for identity tests. With automatic IDs, a matching Final or a trailing partial after VAD end retains the recognizer identity; VAD end alone does not increment it. The next speech start or the next recognizer event after a Final advances the automatic ID. The DSL defaults to the audio origin. `asr_stream_reset` carries `generation` and drives uncommitted candidate invalidation without removing authoritative finals or committed turns.
+
+`metric_at_most` checks a counter's upper bound. Combine it with `metric_at_least` to require an exact value; `turn_resolution_count` checks exactly-once resolution directly rather than inferring it from a failure counter.
 
 ## Current scenario suite
 
@@ -232,7 +242,7 @@ expect:
 | `transactional_action_commit_is_order_independent` | An Action Commit is produced regardless of ToolCompleted/ToolExecuted arrival order |
 | `transactional_claim_blocked_without_execution_record` | The same claim is rejected without an execution record |
 | `progress_speech_announces_a_slow_tool` | ToolStarted on a slow tool produces Process speech; the Factual final is played later |
-| `tts_failure_does_not_wedge_the_speech_queue` | After the first clause fails synthesis, the next is still attempted (queue does not stick in Synthesizing) |
+| `tts_failure_does_not_wedge_the_speech_queue` | Discards the failed reply's remaining clauses, attempts the next independent reply, and resolves each reply exactly once as undelivered |
 | `proactive_backchannel_fills_an_incomplete_pause` | An incomplete ending and silence between the soft and hard thresholds trigger a proactive "네" |
 | `deep_work_result_reaches_the_session` | A host-initiated deep-work request applies its result when the epoch matches |
 | `playback_ack_timeout_releases_the_speech_queue` | A client that sends no ACK does not occupy the speech queue forever |

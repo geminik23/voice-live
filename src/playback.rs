@@ -63,18 +63,37 @@ pub trait PlaybackSink: Send + Sync {
 #[derive(Clone)]
 pub struct ClientPlaybackSink {
     tx: mpsc::Sender<PlaybackCommand>,
+    shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ClientPlaybackSink {
     pub fn new(tx: mpsc::Sender<PlaybackCommand>) -> Self {
-        Self { tx }
+        Self { tx, shutdown: None }
+    }
+
+    /// Uses nonblocking runtime admission; overload terminates this session.
+    pub fn for_runtime(
+        tx: mpsc::Sender<PlaybackCommand>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            tx,
+            shutdown: Some(shutdown),
+        }
     }
 }
 
 #[async_trait]
 impl PlaybackSink for ClientPlaybackSink {
     async fn command(&self, command: PlaybackCommand) {
-        let _ = self.tx.send(command).await;
+        if let Some(shutdown) = &self.shutdown {
+            if self.tx.try_send(command).is_err() {
+                tracing::error!("playback queue overloaded or closed; terminating session");
+                shutdown.cancel();
+            }
+        } else {
+            let _ = self.tx.send(command).await;
+        }
     }
 }
 

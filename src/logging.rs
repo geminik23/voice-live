@@ -89,6 +89,7 @@ fn event_clock(event: &VoiceEvent) -> (u64, String) {
         VoiceEvent::AsrPartial { meta, .. } => meta,
         VoiceEvent::StableTranscriptChanged { meta, .. } => meta,
         VoiceEvent::AsrUtteranceFinal { meta, .. } => meta,
+        VoiceEvent::AsrStreamReset { meta, .. } => meta,
         VoiceEvent::SemanticCue { meta, .. } => meta,
         VoiceEvent::SemanticFrameUpdated { meta, .. } => meta,
         VoiceEvent::InteractionDecision { meta, .. } => meta,
@@ -132,8 +133,16 @@ fn event_payload(event: &VoiceEvent, include_sensitive: bool) -> Value {
         VoiceEvent::StableTranscriptChanged { stable_prefix, .. } => {
             serde_json::json!({ "stable_prefix": sensitive_text(stable_prefix, include_sensitive) })
         }
-        VoiceEvent::AsrUtteranceFinal { transcript, .. } => {
-            serde_json::json!({ "transcript": sensitive_text(transcript, include_sensitive) })
+        VoiceEvent::AsrUtteranceFinal {
+            transcript,
+            source,
+            utterance_id,
+            ..
+        } => {
+            serde_json::json!({ "source": source, "utterance_id": utterance_id, "transcript": sensitive_text(transcript, include_sensitive) })
+        }
+        VoiceEvent::AsrStreamReset { generation, .. } => {
+            serde_json::json!({ "generation": generation })
         }
         VoiceEvent::UserTurnCommitted {
             transcript,

@@ -146,6 +146,16 @@ pub struct AsrConfig {
     pub manual_commit: bool,
     #[serde(default = "default_asr_locale")]
     pub locale: String,
+    /// Deadline for one provider connect/auth/ready attempt.
+    #[serde(default = "default_asr_open_timeout_ms")]
+    pub open_timeout_ms: u64,
+    /// Per-write deadline for audio and commit writes to the provider.
+    #[serde(default = "default_asr_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    /// Normalized audio queued for the provider writer, converted to samples
+    /// at the ASR input rate.
+    #[serde(default = "default_asr_input_buffer_ms")]
+    pub input_buffer_ms: u64,
     #[serde(default)]
     pub partials: AsrPartialsConfig,
 }
@@ -159,7 +169,7 @@ fn default_asr_model() -> String {
 }
 
 fn default_asr_endpoint() -> String {
-    "wss://api.together.xyz/realtime/v1/audio/transcriptions".into()
+    "wss://api.together.ai/v1/realtime".into()
 }
 
 fn default_asr_api_key_env() -> String {
@@ -172,6 +182,18 @@ fn default_chunk_ms() -> u64 {
 
 fn default_asr_locale() -> String {
     "ko-KR".into()
+}
+
+fn default_asr_open_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_asr_write_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_asr_input_buffer_ms() -> u64 {
+    1_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +239,19 @@ pub struct TtsConfig {
     pub sample_rate_hz: u32,
     #[serde(default = "default_tts_chunk_ms")]
     pub chunk_ms: u64,
+    /// Language sent with synthesis and premade warmup requests. The default
+    /// keeps the existing Korean-focused behaviour.
+    #[serde(default = "default_tts_language")]
+    pub language: String,
+    /// Deadline for one text-session connect/auth/ready attempt.
+    #[serde(default = "default_tts_open_timeout_ms")]
+    pub open_timeout_ms: u64,
+    /// Deadline for one response after its input is admitted.
+    #[serde(default = "default_tts_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// Maximum accumulated text bytes for one response.
+    #[serde(default = "default_tts_max_input_bytes")]
+    pub max_input_bytes: usize,
     #[serde(default)]
     pub premade: PremadeConfig,
 }
@@ -247,6 +282,22 @@ fn default_tts_sample_rate() -> u32 {
 
 fn default_tts_chunk_ms() -> u64 {
     60
+}
+
+fn default_tts_language() -> String {
+    "Korean".into()
+}
+
+fn default_tts_open_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_tts_request_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_tts_max_input_bytes() -> usize {
+    65_536
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,6 +593,10 @@ pub struct SpeechConfig {
     /// disconnected client would otherwise pin the queue forever. `0` disables.
     #[serde(default = "default_playback_ack_timeout_ms")]
     pub playback_ack_timeout_ms: u64,
+    /// How long to wait for an interrupted acknowledgement after an Abort
+    /// before settling with the already confirmed progress.
+    #[serde(default = "default_playback_stop_ack_timeout_ms")]
+    pub playback_stop_ack_timeout_ms: u64,
     /// Recent clauses the audible ledger keeps for self-echo detection and
     /// the session summary. Durable history lives in the agent's memory.
     #[serde(default = "default_audible_history_max_clauses")]
@@ -554,6 +609,10 @@ fn default_hard_stop_ack() -> String {
 
 fn default_playback_ack_timeout_ms() -> u64 {
     15_000
+}
+
+fn default_playback_stop_ack_timeout_ms() -> u64 {
+    1_000
 }
 
 fn default_audible_history_max_clauses() -> usize {
@@ -738,7 +797,28 @@ impl VoiceRuntimeConfig {
         resolve(&mut self.agents.speculative.spec);
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.audio.input_sample_rate_hz > 0 && self.tts.sample_rate_hz > 0,
+            "audio sample rates must be positive"
+        );
+        let samples = (self.audio.input_sample_rate_hz as u64)
+            .checked_mul(self.asr.input_buffer_ms)
+            .ok_or_else(|| anyhow::anyhow!("asr input sample budget overflow"))?
+            / 1_000;
+        anyhow::ensure!(
+            samples > 0 && samples <= u32::MAX as u64,
+            "asr sample budget must fit a positive u32"
+        );
+        for millis in [
+            self.asr.open_timeout_ms,
+            self.asr.write_timeout_ms,
+            self.tts.open_timeout_ms,
+            self.tts.request_timeout_ms,
+            self.speech.playback_ack_timeout_ms,
+        ] {
+            anyhow::ensure!(millis <= u64::MAX / 1_000, "deadline is too large");
+        }
         if self.turn_control.soft_silence_ms >= self.turn_control.hard_silence_ms {
             anyhow::bail!("turn_control.soft_silence_ms must be below hard_silence_ms");
         }
@@ -753,6 +833,32 @@ impl VoiceRuntimeConfig {
                 "turn_control.hard_stop_phrases must not contain '아니'; it is a common \
                  discourse marker and is handled as a correction cue instead"
             );
+        }
+
+        // Local runtime safety limits. These apply without the framework
+        // feature, and zero never means disabled for a deadline.
+        for (key, value) in [
+            ("asr.open_timeout_ms", self.asr.open_timeout_ms),
+            ("asr.write_timeout_ms", self.asr.write_timeout_ms),
+            ("asr.input_buffer_ms", self.asr.input_buffer_ms),
+            ("tts.open_timeout_ms", self.tts.open_timeout_ms),
+            ("tts.request_timeout_ms", self.tts.request_timeout_ms),
+        ] {
+            if value == 0 {
+                anyhow::bail!("{key} must be positive");
+            }
+        }
+
+        if self.tts.max_input_bytes == 0 {
+            anyhow::bail!("tts.max_input_bytes must be positive");
+        }
+
+        // The stop acknowledgement must stay well below the adapter's 10s
+        // turn resolution grace, or a stopped speech could outlive it.
+        if self.speech.playback_stop_ack_timeout_ms == 0
+            || self.speech.playback_stop_ack_timeout_ms > 5_000
+        {
+            anyhow::bail!("speech.playback_stop_ack_timeout_ms must be between 1 and 5000");
         }
 
         if self.agents.speculative.enabled {
