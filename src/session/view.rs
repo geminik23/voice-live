@@ -146,6 +146,11 @@ impl SessionView {
                 self.stable_prefix = transcript.clone();
             }
 
+            VoiceEvent::AsrStreamReset { .. } => {
+                self.current_hypothesis.clear();
+                self.stable_prefix.clear();
+            }
+
             VoiceEvent::UserTurnCommitted {
                 meta,
                 turn_id,

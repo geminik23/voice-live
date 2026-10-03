@@ -1,6 +1,6 @@
 # voice-live
 
-A Korean full-duplex voice interaction runtime and browser demo. It combines existing streaming STT, an LLM, and streaming TTS to support simultaneous listening and speaking, barge-in, backchannels, asynchronous tools, and progress speech while reasoning.
+A full-duplex voice interaction runtime and browser demo. It combines existing streaming STT, an LLM, and streaming TTS to support simultaneous listening and speaking, barge-in, backchannels, asynchronous tools, and progress speech while reasoning.
 
 Reasoning is delegated to [`ai-agents`](https://crates.io/crates/ai-agents), an **optional dependency** behind the default `framework` feature. The deterministic core builds and runs tests without it using `--no-default-features`.
 
@@ -40,7 +40,7 @@ cargo test --workspace
 # Start the keyless demo (text injection + mock ASR/TTS/agent).
 cargo run -p full-duplex-demo -- --config full-duplex-demo/configs/voice-runtime.yaml
 # Open http://localhost:8080 and click Start session.
-# Enter Korean text in the input field to submit a user utterance.
+# Enter text in the input field to submit a user utterance.
 ```
 
 The mock TTS produces **silent PCM**. To verify audio chunks and playback ACKs without API keys, follow the [manual browser check](docs/deployment.md#manual-browser-playback-ack-check).
@@ -66,6 +66,10 @@ $env:OPENAI_API_KEY = "..."
 Then set `asr.provider: together` and `tts.provider: qwen` in `full-duplex-demo/configs/voice-runtime.yaml` and run the same `cargo run` command. The provider adapters still need paid contract testing before relying on their wire formats.
 
 Other environment variables: `VOICE_BIND_ADDR` (default `0.0.0.0:8080`), `VOICE_WEB_DIR` (web root override), `RUST_LOG` (log filter), and `VOICE_KOREAN_FIXTURE` (path to a 16 kHz mono PCM16 WAV for the Together contract test). See the [environment variable reference](docs/deployment.md#environment-variables) for details and path rules.
+
+## Replace speech providers
+
+Hosts can pass `SpeechProviders { asr, tts }` to `VoiceRuntime::build_with_providers` without changing provider-name branches or adding transport dependencies. STT has independent PCM input and transcript output; TTS exposes buffered or native incremental text input with independent audio output. Legacy whole-text TTS can use the bounded buffered bridge. General agent replies still wait for authoritative Final and pass the Claim Gate; this API is not provisional-token speech. See [provider settings and migration](docs/configuration.md#injected-provider-settings-and-migration), [host integration](docs/deployment.md#host-supplied-speech-providers), and [deterministic provider tests](docs/testing.md#duplex-provider-regressions).
 
 ## Documentation
 

@@ -13,6 +13,7 @@ pub mod meta;
 pub mod metrics;
 pub mod playback;
 pub mod protocol;
+pub mod provider;
 pub mod replay;
 pub mod runtime;
 pub mod scenario;
@@ -28,7 +29,7 @@ pub use config::VoiceRuntimeConfig;
 pub use events::VoiceEvent;
 pub use ids::{Revision, SessionId, SpeechId, TaskId, TurnId};
 pub use protocol::{ClientControlMessage, ServerMessage};
-pub use runtime::{ClientInput, GatewaySession, VoiceRuntime};
+pub use runtime::{ClientInput, GatewaySession, SpeechProviders, VoiceRuntime};
 pub use scenario::{Scenario, ScenarioReport, ScenarioRunner};
 pub use session::{
     DeepWorkRequest, DeepWorkResult, DeepWorker, VoiceSession, VoiceSessionBuilder,

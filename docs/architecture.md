@@ -16,7 +16,7 @@ Axum gateway (demo: src/gateway.rs)
     │  ClientInput channel
     ▼
 Media worker (library: runtime.rs)
-    │  validate frame sequence → resample to ASR input rate → energy VAD
+    │  validate frame sequence → resample → energy VAD → nonblocking ASR admission
     ▼
 VoiceEvent bus (events.rs)
     │
@@ -45,6 +45,14 @@ Axum gateway (demo: src/gateway.rs → WebSocket)
     ▼
 Browser playback (24 kHz) → duck/resume/abort control + ACK
 ```
+
+## Duplex speech providers
+
+Speech providers are injectable: a host passes `SpeechProviders { asr, tts }` to `VoiceRuntime::build_with_providers` and keeps every endpoint, model, and API-key setting on its side. The built-in `build` path resolves the same assembly from the configured provider names, so both paths share the wiring.
+
+STT input and transcript output are independent. The media worker runs the local VAD first and admits each frame to the provider with a nonblocking bounded queue, so a stalled network write can never delay barge-in detection, playback acknowledgement handling, or cancellation. The connection owner keeps a private generation counter: provider revisions and utterance ids restart with every connection, so the runtime re-issues both from session-lifetime counters, discards duplicate finals and late partials against a sealed high-water mark, and tags derived work (slot extraction, interaction decisions, speculative reads) with candidate provenance. Typed text injection is owned by the media session rather than any provider connection, so it keeps flowing through recognizer reconnects.
+
+TTS text input and audio output are independent too. A provider declares `Buffered` or `Incremental` text input; buffered whole-text providers are bridged through `BufferedTtsAdapter`, which starts the inner request only once the input finishes. Input operations are nonblocking FIFO admissions; provider I/O runs independently. The runtime submits the complete authorized `SpeechAct` once and finishes the input, then drains audio with a request deadline. This does not turn agent provisional chunks into speech: general answers still follow authoritative `AgentFinal` → clauses → Claim Gate → speech. Qwen remains buffered; native incremental behavior is verified with deterministic fakes, not claimed for the live endpoint.
 
 ## Four time axes
 
@@ -144,11 +152,15 @@ To prevent a missing resolution from stalling the session, the next turn waits a
 
 ### A new turn interrupts the previous reply
 
-Once the user commits a new turn, the conversation has moved on. A previous turn still running inference is canceled and Discarded; a previous reply still playing is interrupted and resolved to **what was heard up to that point**. The new turn's context must reflect what the user heard before speaking again.
+Once the user commits a new turn, the conversation has moved on. A previous turn still running inference is canceled and Discarded; interruptible playback, including ownerless phatic/process acts and already stopping speech, is aborted and conservatively settled using progress already confirmed at the commit boundary. Later ACKs cannot revise that boundary. The new turn's context must reflect what the user heard before speaking again.
+
+`Never` protects the current act during setup, synthesis, and playback, including the period after synthesis finishes but before playback ACK. The runtime keeps one deferred committed turn with its selected semantic/speculative/deep context snapshot; a later committed turn supersedes that unstarted record without fabricating a merged user message or a framework resolution. Release order is protected speech settlement → owning previous reply resolution → consume the deferred record once → successor admission. Hard stop, provider failure, playback watchdog, and session teardown are safety termination paths and override Never.
+
+A partially failed synthesis is never marked synthesis-complete or Full. It invalidates the speech epoch, sends Abort, discards the failed reply's queued clauses, and waits for interrupted ACK or a bounded stop deadline before another act may replace the single in-flight ledger. Duplicate or old terminals/ACKs are rejected before both projection and handling.
 
 ### Known limitation
 
-When a state transition regenerates a reply, ai-agents (as of 1.0.10) **first** stores stale pre-transition text as an assistant message. Because there is no message-kind marker to distinguish it from a tool-call decision, that text remains. Only the final reply is reconciled. A framework `MessageKind` would resolve this.
+When a state transition regenerates a reply, ai-agents (as tested with 1.0.11) **first** stores stale pre-transition text as an assistant message. Because there is no message-kind marker to distinguish it from a tool-call decision, that text remains. Only the final reply is reconciled. A framework `MessageKind` would resolve this.
 
 ## Claim Gate
 
@@ -212,6 +224,12 @@ Only uncertain states (between soft and hard thresholds with no clear ending) es
 
 Even with browser AEC, assistant TTS may re-enter the mic. `echo.rs` classifies an inbound partial as echo if its character-bigram Dice similarity to recently played text reaches `similarity_threshold` (0.82), and discards that partial from the commit path (without aborting, while retaining resume behavior).
 
+## Abandoned ASR candidates
+
+Connection resets clear only uncommitted hypotheses and work derived from them. Candidate provenance carries generation, source, and mapped utterance identity; audio and injection sources are explicit and do not rely on numeric ID ranges. Closing a candidate on its matching Final or partial-based user commit makes its selected writes authoritative, rejects late extraction, and protects promoted speculative work from later audio resets. An unrelated injected Final cannot close an audio candidate.
+
+A bounded slot journal stores the original `Option<SemanticValue>` before candidate writes, including absence, confidence, status, and source revision. Repeated writes by the same candidate retain the baseline. Host writes retire the entry, so a later candidate write records the latest authoritative baseline. Rollback restores this metadata directly and advances frame revision without running correction policy or invalidating unrelated committed main turns. The journal does not undo tool side effects or revive cancelled tasks.
+
 ## Dependency-scoped invalidation
 
 When a correction cue detects a slot replacement (`X 말고 Y`):
@@ -243,10 +261,12 @@ Only the tool backend (`ReservationStore`) is shared, as it models an external s
 
 | Situation | Behavior |
 |---|---|
-| ASR socket closes (`next_event` → `Ok(None)`) | Emit `ProviderError`, then reconnect, replay the most recent ~1.5 seconds of PCM, and back off from 250ms to 8s |
-| ASR error | Same path |
-| TTS failure | `TtsFailed` → release speech state → proceed to next act |
-| Missing playback ACK | After `speech.playback_ack_timeout_ms` (default 15s), increment the speech epoch, send `Abort`, and release the queue. Merely clearing server state is insufficient: a slow client may still be playing, causing the next speech to overlap |
+| ASR connection closes or errors | Emit `ProviderError`, reset the stream generation so work derived from abandoned partials is invalidated, then reconnect fresh with backoff from 250ms to 8s. Audio between connections is discarded; it is never replayed as recognized speech |
+| ASR open rejected (auth or unsupported config) | Report and stop the ASR source; it is not retried until the next session start. Typed text injection keeps flowing |
+| ASR input budget saturated | Report an overflow, drop the connection, and reconnect fresh; local VAD and control processing continue |
+| TTS failure before any audio | Settle the act as undelivered, discard the failed reply's remaining clauses, and proceed to the next independent act |
+| TTS failure after some audio | Abort the browser playback, settle with the interrupted acknowledgement bounded by `speech.playback_stop_ack_timeout_ms`, and settle with the confirmed progress when no acknowledgement arrives |
+| Missing playback ACK | After `speech.playback_ack_timeout_ms` (default 15s) from the first real playback evidence, increment the speech epoch, send `Abort`, and release the queue. Merely clearing server state is insufficient: a slow client may still be playing, causing the next speech to overlap |
 | Cannot resample client sample rate | Emit `ProviderError` (recoverable=false), then discard the audio. Do not send it to the provider at the wrong rate |
 
 ## Audio resampling
@@ -267,6 +287,8 @@ Decimation phase is computed from the **absolute stream index**. Using chunk-rel
 4. Never speak results from a different epoch.
 5. Never speak a claim without evidence.
 6. Start barge-in with duck; abort only after confirmation.
-7. `Ok(None)` from `AsrSession::next_event` means “closed,” not “no event right now.”
+7. `Ok(None)` from `AsrSession::next_event` means "closed," not "no event right now."
 8. Do not share Task/Interaction brains across sessions.
 9. Edit agent memory only between turns, after the framework stream has dropped.
+10. A failed synthesis discards the rest of its reply; a settled speech record is never revived by a late acknowledgement.
+11. The playback watchdog is armed by real playback evidence, never by synthesis progress.

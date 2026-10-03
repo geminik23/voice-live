@@ -13,7 +13,7 @@ transport-agnostic.
 - Static files: `/` → `AppState::web_dir` (the demo resolves this relative to the
   config file; `VOICE_WEB_DIR` can override it)
 - Audio input: the microphone's **actual** sample rate, 20 ms frames, mono
-- Audio output: 24 kHz, mono
+- Audio output: mono PCM16 at the response's actual `speech_started.sample_rate` (built-in default 24 kHz)
 - All API keys stay on the server and are never sent to the browser.
 
 ## Client → server
@@ -24,11 +24,7 @@ transport-agnostic.
 [ u64 LE sequence ][ i16 LE PCM ... ]
 ```
 
-Frames are 20 ms long, with the sample count determined by the actual rate
-(48 kHz → 960 samples → 8 + 1920 bytes; 44.1 kHz → 882 samples → 8 + 1764
-bytes). The sequence increases with each frame, and the server tracks gaps and
-reordering (`FrameSequenceTracker`). A large gap (>25 frames) triggers an ASR
-reconnect and replays roughly the most recent 1.5 seconds of PCM.
+Frames are 20 ms long, with the sample count determined by the actual rate (48 kHz → 960 samples → 8 + 1920 bytes; 44.1 kHz → 882 samples → 8 + 1764 bytes). The sequence increases with each frame; the runtime tracks gaps/reordering and drops late or duplicate frames. A large client frame gap (>25 frames) is reported as an input error, the current PCM frame is not admitted to ASR, and an active recognizer reconnects fresh after local VAD processing. Provider disconnect and ASR queue saturation also reconnect fresh, not with generic PCM replay; the disconnected interval may be lost.
 
 ### JSON control (`tag = "type"`)
 
@@ -123,9 +119,6 @@ Commit and latency metrics accurate.
 
 ### Server-side protection against missing ACKs
 
-`SpeechState` advances only on client ACKs, so a disconnected client could
-occupy the speech queue indefinitely. If the server receives no playback
-signal for `speech.playback_ack_timeout_ms` (default: 15 seconds), it treats the
-current utterance as interrupted and releases the queue
-(`voice_playback_ack_timeout_total`). This is a safety net, not a substitute
-for ACKs: utterances released by the timeout leave no text in audible history.
+`SpeechState` advances only on valid client ACKs. After the first nonempty audio, playback inactivity for `speech.playback_ack_timeout_ms` (default 15 seconds) invalidates the speech epoch, sends Abort, and settles using only progress already confirmed (`voice_playback_ack_timeout_total`). Incoming provider audio does not refresh this timer. Timeout settlement can retain a conservative Partial or None; it is not proof of Full playback.
+
+Synthesis failure after audio also sends `playback_abort`, never `speech_done`. The runtime waits at most `speech.playback_stop_ack_timeout_ms` (default 1000 ms) for the matching interrupted ACK before conservative settlement; ordinary successor speech waits so it cannot overwrite the ledger. A new committed user turn can instead fast-settle at its commit boundary. Old/duplicate ACKs cannot refresh a successor's watchdog, replay settlement, or rewrite its context. An interrupted ACK remains valid for an explicitly stopping speech even after an epoch bump. These are semantic protections; the JSON and binary wire formats are unchanged.

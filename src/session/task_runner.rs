@@ -23,6 +23,11 @@ pub struct ActiveTask {
     pub fingerprint: u64,
     pub cancellation: CancellationToken,
     pub handle: Option<JoinHandle<()>>,
+    /// Which candidate generation spawned this task. Speculative work from
+    /// an abandoned candidate is cancelled on a stream reset; main turns are
+    /// unaffected because they commit to a generation.
+    pub candidate_generation: u64,
+    pub candidate_utterance_id: Option<u64>,
 }
 
 impl ActiveTask {
@@ -50,21 +55,21 @@ pub async fn run_task_turn_with_timeout(
     let timeout_tx = event_tx.clone();
     let timeout_meta = Arc::clone(&meta_factory);
 
-    if tokio::time::timeout(
-        timeout,
-        run_task_turn(agent, request, cancellation, event_tx, meta_factory),
-    )
-    .await
-    .is_err()
-    {
-        let _ = timeout_tx
-            .send(VoiceEvent::AgentFailed {
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return,
+        result = tokio::time::timeout(timeout, run_task_turn(agent, request, cancellation.clone(), event_tx, meta_factory)) => result,
+    };
+    if result.is_err() {
+        tokio::select! {
+            _ = cancellation.cancelled() => {},
+            _ = timeout_tx.send(VoiceEvent::AgentFailed {
                 meta: timeout_meta.new_meta(),
                 task_id,
                 thought_epoch,
                 message: format!("agent turn timed out after {}ms", timeout.as_millis()),
-            })
-            .await;
+            }) => {},
+        }
     }
 }
 

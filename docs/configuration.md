@@ -1,7 +1,6 @@
 # Configuration reference (voice-runtime.yaml)
 
-All fields are optional and use defaults when omitted. Secrets are not stored in
-this file; `api_key_env` looks them up only from environment variables.
+All fields are optional and use defaults when omitted. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
 
 ```yaml
 version: 1
@@ -17,12 +16,15 @@ audio:
 asr:
   provider: inject          # together | inject | mock
   model: nvidia/nemotron-3.5-asr-streaming-0.6b
-  endpoint: wss://api.together.xyz/realtime/v1/audio/transcriptions
+  endpoint: wss://api.together.ai/v1/realtime
   api_key_env: TOGETHER_API_KEY
   chunk_ms: 160
   manual_commit: false     # when true, server VAD controls endpointing and
-                           # sends commit_audio() on each LocalSpeechEnded
+                           # admits a FIFO provider commit after the frame's PCM
   locale: ko-KR
+  open_timeout_ms: 10000
+  write_timeout_ms: 2000
+  input_buffer_ms: 1000
   partials:
     enabled: true
     stable_after_ms: 320   # only prefixes unchanged for this long are stable
@@ -37,6 +39,10 @@ tts:
   voice_env: QWEN_VOICE_ID # voice IDs are account-specific; do not commit one to config
   sample_rate_hz: 24000
   chunk_ms: 60
+  language: Korean
+  open_timeout_ms: 10000
+  request_timeout_ms: 30000
+  max_input_bytes: 65536
   premade:
     enabled: true
     phrases: ["네", "네, 확인했어요."]   # pre-synthesize at startup for immediate playback
@@ -86,6 +92,7 @@ agents:
 speech:
   hard_stop_ack_text: "네, 멈췄어요."
   playback_ack_timeout_ms: 15000  # release the speech queue if no playback ACK arrives; 0 disables this
+  playback_stop_ack_timeout_ms: 1000 # bounded interrupted ACK wait after Abort
   audible_history_max_clauses: 64 # recent clauses kept by the audible ledger for echo detection and summaries
   progress_templates:
     search_availability:         # tool name is the key
@@ -127,11 +134,7 @@ The sample configuration runs without API keys.
 - `dev.allow_text_injection: true` — the browser text box acts as the user's utterance
 - `tts.provider: mock` — deterministic silent PCM
 
-When `allow_text_injection` is enabled, the injection channel is attached to
-**any ASR provider** (`InjectableAsr`). You can therefore use `provider: together`
-for live recognition while also reproducing scenarios with injected text. The
-injection queues are per-session, so multiple clients do not interfere with
-one another.
+When `allow_text_injection` is enabled, the runtime owns a per-session injection queue independently of the recognizer connection. Typed finals therefore keep flowing during ASR open failures and reconnects, without crossing between clients. `InjectableAsr` remains available as a standalone decorator; the runtime no longer ties injection delivery to that decorator's open.
 
 ## Choosing a provider
 
@@ -139,16 +142,45 @@ one another.
 |---|---|---|
 | `mock` (ASR/TTS) | Offline demo and pipeline checks | None |
 | `inject` (ASR) | Development text injection: the browser text box acts as the user's utterance | `dev.allow_text_injection` |
-| `together` (ASR) | Live Korean streaming recognition | `TOGETHER_API_KEY` |
+| `together` (ASR) | Live streaming recognition | `TOGETHER_API_KEY` |
 | `qwen` (TTS) | Live speech synthesis | `DASHSCOPE_API_KEY`, `QWEN_VOICE_ID` (or `tts.voice`) |
 
-Unknown provider names cause an error at load time; they do not silently fall
-back to `mock`.
+Unknown provider names fail the built-in runtime build; they do not silently fall back to `mock`. The injected builder uses the host's factories instead of resolving these names.
 
 Verify the wire-level fields of the `together`/`qwen` adapters with the paid
 contract tests before use (`cargo test --test provider_contracts -- --ignored`).
 The Together test requires a consented 16 kHz mono PCM WAV supplied through
 `VOICE_KOREAN_FIXTURE`.
+
+## Language scope
+
+The project is a full-duplex voice runtime, not a single-language product. Its current defaults and demo are language-specific: the ASR locale is `ko-KR`, the agent prompts and deterministic speech cues use Korean, and runtime TTS requests use `tts.language` (default `Korean`). Changing only `asr.locale` does not adapt these other components. Using English or another language requires suitable provider models and voices, adapted prompts and policies, and verification of the TTS request language and transactional claim classification. These implementation defaults should not be confused with the project's purpose, and multilingual end-to-end behavior has not been validated.
+
+## Duplex safety limits
+
+| Key | Default | Enforcement |
+|---|---:|---|
+| `asr.open_timeout_ms` | 10000 | One connect/auth/readiness attempt; idle transcript silence is not a failure |
+| `asr.write_timeout_ms` | 2000 | Audio and commit socket writes |
+| `asr.input_buffer_ms` | 1000 | Pending mono PCM16 sample budget, `input_sample_rate_hz * input_buffer_ms / 1000`; commands are separately bounded at 64 |
+| `tts.open_timeout_ms` | 10000 | Text-session open and built-in Qwen setup; a buffered bridge does not start its provider until finish |
+| `tts.language` | `Korean` | Normal and premade synthesis requests, separately from `asr.locale` |
+| `tts.request_timeout_ms` | 30000 | One response; buffered deadline starts at finish admission, native providers start at the first accepted nonempty text and must not extend it on append |
+| `tts.max_input_bytes` | 65536 | Accumulated UTF-8 text bytes per response |
+| `speech.playback_stop_ack_timeout_ms` | 1000 | After Abort, await interrupted ACK before conservative settlement; valid range 1–5000 |
+| `speech.playback_ack_timeout_ms` | 15000 | Playback inactivity after first nonempty audio; provider chunks do not refresh this timer; zero disables this existing watchdog only |
+
+New safety limits must be positive. The sample budget is checked for overflow and must fit a positive `u32`. Buffered input waiting for the host to finish is not synthesis activity and does not trigger a request timeout. Provider owners enforce deadlines independently of output polling. The built-in buffered bridge retains one terminal separately from its normalized 16-item audio queue, so timeout cleanup does not depend on queue space.
+
+PCM output is mono s16le. A decoded raw provider chunk is limited to 65536 bytes and normalized into at most 8192-byte chunks with per-response sequences; zero rates, odd byte lengths, rate changes, and duplicate/reordered sequences are rejected. The preferred rate is advisory: the actual emitted rate is sent to the browser and used by the ledger. Premade clips are limited to 1 MiB each and cached only after valid nonempty audio and a successful terminal.
+
+## Injected provider settings and migration
+
+`VoiceRuntime::build_with_providers(config, SpeechProviders { asr, tts })` shares the built-in assembly but skips provider-name construction. Endpoint, model, and API-key environment settings are host-owned on this path. Common locale/manual-commit, language/voice, timing, premade, and safety budgets still apply to sessions. Factories must report their capabilities honestly; a serial-only ASR is rejected rather than disguised as duplex, and an `Incremental` TTS without text-stream support is rejected without opening a network connection. Legacy buffered TTS factories are adapted exactly once.
+
+Task-spec probe failures are strict for injected providers, even if the config still says `mock`. For a custom keyless setup, omit `agents.task.spec`; the existing built-in keyless fallback remains unchanged. New config fields require updates to exhaustive Rust struct literals, although YAML omission remains compatible through serde defaults. Existing `TtsRequest`, `AsrSessionConfig`, `PlaybackSink::command`, and legacy provider trait methods remain usable. Internal voice events add reset/provenance/source information. `AsrEvent::InjectedFinal` identifies standalone duplex decorator injection independently of provider IDs; exhaustive event consumers need to handle that additive variant. These are not browser wire changes.
+
+Together now uses the documented realtime endpoint and JSON/base64 messages rather than the previous unverified binary/session-create dialect. Explicit old endpoint overrides are not rewritten: update them to `wss://api.together.ai/v1/realtime`. The adapter waits for `session.created`, supports documented manual commit, and rejects rates other than 16 kHz. See the [official protocol](https://docs.together.ai/reference/audio-transcriptions-realtime); live model/locale compatibility still needs paid contract validation.
 
 ## Validation rules
 
@@ -171,11 +203,7 @@ them.
 
 ## Framework integration
 
-When `agents.task.spec` is present, the runtime builds a `RuntimeAgent` through
-the `ai-agents` `AgentBuilder` chain and wraps it in `AiAgentsCognitiveAgent`.
-It attempts the build once at startup. If that fails with development providers
-(`mock`/`inject`), it falls back to `MockReservationAgent`; with live providers,
-it fails immediately.
+With `framework` enabled and `agents.task.spec` present, runtime startup probes the spec and credentials; actual `RuntimeAgent` construction through `AgentBuilder` occurs separately for each session. Built-in development setups (`mock`/`inject` ASR plus `mock` TTS) preserve the keyless `MockReservationAgent` fallback on probe failure. Live built-in providers and injected providers fail strictly. An injected task spec without the `framework` feature is rejected rather than silently selecting the mock agent; omit the spec for an intentionally keyless injected setup.
 
 A new brain is created **for each session**. `RuntimeAgent` holds conversation
 memory, so sharing one would mix transcripts between clients. Only the tool

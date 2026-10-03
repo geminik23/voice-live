@@ -6,6 +6,23 @@ use crate::interaction::{InteractionDecisionEnvelope, InterruptionReason};
 use crate::meta::EventMeta;
 use crate::semantics::SemanticCue;
 
+/// Origin of a transcript, independent of provider or runtime numeric ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsrSource {
+    Audio,
+    Injection,
+}
+
+/// Which candidate a derived slot update came from. `None` provenance marks
+/// a host-issued update, which never rolls back on a stream reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotProvenance {
+    pub candidate_generation: u64,
+    pub source_utterance_id: u64,
+    pub source: AsrSource,
+}
+
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum VoiceEvent {
@@ -34,7 +51,17 @@ pub enum VoiceEvent {
     AsrUtteranceFinal {
         meta: EventMeta,
         utterance_id: u64,
+        source: AsrSource,
         transcript: String,
+    },
+
+    /// The ASR connection generation restarted, so hypotheses and work
+    /// derived from abandoned partials are invalid. Authoritative finals and
+    /// committed turns are unaffected. Library internal; no browser wire
+    /// change.
+    AsrStreamReset {
+        meta: EventMeta,
+        generation: u64,
     },
 
     SemanticCue {
@@ -47,6 +74,7 @@ pub enum VoiceEvent {
         meta: EventMeta,
         revision: Revision,
         updates: Vec<crate::semantics::frame::SlotUpdate>,
+        provenance: Option<SlotProvenance>,
     },
 
     InteractionDecision {
@@ -217,6 +245,7 @@ impl VoiceEvent {
             VoiceEvent::AsrPartial { .. } => "asr_partial",
             VoiceEvent::StableTranscriptChanged { .. } => "stable_transcript_changed",
             VoiceEvent::AsrUtteranceFinal { .. } => "asr_utterance_final",
+            VoiceEvent::AsrStreamReset { .. } => "asr_stream_reset",
             VoiceEvent::SemanticCue { .. } => "semantic_cue",
             VoiceEvent::SemanticFrameUpdated { .. } => "semantic_frame_updated",
             VoiceEvent::InteractionDecision { .. } => "interaction_decision",

@@ -1,4 +1,4 @@
-# Full-duplex Korean voice runtime configuration.
+# Full-duplex voice runtime configuration with Korean demo defaults.
 #
 # Providers: "together" (Nemotron streaming ASR), "qwen" (DashScope realtime
 # TTS), "inject" (dev text injection), "mock" (offline fakes).
@@ -19,11 +19,15 @@ asr:
   # box. Switch to `together` once TOGETHER_API_KEY is set.
   provider: inject
   model: nvidia/nemotron-3.5-asr-streaming-0.6b
-  endpoint: wss://api.together.xyz/realtime/v1/audio/transcriptions
+  endpoint: wss://api.together.ai/v1/realtime
   api_key_env: TOGETHER_API_KEY
   chunk_ms: 160
   manual_commit: false
   locale: ko-KR
+  # Bounded safety limits for the duplex recognizer connection.
+  open_timeout_ms: 10000
+  write_timeout_ms: 2000
+  input_buffer_ms: 1000
   partials:
     enabled: true
     stable_after_ms: 320
@@ -40,6 +44,12 @@ tts:
   voice_env: QWEN_VOICE_ID
   sample_rate_hz: 24000
   chunk_ms: 60
+  # Language sent with synthesis and premade warmup requests.
+  language: Korean
+  # Bounded safety limits for one synthesis response.
+  open_timeout_ms: 10000
+  request_timeout_ms: 30000
+  max_input_bytes: 65536
   premade:
     enabled: true
     phrases:
@@ -101,6 +111,9 @@ speech:
   # Speech state only advances on a client playback ACK; this releases the
   # queue if a client disconnects mid-utterance.
   playback_ack_timeout_ms: 15000
+  # After an Abort, the interrupted acknowledgement is awaited for this long
+  # before the speech settles with its already confirmed progress.
+  playback_stop_ack_timeout_ms: 1000
   # Recent clauses kept for self-echo detection and the session summary.
   # Durable history lives in the agent's memory, rewritten to what was heard.
   audible_history_max_clauses: 64

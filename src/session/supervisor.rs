@@ -9,8 +9,9 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{AgentTurnRequest, CognitiveAgent, TurnContext, TurnResolution};
 use crate::clock::{ClockRef, TokioClock};
 use crate::config::{ToolEffect, VoiceRuntimeConfig};
-use crate::events::{DeepWorkResult, SessionSummary, VoiceEvent};
+use crate::events::{AsrSource, DeepWorkResult, SessionSummary, SlotProvenance, VoiceEvent};
 use crate::ids::Revision;
+
 use crate::ids::{SpeechId, TaskId, TurnId};
 use crate::interaction::brain::{InteractionBrain, NoopInteractionBrain};
 use crate::interaction::policy::ReflexPolicy;
@@ -29,7 +30,7 @@ use crate::semantics::frame::{SemanticFrame, SlotUpdate};
 use crate::semantics::partial_policy::{PartialControllerPolicy, TranscriptSnapshot};
 use crate::session::deep_worker::DeepWorker;
 use crate::session::task_runner::{ActiveTask, ActiveTaskKind, run_task_turn_with_timeout};
-use crate::session::tts_worker::{TtsCancellationRegistry, run_tts_worker};
+use crate::session::tts_worker::{TtsCancellationRegistry, TtsWorkerSettings, run_tts_worker};
 use crate::session::view::SessionView;
 use crate::speech::act::{ClaimClass, Interruptibility, SpeechAct};
 use crate::speech::claim_gate::ClaimGate;
@@ -51,6 +52,59 @@ struct SpeculativeResult {
     fingerprint: u64,
     summary: String,
     dependencies: Vec<String>,
+    candidate_generation: u64,
+    candidate_utterance_id: Option<u64>,
+}
+
+/// Synthesis outcome for one tracked act, kept separate from playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SynthesisOutcome {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// Playback lifecycle for one tracked act. `Stopping` means an Abort was
+/// sent and the interrupted acknowledgement (or the stop deadline) is the
+/// only thing left to settle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackLifecycle {
+    NotStarted,
+    Playing,
+    Stopping,
+    Settled,
+}
+
+/// The supervisor's private speech tracking: one entry for the current act
+/// and at most one entry for an act that is stopping.
+struct SpeechRecord {
+    text: String,
+    never: bool,
+    sample_rate: u32,
+    /// The main task whose reply contains this act, if any.
+    owner: Option<TaskId>,
+    synthesis: SynthesisOutcome,
+    playback: PlaybackLifecycle,
+    confirmed_samples: u64,
+    stop_deadline_us: Option<u64>,
+}
+
+/// A slot's authoritative baseline before a candidate overwrote it.
+struct SlotJournalEntry {
+    previous: Option<crate::semantics::frame::SemanticValue<serde_json::Value>>,
+    writer: crate::events::SlotProvenance,
+}
+
+/// A committed turn waiting behind a `Never`-protected act. The context is
+/// the snapshot selected at commit time; uncommitted partials that arrive
+/// while waiting never reshape it.
+struct DeferredTurn {
+    turn_id: TurnId,
+    transcript: String,
+    transcript_revision: Revision,
+    context: TurnContext,
+    dependencies: Vec<String>,
 }
 
 pub struct VoiceSession {
@@ -65,7 +119,7 @@ pub struct VoiceSession {
     pub trace_tx: Option<mpsc::Sender<VoiceEvent>>,
 
     pub playback: Arc<dyn PlaybackSink>,
-    pub speech_tx: mpsc::Sender<SpeechAct>,
+    pub speech_tx: mpsc::Sender<(SpeechAct, CancellationToken)>,
     pub tts_registry: Arc<TtsCancellationRegistry>,
 
     pub task_agent: Arc<dyn CognitiveAgent>,
@@ -76,12 +130,13 @@ pub struct VoiceSession {
 
     pub active_tasks: HashMap<TaskId, ActiveTask>,
     pub pending_speech: VecDeque<SpeechAct>,
-    pub speech_texts: HashMap<SpeechId, (String, u32)>,
-    /// Acts that declared `Interruptibility::Never`, tracked separately so the
-    /// abort path can honour them without carrying the whole act around.
-    uninterruptible_speech: HashSet<SpeechId>,
+    speech_records: HashMap<SpeechId, SpeechRecord>,
+    /// Reply ownership of queued acts, so a failed synthesis can discard the
+    /// remaining clauses of exactly the reply it belonged to.
+    act_owner: HashMap<SpeechId, TaskId>,
     /// Monotonic time of the last playback signal for the active speech. The
     /// client owes us an ACK; if it never arrives the queue must not wedge.
+    /// Synthesis chunks never refresh it: only real playback does.
     last_playback_signal_us: Option<u64>,
 
     pub transcript: TranscriptReconciler,
@@ -100,6 +155,15 @@ pub struct VoiceSession {
     deep_results: Vec<DeepWorkResult>,
     turn_speech: HashMap<TaskId, TurnSpeech>,
     turn_started_at_us: Option<u64>,
+    /// Increments on every ASR stream reset; results derived from older
+    /// generations are discarded on arrival.
+    candidate_generation: u64,
+    /// Highest audio-source utterance whose candidates are closed (committed
+    /// or superseded by an authoritative final).
+    candidate_closed_watermark: Option<u64>,
+    slot_journal: HashMap<crate::semantics::frame::SlotName, SlotJournalEntry>,
+    deferred_turn: Option<DeferredTurn>,
+    workers: tokio::task::JoinSet<()>,
 
     pub shutdown: CancellationToken,
     pub metrics: MetricsRef,
@@ -233,7 +297,7 @@ impl VoiceSessionBuilder {
     pub fn build(self) -> (VoiceSession, VoiceSessionHandle) {
         let session_id = self.session_id.unwrap_or_default();
         let (event_tx, event_rx) = mpsc::channel::<VoiceEvent>(1024);
-        let (speech_tx, speech_rx) = mpsc::channel::<SpeechAct>(64);
+        let (speech_tx, speech_rx) = mpsc::channel::<(SpeechAct, CancellationToken)>(64);
         let tts_registry = Arc::new(TtsCancellationRegistry::default());
 
         let cue_extractor = CueExtractor::from_config(&self.config.turn_control);
@@ -241,14 +305,32 @@ impl VoiceSessionBuilder {
         let interaction_interval = self.config.agents.interaction.minimum_interval_ms;
         let audible_capacity = self.config.speech.audible_history_max_clauses;
 
-        tokio::spawn(run_tts_worker(
-            self.tts,
+        let tts: Arc<dyn StreamingTts> = if self.tts.text_input_mode()
+            == crate::tts::TextInputMode::Buffered
+            && !self.tts.supports_text_stream()
+        {
+            crate::tts::buffered::BufferedTtsAdapter::new(self.tts)
+        } else {
+            self.tts
+        };
+        let worker_settings = TtsWorkerSettings {
+            language: self.config.tts.language.clone(),
+            voice: self.config.tts.resolved_voice(),
+            max_input_bytes: self.config.tts.max_input_bytes,
+            request_timeout: Duration::from_millis(self.config.tts.request_timeout_ms),
+            open_timeout: Duration::from_millis(self.config.tts.open_timeout_ms),
+            preferred_sample_rate_hz: Some(self.config.tts.sample_rate_hz),
+        };
+
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(run_tts_worker(
+            tts,
             speech_rx,
             event_tx.clone(),
             Arc::clone(&self.meta_factory),
             self.shutdown.clone(),
             Arc::clone(&tts_registry),
-            self.config.tts.resolved_voice(),
+            worker_settings,
         ));
 
         let session = VoiceSession {
@@ -270,8 +352,8 @@ impl VoiceSessionBuilder {
             deep_worker: self.deep_worker,
             active_tasks: HashMap::new(),
             pending_speech: VecDeque::new(),
-            speech_texts: HashMap::new(),
-            uninterruptible_speech: HashSet::new(),
+            speech_records: HashMap::new(),
+            act_owner: HashMap::new(),
             last_playback_signal_us: None,
             transcript: TranscriptReconciler::new(asr_partials),
             turn_buffer: TurnAssemblyBuffer::default(),
@@ -288,6 +370,11 @@ impl VoiceSessionBuilder {
             deep_results: Vec::new(),
             turn_speech: HashMap::new(),
             turn_started_at_us: None,
+            candidate_generation: 0,
+            candidate_closed_watermark: None,
+            slot_journal: HashMap::new(),
+            deferred_turn: None,
+            workers,
             shutdown: self.shutdown,
             metrics: self.metrics,
         };
@@ -309,27 +396,32 @@ impl VoiceSession {
         control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         control_tick.tick().await;
 
-        loop {
+        let shutdown = self.shutdown.clone();
+        let result = loop {
             tokio::select! {
-                _ = self.shutdown.cancelled() => {
-                    self.shutdown_active_work().await;
-                    break;
-                }
-
+                _ = self.shutdown.cancelled() => break Ok(()),
                 _ = control_tick.tick() => {
-                    self.on_control_tick().await?;
-                }
-
-                event = self.event_rx.recv() => {
-                    let Some(event) = event else {
-                        break;
+                    let result = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break Ok(()),
+                        result = self.on_control_tick() => result,
                     };
-                    self.handle_event(event).await?;
+                    if let Err(error) = result { break Err(error); }
+                }
+                event = self.event_rx.recv() => {
+                    let Some(event) = event else { break Ok(()); };
+                    let result = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break Ok(()),
+                        result = self.handle_event(event) => result,
+                    };
+                    if let Err(error) = result { break Err(error); }
                 }
             }
-        }
-
-        Ok(())
+            while self.workers.try_join_next().is_some() {}
+        };
+        self.shutdown_active_work().await;
+        result
     }
 
     fn monotonic_us(&self) -> u64 {
@@ -348,6 +440,14 @@ impl VoiceSession {
 
     async fn handle_event(&mut self, event: VoiceEvent) -> Result<()> {
         self.forward_trace(&event).await;
+
+        // Speech events are admitted by identity and lifecycle before any
+        // projection or handler runs, so a late chunk, a duplicate terminal,
+        // or an old acknowledgement can never touch the current state.
+        if !self.admit_speech_event(&event) {
+            return Ok(());
+        }
+
         if self.should_apply_projection(&event) {
             self.state.apply(&event);
         }
@@ -378,6 +478,7 @@ impl VoiceSession {
             VoiceEvent::AsrUtteranceFinal {
                 meta,
                 utterance_id,
+                source,
                 transcript,
                 ..
             } => {
@@ -386,16 +487,33 @@ impl VoiceSession {
                 if self.state.last_user_audio_at_us.is_none() {
                     self.state.last_user_audio_at_us = Some(meta.monotonic_us);
                 }
+                if source == AsrSource::Injection {
+                    self.turn_buffer.push_final(transcript);
+                    self.state.current_hypothesis = self.transcript.current_text().to_owned();
+                    self.state.stable_prefix = self.transcript.stable_prefix().to_owned();
+                    self.close_candidates_for(utterance_id, source);
+                    self.publish_interaction_snapshot().await;
+                    return Ok(());
+                }
                 self.transcript.on_final(utterance_id, &transcript);
                 let sealed = self.transcript.seal_current();
                 self.turn_buffer.push_final(sealed);
                 self.state.current_hypothesis.clear();
                 self.state.stable_prefix.clear();
+                self.close_candidates_for(utterance_id, source);
                 self.publish_interaction_snapshot().await;
             }
 
-            VoiceEvent::SemanticFrameUpdated { updates, .. } => {
-                self.apply_slot_updates(updates).await?;
+            VoiceEvent::AsrStreamReset { .. } => {
+                self.on_asr_stream_reset().await?;
+            }
+
+            VoiceEvent::SemanticFrameUpdated {
+                updates,
+                provenance,
+                ..
+            } => {
+                self.apply_slot_updates(updates, provenance).await?;
             }
 
             VoiceEvent::InteractionDecision { envelope, .. } => {
@@ -494,13 +612,18 @@ impl VoiceSession {
                 played_samples,
                 ..
             } => {
-                self.last_playback_signal_us = Some(self.monotonic_us());
+                if let Some(record) = self.speech_records.get_mut(&speech_id) {
+                    record.confirmed_samples = record.confirmed_samples.max(played_samples);
+                }
+                if self.state.active_speech_id == Some(speech_id) {
+                    self.last_playback_signal_us = Some(self.monotonic_us());
+                }
                 self.audible_ledger.mark_progress(speech_id, played_samples);
             }
 
             VoiceEvent::PlaybackCompleted { speech_id, .. } => {
                 self.last_playback_signal_us = None;
-                self.uninterruptible_speech.remove(&speech_id);
+                self.settle_speech_record(speech_id);
                 self.audible_ledger.mark_completed(speech_id);
                 self.start_next_speech_if_possible().await?;
             }
@@ -511,8 +634,13 @@ impl VoiceSession {
                 reason,
                 ..
             } => {
-                self.last_playback_signal_us = None;
-                self.uninterruptible_speech.remove(&speech_id);
+                if self.state.active_speech_id == Some(speech_id) {
+                    self.last_playback_signal_us = None;
+                }
+                if let Some(record) = self.speech_records.get_mut(&speech_id) {
+                    record.confirmed_samples = record.confirmed_samples.max(played_samples);
+                }
+                self.settle_speech_record(speech_id);
                 self.audible_ledger
                     .mark_interrupted(speech_id, played_samples, reason);
                 self.metrics.inc("voice_speech_interrupted_total");
@@ -548,7 +676,75 @@ impl VoiceSession {
         }
 
         self.resolve_settled_turns();
+        self.maybe_release_deferred().await?;
         Ok(())
+    }
+
+    /// Admission for speech-lifecycle events. `true` means the event may run
+    /// its projection and handler; `false` drops it after the trace. Events
+    /// that are not speech-lifecycle events are always admitted.
+    fn admit_speech_event(&self, event: &VoiceEvent) -> bool {
+        let record = |speech_id: &SpeechId| self.speech_records.get(speech_id);
+
+        match event {
+            VoiceEvent::TtsAudioChunk {
+                speech_id,
+                speech_epoch,
+                ..
+            } => record(speech_id).is_some_and(|record| {
+                record.synthesis == SynthesisOutcome::Running
+                    && record.playback != PlaybackLifecycle::Settled
+                    && *speech_epoch == self.state.epochs.speech
+            }),
+
+            VoiceEvent::TtsAudioDone {
+                speech_id,
+                speech_epoch,
+                ..
+            } => record(speech_id).is_some_and(|record| {
+                record.synthesis == SynthesisOutcome::Running
+                    && *speech_epoch == self.state.epochs.speech
+            }),
+
+            VoiceEvent::TtsFailed {
+                speech_id,
+                speech_epoch,
+                ..
+            } => record(speech_id).is_some_and(|record| {
+                record.synthesis == SynthesisOutcome::Running
+                    && *speech_epoch == self.state.epochs.speech
+            }),
+
+            VoiceEvent::PlaybackProgress { speech_id, .. } => {
+                record(speech_id).is_some_and(|record| {
+                    matches!(
+                        record.playback,
+                        PlaybackLifecycle::Playing | PlaybackLifecycle::Stopping
+                    )
+                })
+            }
+
+            VoiceEvent::PlaybackCompleted { speech_id, .. } => {
+                record(speech_id).is_some_and(|record| {
+                    record.synthesis == SynthesisOutcome::Succeeded
+                        && record.playback == PlaybackLifecycle::Playing
+                })
+            }
+
+            // An interrupted acknowledgement may legitimately arrive after an
+            // epoch bump, so identity - not the epoch - decides here.
+            VoiceEvent::PlaybackInterrupted { speech_id, .. } => record(speech_id)
+                .is_some_and(|record| record.playback != PlaybackLifecycle::Settled),
+
+            _ => true,
+        }
+    }
+
+    fn settle_speech_record(&mut self, speech_id: SpeechId) {
+        if let Some(mut record) = self.speech_records.remove(&speech_id) {
+            record.playback = PlaybackLifecycle::Settled;
+        }
+        self.act_owner.remove(&speech_id);
     }
 
     fn should_apply_projection(&self, event: &VoiceEvent) -> bool {
@@ -621,9 +817,29 @@ impl VoiceSession {
     /// clause simply never starts. `Never` is the only class that has to be
     /// honoured inside `abort_current_speech`.
     fn active_speech_is_uninterruptible(&self) -> bool {
-        self.state
-            .active_speech_id
-            .is_some_and(|id| self.uninterruptible_speech.contains(&id))
+        self.state.active_speech_id.is_some_and(|id| {
+            self.speech_records
+                .get(&id)
+                .is_some_and(|record| record.never)
+        })
+    }
+
+    /// A `Never` act currently holds the floor: an ordinary new turn defers
+    /// behind it. Only a hard stop or a safety failure may end the act.
+    fn current_act_is_never_protected(&self) -> bool {
+        self.state.active_speech_id.is_some_and(|id| {
+            self.speech_records.get(&id).is_some_and(|record| {
+                record.never
+                    && matches!(
+                        record.synthesis,
+                        SynthesisOutcome::Running | SynthesisOutcome::Succeeded
+                    )
+                    && matches!(
+                        record.playback,
+                        PlaybackLifecycle::NotStarted | PlaybackLifecycle::Playing
+                    )
+            })
+        })
     }
 
     async fn abort_current_speech(&mut self, reason: InterruptionReason) -> Result<()> {
@@ -642,12 +858,28 @@ impl VoiceSession {
         // flight against the old one.
         self.state.epochs.bump_interaction();
 
+        let now_us = self.monotonic_us();
+        let stop_ack_timeout_us = self.config.speech.playback_stop_ack_timeout_ms * 1_000;
+
         if let Some(speech_id) = self.state.active_speech_id.take() {
             self.tts_registry.cancel(&speech_id);
-            // The cancelled synthesis emits no AudioDone, so nothing else will
-            // ever retire this entry.
-            self.speech_texts.remove(&speech_id);
-            self.uninterruptible_speech.remove(&speech_id);
+            // The cancelled synthesis emits no AudioDone, so the record's only
+            // remaining duty is settling the ledger when the interrupted
+            // acknowledgement (or the stop deadline) lands.
+            match self.speech_records.get_mut(&speech_id) {
+                Some(record) if record.playback != PlaybackLifecycle::NotStarted => {
+                    record.synthesis = SynthesisOutcome::Cancelled;
+                    record.never = false;
+                    record.playback = PlaybackLifecycle::Stopping;
+                    record.stop_deadline_us = Some(now_us.saturating_add(stop_ack_timeout_us));
+                }
+                Some(_) => {
+                    // Nothing reached the browser, so nothing will ever
+                    // acknowledge it.
+                    self.settle_speech_record(speech_id);
+                }
+                None => {}
+            }
             // `active_speech_id` is cleared so turn settlement does not wait
             // on an act that will never report again. If it had started
             // playing, the ledger still holds it in flight until the client's
@@ -822,7 +1054,7 @@ impl VoiceSession {
 
             match cue {
                 SemanticCue::HardStop { .. } => {
-                    if agent_audible {
+                    if self.state.active_speech_id.is_some() {
                         self.abort_current_speech(InterruptionReason::HardStop)
                             .await?;
                     }
@@ -853,7 +1085,13 @@ impl VoiceSession {
                         confidence,
                         source_revision: revision,
                     };
-                    self.apply_slot_updates(vec![update]).await?;
+                    let provenance = SlotProvenance {
+                        candidate_generation: self.candidate_generation,
+                        source_utterance_id: utterance_id,
+                        source: AsrSource::Audio,
+                    };
+                    self.apply_slot_updates(vec![update], Some(provenance))
+                        .await?;
                 }
                 _ => {}
             }
@@ -903,7 +1141,13 @@ impl VoiceSession {
         let event_tx = self.event_tx.clone();
         let meta_factory = Arc::clone(&self.meta_factory);
 
-        tokio::spawn(async move {
+        let shutdown = self.shutdown.clone();
+        let timeout = Duration::from_millis(self.config.agents.interaction.timeout_ms);
+        self.workers.spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = tokio::time::sleep(timeout) => {},
+                _ = async {
             if let Some(envelope) = brain.decide(snapshot).await {
                 let _ = event_tx
                     .send(VoiceEvent::InteractionDecision {
@@ -911,6 +1155,8 @@ impl VoiceSession {
                         envelope,
                     })
                     .await;
+            }
+                } => {},
             }
         });
     }
@@ -940,8 +1186,19 @@ impl VoiceSession {
         let previous_frame = self.state.semantic_frame.clone();
         let event_tx = self.event_tx.clone();
         let meta_factory = Arc::clone(&self.meta_factory);
+        let provenance = SlotProvenance {
+            candidate_generation: self.candidate_generation,
+            source_utterance_id: self.transcript.current_utterance(),
+            source: AsrSource::Audio,
+        };
 
-        tokio::spawn(async move {
+        let shutdown = self.shutdown.clone();
+        let timeout = Duration::from_millis(self.config.agents.interaction.timeout_ms);
+        self.workers.spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = tokio::time::sleep(timeout) => {},
+                _ = async {
             let updates = extractor
                 .extract(&previous_frame, &stable_prefix, revision)
                 .await;
@@ -954,12 +1211,41 @@ impl VoiceSession {
                     meta: meta_factory.new_meta(),
                     revision,
                     updates,
+                    provenance: Some(provenance),
                 })
                 .await;
+                } => {},
+            }
         });
     }
 
-    async fn apply_slot_updates(&mut self, updates: Vec<SlotUpdate>) -> Result<()> {
+    /// Applies slot updates with their provenance.
+    ///
+    /// Candidate-derived work from an abandoned or closed generation is
+    /// discarded before it can touch the frame. Candidate writes journal the
+    /// authoritative baseline they overwrite, so a stream reset can restore
+    /// it; host-issued writes retire the journal entry instead.
+    async fn apply_slot_updates(
+        &mut self,
+        updates: Vec<SlotUpdate>,
+        provenance: Option<SlotProvenance>,
+    ) -> Result<()> {
+        if let Some(provenance) = &provenance
+            && provenance.candidate_generation != self.candidate_generation
+        {
+            self.metrics.inc("voice_stale_slot_update_total");
+            return Ok(());
+        }
+
+        if let Some(provenance) = &provenance
+            && let Some(watermark) = self.candidate_closed_watermark
+            && provenance.source == AsrSource::Audio
+            && provenance.source_utterance_id <= watermark
+        {
+            self.metrics.inc("voice_stale_slot_update_total");
+            return Ok(());
+        }
+
         let mut changed_slots: Vec<SlotName> = Vec::new();
 
         for update in updates {
@@ -968,6 +1254,25 @@ impl VoiceSession {
 
             if is_correction {
                 changed_slots.push(update.slot.clone());
+            }
+
+            match &provenance {
+                Some(provenance) => {
+                    let previous = self.state.semantic_frame.slots.get(&update.slot).cloned();
+                    let journal =
+                        self.slot_journal
+                            .entry(update.slot.clone())
+                            .or_insert_with(|| SlotJournalEntry {
+                                previous: previous.clone(),
+                                writer: provenance.clone(),
+                            });
+                    if journal.writer != *provenance {
+                        journal.writer = provenance.clone();
+                    }
+                }
+                None => {
+                    self.slot_journal.remove(&update.slot);
+                }
             }
 
             self.state.semantic_frame.set_slot(update);
@@ -980,6 +1285,102 @@ impl VoiceSession {
         }
 
         Ok(())
+    }
+
+    /// Closes the candidates of one utterance: its writes become
+    /// authoritative, and later resets never roll them back.
+    fn close_candidates_for(&mut self, source_utterance_id: u64, source: AsrSource) {
+        if source == AsrSource::Injection {
+            self.slot_journal.retain(|_, entry| {
+                entry.writer.source != source
+                    || entry.writer.source_utterance_id != source_utterance_id
+            });
+            return;
+        }
+
+        let watermark = self
+            .candidate_closed_watermark
+            .map(|current| current.max(source_utterance_id))
+            .unwrap_or(source_utterance_id);
+        self.candidate_closed_watermark = Some(watermark);
+        self.state.epochs.bump_interaction();
+        for task in self.active_tasks.values_mut() {
+            if task.kind == ActiveTaskKind::SpeculativeRead
+                && task.candidate_generation == self.candidate_generation
+                && task
+                    .candidate_utterance_id
+                    .is_some_and(|id| id <= watermark)
+            {
+                task.candidate_generation = u64::MAX;
+            }
+        }
+        for result in &mut self.speculative_results {
+            if result.candidate_generation == self.candidate_generation
+                && result
+                    .candidate_utterance_id
+                    .is_some_and(|id| id <= watermark)
+            {
+                result.candidate_generation = u64::MAX;
+            }
+        }
+
+        // Serial utterance ids: anything at or below the watermark is
+        // closed, so only strictly newer candidates stay journaled.
+        self.slot_journal.retain(|_, entry| {
+            entry.writer.source != AsrSource::Audio || entry.writer.source_utterance_id > watermark
+        });
+    }
+
+    /// An ASR generation restart voids the abandoned hypotheses and every
+    /// kind of work derived from them. Authoritative finals, committed turns,
+    /// and host-issued slot values are untouched.
+    async fn on_asr_stream_reset(&mut self) -> Result<()> {
+        self.transcript.clear();
+        self.state.current_hypothesis.clear();
+        self.state.stable_prefix.clear();
+        self.state.epochs.bump_interaction();
+        self.rollback_abandoned_candidate_slots();
+        let abandoned = self.candidate_generation;
+        self.candidate_generation += 1;
+        let cancelled: Vec<TaskId> = self
+            .active_tasks
+            .iter()
+            .filter(|(_, task)| {
+                task.kind == ActiveTaskKind::SpeculativeRead
+                    && task.candidate_generation == abandoned
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in cancelled {
+            if let Some(mut task) = self.active_tasks.remove(&id) {
+                task.cancel();
+            }
+        }
+        self.speculative_results
+            .retain(|result| result.candidate_generation != abandoned);
+        self.metrics.inc("voice_asr_reset_total");
+
+        Ok(())
+    }
+
+    /// Restores exact metadata or absence without triggering unrelated correction policy.
+    fn rollback_abandoned_candidate_slots(&mut self) {
+        for (slot, entry) in std::mem::take(&mut self.slot_journal) {
+            if entry.writer.source == AsrSource::Audio
+                && entry.writer.candidate_generation == self.candidate_generation
+            {
+                match entry.previous {
+                    Some(value) => {
+                        self.state.semantic_frame.slots.insert(slot, value);
+                    }
+                    None => {
+                        self.state.semantic_frame.slots.remove(&slot);
+                    }
+                }
+                self.state.semantic_frame.revision = self.state.semantic_frame.revision.next();
+                self.metrics.inc("voice_slot_rollback_total");
+            }
+        }
     }
 
     fn maybe_spawn_speculative(&mut self, stable_prefix: &str) {
@@ -1044,7 +1445,7 @@ impl VoiceSession {
         let child = cancellation.clone();
         let timeout = Duration::from_millis(self.config.agents.speculative.timeout_ms);
 
-        let handle = tokio::spawn(async move {
+        self.workers.spawn(async move {
             run_task_turn_with_timeout(agent, request, child, event_tx, meta_factory, timeout)
                 .await;
         });
@@ -1058,7 +1459,9 @@ impl VoiceSession {
                 dependencies,
                 fingerprint,
                 cancellation,
-                handle: Some(handle),
+                handle: None,
+                candidate_generation: self.candidate_generation,
+                candidate_utterance_id: Some(self.transcript.current_utterance()),
             },
         );
 
@@ -1082,6 +1485,9 @@ impl VoiceSession {
         for task_id in task_ids {
             if let Some(mut task) = self.active_tasks.remove(&task_id) {
                 task.cancel();
+                if task.kind == ActiveTaskKind::MainTurn {
+                    self.resolve_turn(task_id, TurnResolution::Discard);
+                }
             }
         }
 
@@ -1098,6 +1504,7 @@ impl VoiceSession {
     // User turn commit and main task processing.
 
     async fn commit_user_turn(&mut self, reason: &str) -> Result<()> {
+        let sealed_source = self.transcript.current_utterance();
         let sealed = self.transcript.seal_current();
         if !sealed.trim().is_empty() {
             self.turn_buffer.push_partial_seal(sealed);
@@ -1108,6 +1515,11 @@ impl VoiceSession {
         if transcript.trim().is_empty() {
             return Ok(());
         }
+
+        // The committed turn promotes the candidates that fed it, even when
+        // no authoritative final ever arrived: a later stream reset must not
+        // roll back work the user already committed.
+        self.close_candidates_for(sealed_source, AsrSource::Audio);
 
         let turn_id = TurnId::new();
         let revision = self.state.epochs.transcript;
@@ -1126,14 +1538,15 @@ impl VoiceSession {
         self.state.epochs.bump_interaction();
         self.metrics.inc("voice_user_turn_committed_total");
 
-        self.event_tx
-            .send(VoiceEvent::UserTurnCommitted {
-                meta: self.new_meta(),
-                turn_id,
-                transcript_revision: revision,
-                transcript,
-            })
-            .await?;
+        let event = VoiceEvent::UserTurnCommitted {
+            meta: self.new_meta(),
+            turn_id,
+            transcript_revision: revision,
+            transcript: transcript.clone(),
+        };
+        self.forward_trace(&event).await;
+        self.state.apply(&event);
+        self.start_main_task(turn_id, transcript, revision).await?;
 
         let _ = reason;
         Ok(())
@@ -1145,13 +1558,9 @@ impl VoiceSession {
         transcript: String,
         transcript_revision: Revision,
     ) -> Result<()> {
-        // The previous turn must be settled before this one can start: the
-        // agent will not admit a new turn while an earlier one is unresolved.
-        self.settle_previous_turns().await?;
-
-        let task_id = TaskId::new();
-        let thought_epoch = self.state.epochs.invalidate_thought();
-
+        // The commit-time environment is selected here. A `Never`-protected
+        // act defers this turn, and uncommitted partials arriving while it
+        // waits must not reshape the context the turn eventually runs with.
         let context = render_turn_context(
             turn_id,
             transcript_revision,
@@ -1163,6 +1572,38 @@ impl VoiceSession {
                 .collect::<Vec<_>>(),
             &self.deep_results,
         );
+        let dependencies: Vec<String> = self.state.semantic_frame.slots.keys().cloned().collect();
+        self.settle_previous_turns().await?;
+        self.pending_speech.clear();
+        self.act_owner.clear();
+        if self.deferred_turn.take().is_some() {
+            self.metrics.inc("voice_turn_deferred_superseded_total");
+        }
+
+        if self.current_act_is_never_protected() {
+            self.deferred_turn = Some(DeferredTurn {
+                turn_id,
+                transcript,
+                transcript_revision,
+                context,
+                dependencies,
+            });
+            self.metrics.inc("voice_turn_deferred_total");
+            return Ok(());
+        }
+
+        self.spawn_main_task_now(transcript, context, dependencies)
+            .await
+    }
+
+    async fn spawn_main_task_now(
+        &mut self,
+        transcript: String,
+        context: TurnContext,
+        dependencies: Vec<String>,
+    ) -> Result<()> {
+        let task_id = TaskId::new();
+        let thought_epoch = self.state.epochs.invalidate_thought();
 
         let cancellation = CancellationToken::new();
         let request = AgentTurnRequest {
@@ -1174,7 +1615,7 @@ impl VoiceSession {
             input: transcript,
             context,
             speculative: false,
-            dependencies: self.state.semantic_frame.slots.keys().cloned().collect(),
+            dependencies,
         };
 
         let agent = Arc::clone(&self.task_agent);
@@ -1183,7 +1624,7 @@ impl VoiceSession {
         let child = cancellation.clone();
         let timeout = Duration::from_millis(self.config.agents.task.timeout_ms);
 
-        let handle = tokio::spawn(async move {
+        self.workers.spawn(async move {
             run_task_turn_with_timeout(agent, request, child, event_tx, meta_factory, timeout)
                 .await;
         });
@@ -1197,7 +1638,9 @@ impl VoiceSession {
                 dependencies: Vec::new(),
                 fingerprint: 0,
                 cancellation,
-                handle: Some(handle),
+                handle: None,
+                candidate_generation: self.candidate_generation,
+                candidate_utterance_id: None,
             },
         );
 
@@ -1206,6 +1649,41 @@ impl VoiceSession {
 
         self.metrics.inc("voice_task_started_total");
         Ok(())
+    }
+
+    /// Starts the deferred turn once nothing protects the floor anymore.
+    /// Consuming the record once means a duplicated acknowledgement can
+    /// never start it twice.
+    async fn maybe_release_deferred(&mut self) -> Result<()> {
+        if self.deferred_turn.is_none() {
+            return Ok(());
+        }
+
+        if self.current_act_is_never_protected()
+            || !self.speech_records.is_empty()
+            || !self.turn_speech.is_empty()
+        {
+            return Ok(());
+        }
+
+        if self
+            .active_tasks
+            .values()
+            .any(|task| task.kind == ActiveTaskKind::MainTurn)
+        {
+            return Ok(());
+        }
+
+        let deferred = self.deferred_turn.take().expect("checked above");
+        self.metrics.inc("voice_turn_deferred_released_total");
+        tracing::debug!(
+            turn_id = %deferred.turn_id,
+            revision = %deferred.transcript_revision,
+            "releasing the turn deferred behind a protected act"
+        );
+
+        self.spawn_main_task_now(deferred.transcript, deferred.context, deferred.dependencies)
+            .await
     }
 
     // Tool lifecycle processing.
@@ -1225,6 +1703,9 @@ impl VoiceSession {
                     }
                     ActiveTaskKind::SpeculativeRead | ActiveTaskKind::DeepWorker => {
                         !task.cancellation.is_cancelled()
+                            && (task.kind != ActiveTaskKind::SpeculativeRead
+                                || matches!(task.candidate_generation, u64::MAX)
+                                || task.candidate_generation == self.candidate_generation)
                     }
                 }
             }
@@ -1266,7 +1747,7 @@ impl VoiceSession {
             expires_at_monotonic_us: Some(self.monotonic_us() + template.expire_after_ms * 1_000),
         };
 
-        self.authorize_and_enqueue(act).await?;
+        self.authorize_and_enqueue(act, None).await?;
         Ok(())
     }
 
@@ -1354,6 +1835,10 @@ impl VoiceSession {
 
         match kind {
             Some(ActiveTaskKind::SpeculativeRead) => {
+                if !self.is_task_result_current(task_id, thought_epoch) {
+                    self.active_tasks.remove(&task_id);
+                    return Ok(());
+                }
                 let fingerprint = self
                     .active_tasks
                     .get(&task_id)
@@ -1365,11 +1850,22 @@ impl VoiceSession {
                     .map(|task| task.dependencies.clone())
                     .unwrap_or_default();
 
+                let candidate_generation = self
+                    .active_tasks
+                    .get(&task_id)
+                    .map(|task| task.candidate_generation)
+                    .unwrap_or(0);
+                let candidate_utterance_id = self
+                    .active_tasks
+                    .get(&task_id)
+                    .and_then(|task| task.candidate_utterance_id);
                 self.active_tasks.remove(&task_id);
                 self.speculative_results.push(SpeculativeResult {
                     fingerprint,
                     summary: text,
                     dependencies,
+                    candidate_generation,
+                    candidate_utterance_id,
                 });
                 self.metrics.inc("voice_speculative_completed_total");
                 return Ok(());
@@ -1413,6 +1909,13 @@ impl VoiceSession {
             )]
         };
 
+        self.turn_speech.insert(
+            task_id,
+            TurnSpeech {
+                final_text: text.clone(),
+                clauses: Vec::new(),
+            },
+        );
         let mut spoken = Vec::new();
         for clause in split_clauses(&text) {
             let class = if transactional {
@@ -1433,7 +1936,12 @@ impl VoiceSession {
             };
 
             let id = act.id;
-            if self.authorize_and_enqueue(act).await? {
+            self.turn_speech
+                .get_mut(&task_id)
+                .expect("reply owner registered")
+                .clauses
+                .push((id, clause.clone()));
+            if self.authorize_and_enqueue(act, Some(task_id)).await? {
                 spoken.push((id, clause));
             }
         }
@@ -1474,6 +1982,8 @@ impl VoiceSession {
             {
                 self.active_tasks.remove(&task_id);
                 self.resolve_turn(task_id, TurnResolution::Discard);
+            } else {
+                self.active_tasks.remove(&task_id);
             }
             return Ok(());
         }
@@ -1498,7 +2008,7 @@ impl VoiceSession {
             self.state.epochs.speech,
             crate::speech::act::PRIORITY_CLARIFICATION,
         );
-        self.authorize_and_enqueue(act).await?;
+        self.authorize_and_enqueue(act, None).await?;
 
         self.metrics.inc("voice_agent_failed_total");
         tracing::warn!("agent turn failed: {message}");
@@ -1508,7 +2018,11 @@ impl VoiceSession {
     // Speech queue and TTS flow.
 
     /// Returns whether the act was queued. A rejected act is dropped silently.
-    async fn authorize_and_enqueue(&mut self, act: SpeechAct) -> Result<bool> {
+    async fn authorize_and_enqueue(
+        &mut self,
+        act: SpeechAct,
+        owner: Option<TaskId>,
+    ) -> Result<bool> {
         let now_us = self.monotonic_us();
 
         if let Err(rejection) = self.claim_gate.authorize(&act, &self.state, now_us) {
@@ -1522,6 +2036,10 @@ impl VoiceSession {
         {
             self.metrics.inc("voice_speech_expired_total");
             return Ok(false);
+        }
+
+        if let Some(owner) = owner {
+            self.act_owner.insert(act.id, owner);
         }
 
         self.enqueue_act_unchecked(act);
@@ -1539,6 +2057,16 @@ impl VoiceSession {
     }
 
     async fn start_next_speech_if_possible(&mut self) -> Result<()> {
+        if self
+            .speech_records
+            .values()
+            .any(|record| record.playback == PlaybackLifecycle::Stopping)
+        {
+            return Ok(());
+        }
+        if self.deferred_turn.is_some() {
+            return Ok(());
+        }
         if matches!(
             self.state.speech,
             SpeechState::Playing | SpeechState::Synthesizing | SpeechState::Ducking
@@ -1556,16 +2084,37 @@ impl VoiceSession {
                 continue;
             }
 
-            self.speech_texts.insert(act.id, (act.text.clone(), 0));
+            self.speech_records.insert(
+                act.id,
+                SpeechRecord {
+                    text: act.text.clone(),
+                    never: act.interruptibility == Interruptibility::Never,
+                    sample_rate: 0,
+                    owner: self.act_owner.get(&act.id).copied(),
+                    synthesis: SynthesisOutcome::Running,
+                    playback: PlaybackLifecycle::NotStarted,
+                    confirmed_samples: 0,
+                    stop_deadline_us: None,
+                },
+            );
+            self.act_owner.remove(&act.id);
             self.state.active_speech_id = Some(act.id);
-            self.last_playback_signal_us = Some(self.monotonic_us());
 
-            if act.interruptibility == Interruptibility::Never {
-                self.uninterruptible_speech.insert(act.id);
-            }
+            // The playback watchdog is armed by the first real playback
+            // evidence, never by synthesis admission.
 
-            if self.speech_tx.send(act).await.is_err() {
-                return Ok(());
+            // The cancellation token is registered before queue admission,
+            // so an abort can never miss the window while the act sits in
+            // the queue.
+            let cancellation = CancellationToken::new();
+            self.tts_registry.insert(act.id, cancellation.clone());
+            let act_id = act.id;
+
+            if self.speech_tx.try_send((act, cancellation)).is_err() {
+                self.tts_registry.remove(&act_id);
+                self.speech_records.remove(&act_id);
+                self.shutdown.cancel();
+                anyhow::bail!("speech queue overloaded or closed");
             }
 
             self.state.speech = SpeechState::Synthesizing;
@@ -1583,17 +2132,25 @@ impl VoiceSession {
         sample_rate: u32,
         pcm: bytes::Bytes,
     ) -> Result<()> {
-        if speech_epoch != self.state.epochs.speech {
-            self.metrics.inc("voice_stale_tts_chunk_dropped_total");
+        if pcm.is_empty() {
             return Ok(());
         }
+        // Admission already verified identity before any state is changed.
+        let first_audio = match self.speech_records.get_mut(&speech_id) {
+            Some(record) if record.playback == PlaybackLifecycle::NotStarted => {
+                record.playback = PlaybackLifecycle::Playing;
+                record.sample_rate = sample_rate;
+                true
+            }
+            Some(_) => false,
+            None => return Ok(()),
+        };
 
-        self.last_playback_signal_us = Some(self.monotonic_us());
-
-        let first_audio = !matches!(
-            self.state.speech,
-            SpeechState::Playing | SpeechState::Ducking
-        );
+        // Only real playback evidence arms the watchdog; synthesis chunks
+        // must not mask a client that stopped acknowledging.
+        if first_audio {
+            self.last_playback_signal_us = Some(self.monotonic_us());
+        }
 
         if self.state.local_vad_active {
             // The user started speaking while we were synthesizing: keep the
@@ -1620,14 +2177,9 @@ impl VoiceSession {
             }
         }
 
-        let first_audio_text = self.speech_texts.get_mut(&speech_id).map(|(text, rate)| {
-            *rate = sample_rate;
-            text.clone()
-        });
-
-        if first_audio && let Some(text) = first_audio_text {
+        if first_audio && let Some(record) = self.speech_records.get(&speech_id) {
             self.audible_ledger
-                .speech_started(speech_id, &text, sample_rate);
+                .speech_started(speech_id, &record.text, sample_rate);
         }
         self.audible_ledger
             .add_enqueued_samples(speech_id, (pcm.len() / 2) as u64);
@@ -1646,11 +2198,21 @@ impl VoiceSession {
     }
 
     async fn on_tts_audio_done(&mut self, speech_id: SpeechId, speech_epoch: u64) -> Result<()> {
-        if speech_epoch != self.state.epochs.speech {
-            return Ok(());
+        // Admission verified the record, the epoch, and the running
+        // synthesis: this is the first and only success terminal.
+        if self
+            .speech_records
+            .get(&speech_id)
+            .is_some_and(|record| record.playback == PlaybackLifecycle::NotStarted)
+        {
+            return self
+                .on_tts_failed(speech_id, "tts completed without audio".into())
+                .await;
+        }
+        if let Some(record) = self.speech_records.get_mut(&speech_id) {
+            record.synthesis = SynthesisOutcome::Succeeded;
         }
 
-        self.speech_texts.remove(&speech_id);
         self.audible_ledger.mark_synthesis_done(speech_id);
 
         self.playback
@@ -1664,23 +2226,89 @@ impl VoiceSession {
     }
 
     async fn on_tts_failed(&mut self, speech_id: SpeechId, message: String) -> Result<()> {
-        // A failed synthesis must never wedge the queue: reset the speech
-        // state so the next act can start.
-        self.speech_texts.remove(&speech_id);
-        self.uninterruptible_speech.remove(&speech_id);
-        self.tts_registry.cancel(&speech_id);
+        let Some(record) = self.speech_records.get_mut(&speech_id) else {
+            return Ok(());
+        };
 
-        if self.state.active_speech_id == Some(speech_id) {
-            self.state.active_speech_id = None;
-            self.state.speech = SpeechState::Silent;
-            self.last_playback_signal_us = None;
+        // A duplicate failure terminal changes nothing.
+        if record.synthesis != SynthesisOutcome::Running {
+            return Ok(());
         }
+        record.synthesis = SynthesisOutcome::Failed;
+        let owner = record.owner;
+        let reached_browser = record.playback != PlaybackLifecycle::NotStarted;
 
         self.metrics.inc("voice_tts_failed_total");
         tracing::warn!("tts failed: {message}");
 
-        self.start_next_speech_if_possible().await?;
+        if reached_browser {
+            // Some audio already reached the client: abort it and settle with
+            // the interrupted acknowledgement, bounded by the stop deadline.
+            // The epoch bump makes any late provider chunk stale.
+            let new_epoch = self.state.epochs.invalidate_speech();
+            let now_us = self.monotonic_us();
+
+            let record = self
+                .speech_records
+                .get_mut(&speech_id)
+                .expect("checked above");
+            record.playback = PlaybackLifecycle::Stopping;
+            record.stop_deadline_us = Some(
+                now_us.saturating_add(self.config.speech.playback_stop_ack_timeout_ms * 1_000),
+            );
+
+            self.playback
+                .command(PlaybackCommand::Abort {
+                    new_speech_epoch: new_epoch,
+                    reason: InterruptionReason::ProviderError,
+                })
+                .await;
+
+            // Independent replies survive re-stamped; the failed reply's
+            // remaining clauses do not.
+            self.discard_reply_clauses(owner);
+            for act in &mut self.pending_speech {
+                act.speech_epoch = new_epoch;
+            }
+
+            if self.state.active_speech_id == Some(speech_id) {
+                self.state.active_speech_id = None;
+                self.state.speech = SpeechState::Silent;
+            }
+        } else {
+            // Nothing reached the browser: nothing to abort, so the act
+            // settles as undelivered immediately.
+            self.settle_speech_record(speech_id);
+            self.discard_reply_clauses(owner);
+
+            if self.state.active_speech_id == Some(speech_id) {
+                self.state.active_speech_id = None;
+                self.state.speech = SpeechState::Silent;
+            }
+
+            self.start_next_speech_if_possible().await?;
+        }
+
         Ok(())
+    }
+
+    /// Removes the queued acts that belong to one reply, so a failed
+    /// synthesis never leaves the rest of that reply speaking.
+    fn discard_reply_clauses(&mut self, owner: Option<TaskId>) {
+        let Some(owner) = owner else {
+            return;
+        };
+        let Some(turn) = self.turn_speech.get(&owner) else {
+            return;
+        };
+
+        let clause_ids: HashSet<SpeechId> = turn.clauses.iter().map(|(id, _)| *id).collect();
+        let before = self.pending_speech.len();
+        self.pending_speech
+            .retain(|act| !clause_ids.contains(&act.id));
+        if self.pending_speech.len() != before {
+            self.metrics.inc("voice_reply_clauses_discarded_total");
+        }
     }
 
     async fn enqueue_backchannel(&mut self) -> Result<()> {
@@ -1709,7 +2337,7 @@ impl VoiceSession {
             self.state.epochs.speech,
             crate::speech::act::PRIORITY_BACKCHANNEL,
         );
-        self.authorize_and_enqueue(act).await?;
+        self.authorize_and_enqueue(act, None).await?;
         self.metrics.inc("voice_backchannel_emitted_total");
         Ok(())
     }
@@ -1764,8 +2392,10 @@ impl VoiceSession {
 
         self.maybe_emit_backchannel(&candidate, now_us).await?;
         self.recover_stalled_playback(now_us).await?;
+        self.settle_expired_stops(now_us);
         self.start_next_speech_if_possible().await?;
         self.resolve_settled_turns();
+        self.maybe_release_deferred().await?;
 
         Ok(())
     }
@@ -1773,17 +2403,26 @@ impl VoiceSession {
     /// Releases the speech queue when a client stops acknowledging playback.
     ///
     /// `SpeechState` only leaves `Playing` on a client ACK. A disconnected or
-    /// wedged client would otherwise pin the queue for the rest of the session.
+    /// wedged client would otherwise pin the queue for the rest of the
+    /// session. Only real playback is watched here: synthesis is bounded by
+    /// the request deadline inside the TTS session, and a stopping act is
+    /// bounded by its own stop deadline.
     async fn recover_stalled_playback(&mut self, now_us: u64) -> Result<()> {
         let timeout_ms = self.config.speech.playback_ack_timeout_ms;
         if timeout_ms == 0 {
             return Ok(());
         }
 
-        if !matches!(
+        let active_playing = self.state.active_speech_id.is_some_and(|speech_id| {
+            self.speech_records
+                .get(&speech_id)
+                .is_some_and(|record| record.playback == PlaybackLifecycle::Playing)
+        }) && matches!(
             self.state.speech,
-            SpeechState::Synthesizing | SpeechState::Playing | SpeechState::Ducking
-        ) {
+            SpeechState::Playing | SpeechState::Ducking
+        );
+
+        if !active_playing {
             return Ok(());
         }
 
@@ -1806,12 +2445,21 @@ impl VoiceSession {
         // and tell the client to stop, exactly as a barge-in would.
         let new_epoch = self.state.epochs.invalidate_speech();
 
-        if let Some(speech_id) = self.state.active_speech_id {
+        if let Some(speech_id) = self.state.active_speech_id.take() {
             self.tts_registry.cancel(&speech_id);
-            self.speech_texts.remove(&speech_id);
-            self.uninterruptible_speech.remove(&speech_id);
-            self.audible_ledger
-                .mark_interrupted(speech_id, 0, InterruptionReason::ProviderError);
+            let confirmed = self
+                .speech_records
+                .get(&speech_id)
+                .map(|record| record.confirmed_samples)
+                .unwrap_or(0);
+            self.settle_speech_record(speech_id);
+            // Conservative: only the progress the client already confirmed
+            // counts as heard.
+            self.audible_ledger.mark_interrupted(
+                speech_id,
+                confirmed,
+                InterruptionReason::ProviderError,
+            );
         }
 
         self.playback
@@ -1943,6 +2591,61 @@ impl VoiceSession {
         render_heard_turn(&clauses)
     }
 
+    /// Conservative fast settlement for acts already waiting on an
+    /// interrupted acknowledgement: the confirmed progress is all they get.
+    fn settle_all_stopping_now(&mut self) {
+        let stopping: Vec<SpeechId> = self
+            .speech_records
+            .iter()
+            .filter(|(_, record)| record.playback == PlaybackLifecycle::Stopping)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for speech_id in stopping {
+            let confirmed = self
+                .speech_records
+                .get(&speech_id)
+                .map(|record| record.confirmed_samples)
+                .unwrap_or(0);
+            self.settle_speech_record(speech_id);
+            self.audible_ledger.mark_interrupted(
+                speech_id,
+                confirmed,
+                InterruptionReason::UserTurn,
+            );
+        }
+    }
+
+    /// Settles stopping records whose interrupted acknowledgement never came.
+    fn settle_expired_stops(&mut self, now_us: u64) {
+        let expired: Vec<SpeechId> = self
+            .speech_records
+            .iter()
+            .filter(|(_, record)| {
+                record.playback == PlaybackLifecycle::Stopping
+                    && record
+                        .stop_deadline_us
+                        .is_some_and(|deadline| now_us >= deadline)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        for speech_id in expired {
+            let confirmed = self
+                .speech_records
+                .get(&speech_id)
+                .map(|record| record.confirmed_samples)
+                .unwrap_or(0);
+            self.settle_speech_record(speech_id);
+            self.audible_ledger.mark_interrupted(
+                speech_id,
+                confirmed,
+                InterruptionReason::ProviderError,
+            );
+            self.metrics.inc("voice_stop_ack_timeout_total");
+        }
+    }
+
     /// Resolves every reply whose clauses have all settled.
     fn resolve_settled_turns(&mut self) {
         let settled: Vec<TaskId> = self
@@ -1989,12 +2692,13 @@ impl VoiceSession {
             }
         }
 
-        let still_speaking = self
-            .turn_speech
-            .values()
-            .any(|turn| turn.clauses.iter().any(|(id, _)| !self.clause_settled(*id)));
-
-        if still_speaking {
+        let protected_owner = self
+            .state
+            .active_speech_id
+            .filter(|_| self.current_act_is_never_protected())
+            .and_then(|id| self.speech_records.get(&id).and_then(|record| record.owner));
+        // Ownerless phatic/process speech follows the same commit boundary as replies.
+        if self.state.active_speech_id.is_some() && !self.current_act_is_never_protected() {
             // Aborting moves the floor to the user, but at this point the turn
             // commit has already handed it back; keep that.
             let floor = self.state.floor;
@@ -2003,7 +2707,14 @@ impl VoiceSession {
             self.state.floor = floor;
         }
 
-        let unresolved: Vec<TaskId> = self.turn_speech.keys().copied().collect();
+        self.settle_all_stopping_now();
+        self.pending_speech.clear();
+        let unresolved: Vec<TaskId> = self
+            .turn_speech
+            .keys()
+            .copied()
+            .filter(|id| Some(*id) != protected_owner)
+            .collect();
         for task_id in unresolved {
             if let Some(turn) = self.turn_speech.remove(&task_id) {
                 let heard = self.heard_rendering(&turn);
@@ -2054,7 +2765,11 @@ impl VoiceSession {
         let meta_factory = Arc::clone(&self.meta_factory);
         let timeout = Duration::from_millis(self.config.agents.deep.timeout_ms);
 
-        tokio::spawn(async move {
+        let shutdown = self.shutdown.clone();
+        self.workers.spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = async {
             match tokio::time::timeout(timeout, worker.run(request)).await {
                 Ok(Ok(result)) => {
                     let _ = event_tx
@@ -2070,6 +2785,8 @@ impl VoiceSession {
                 Err(_) => {
                     tracing::warn!("deep work timed out after {}ms", timeout.as_millis());
                 }
+            }
+                } => {},
             }
         });
 
@@ -2089,15 +2806,52 @@ impl VoiceSession {
     // Session shutdown.
 
     async fn shutdown_active_work(&mut self) {
-        for (_, mut task) in self.active_tasks.drain() {
+        // Main turns resolve exactly once: a running turn discards here, and
+        // a reply that already received its Final resolves with the
+        // confirmed ledger outcome below.
+        let tasks: Vec<(TaskId, ActiveTask)> = self.active_tasks.drain().collect();
+        for (task_id, mut task) in tasks {
             task.cancel();
+            if task.kind == ActiveTaskKind::MainTurn {
+                self.resolve_turn(task_id, TurnResolution::Discard);
+            }
         }
 
-        for (speech_id, _) in self.speech_texts.drain() {
+        let records: Vec<(SpeechId, SpeechRecord)> = self.speech_records.drain().collect();
+        for (speech_id, record) in records {
             self.tts_registry.cancel(&speech_id);
+            if record.playback != PlaybackLifecycle::NotStarted {
+                self.audible_ledger.mark_interrupted(
+                    speech_id,
+                    record.confirmed_samples,
+                    InterruptionReason::ProviderError,
+                );
+            }
         }
+        self.pending_speech.clear();
+        self.act_owner.clear();
+        self.deferred_turn = None;
+        // Tokens for acts queued but never dequeued must not outlive the
+        // session either.
+        self.tts_registry.cancel_all();
 
-        self.playback.command(PlaybackCommand::Shutdown).await;
+        self.shutdown.cancel();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(1_000),
+            self.playback.command(PlaybackCommand::Shutdown),
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while !self.workers.is_empty() {
+            if tokio::time::timeout_at(deadline, self.workers.join_next())
+                .await
+                .is_err()
+            {
+                self.workers.abort_all();
+                while self.workers.join_next().await.is_some() {}
+                break;
+            }
+        }
 
         let summary = SessionSummary {
             session_id: self.session_id,
@@ -2130,7 +2884,23 @@ impl VoiceSession {
             summary,
         };
         self.forward_trace(&event).await;
-        let _ = self.event_tx.send(event).await;
+        // Shutdown must never hang waiting on its own event queue.
+        let _ = self.event_tx.try_send(event);
+
+        // Replies that already finished generating resolve exactly once with
+        // the confirmed ledger outcome; no late client acknowledgement is
+        // waited for here.
+        let turns: Vec<(TaskId, TurnSpeech)> = self.turn_speech.drain().collect();
+        for (task_id, turn) in turns {
+            let heard = self.heard_rendering(&turn);
+            self.resolve_turn(
+                task_id,
+                TurnResolution::Audible {
+                    final_text: turn.final_text,
+                    heard,
+                },
+            );
+        }
     }
 }
 
@@ -2303,5 +3073,530 @@ mod tests {
         );
         // No terminator still yields one speakable clause.
         assert_eq!(split_clauses("네 알겠어요"), vec!["네 알겠어요"]);
+    }
+
+    #[derive(Default)]
+    struct RecordedPlayback(parking_lot::Mutex<Vec<PlaybackCommand>>);
+
+    #[async_trait::async_trait]
+    impl PlaybackSink for RecordedPlayback {
+        async fn command(&self, command: PlaybackCommand) {
+            self.0.lock().push(command);
+        }
+    }
+
+    fn harness() -> (
+        VoiceSession,
+        Arc<crate::agent::mock::AgentRecorder>,
+        Arc<RecordedPlayback>,
+    ) {
+        let agent = crate::agent::mock::FakeAgent::finalizing("완료했습니다.");
+        let recorder = agent.recorder();
+        let sink = Arc::new(RecordedPlayback::default());
+        let tts = crate::tts::buffered::BufferedTtsAdapter::new(Arc::new(
+            crate::tts::fake::FakeTts::new(24_000, 60, 2),
+        ));
+        let config = Arc::new(
+            VoiceRuntimeConfig::from_yaml_str("observability:\n  event_log: false").unwrap(),
+        );
+        let (session, _) =
+            VoiceSessionBuilder::new(config, sink.clone(), tts, Arc::new(agent)).build();
+        session.clock.now_us();
+        (session, recorder, sink)
+    }
+
+    fn slot(value: &str) -> SlotUpdate {
+        SlotUpdate {
+            slot: "date".into(),
+            operation: crate::semantics::frame::SlotOperation::Set,
+            old_value: None,
+            new_value: value.into(),
+            confidence: 0.73,
+            source_revision: Revision(7),
+        }
+    }
+
+    fn candidate(session: &VoiceSession, id: u64) -> SlotProvenance {
+        SlotProvenance {
+            candidate_generation: session.candidate_generation,
+            source_utterance_id: id,
+            source: AsrSource::Audio,
+        }
+    }
+
+    fn track(session: &mut VoiceSession, never: bool, owner: Option<TaskId>) -> SpeechId {
+        let id = SpeechId::new();
+        let text = "첫 번째 안내를 전달하는 동안 추가 확인을 진행합니다.".to_string();
+        session.speech_records.insert(
+            id,
+            SpeechRecord {
+                text: text.clone(),
+                never,
+                sample_rate: 24_000,
+                owner,
+                synthesis: SynthesisOutcome::Running,
+                playback: PlaybackLifecycle::Playing,
+                confirmed_samples: 2_400,
+                stop_deadline_us: None,
+            },
+        );
+        session.state.active_speech_id = Some(id);
+        session.state.speech = SpeechState::Playing;
+        session.audible_ledger.speech_started(id, &text, 24_000);
+        session.audible_ledger.add_enqueued_samples(id, 24_000);
+        session.audible_ledger.mark_progress(id, 2_400);
+        if let Some(owner) = owner {
+            session.turn_speech.insert(
+                owner,
+                TurnSpeech {
+                    final_text: text.clone(),
+                    clauses: vec![(id, text)],
+                },
+            );
+        }
+        id
+    }
+
+    struct BlockedPlayback;
+    #[async_trait::async_trait]
+    impl PlaybackSink for BlockedPlayback {
+        async fn command(&self, _: PlaybackCommand) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_escapes_an_external_sink_stalled_inside_an_event_handler() {
+        let (mut session, recorder, _) = harness();
+        session.playback = Arc::new(BlockedPlayback);
+        track(&mut session, false, Some(TaskId::new()));
+        let shutdown = session.shutdown.clone();
+        let events = session.event_tx.clone();
+        let meta = session.new_meta();
+        let worker = tokio::spawn(session.run());
+        events
+            .send(VoiceEvent::AsrPartial {
+                meta,
+                utterance_id: 0,
+                revision: Revision(1),
+                hypothesis: "그만".into(),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorder.resolutions().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_stop_overrides_never_before_the_first_audio() {
+        let (mut session, _, sink) = harness();
+        let id = track(&mut session, true, None);
+        session.speech_records.get_mut(&id).unwrap().playback = PlaybackLifecycle::NotStarted;
+        session.audible_ledger = AudibleLedger::default();
+        session.state.speech = SpeechState::Synthesizing;
+        session
+            .on_asr_partial(0, Revision(1), "그만".into())
+            .await
+            .unwrap();
+        assert!(!session.speech_records.contains_key(&id));
+        assert!(sink.0.lock().iter().any(|command| matches!(
+            command,
+            PlaybackCommand::Abort {
+                reason: InterruptionReason::HardStop,
+                ..
+            }
+        )));
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn changing_candidate_writer_does_not_promote_a_tentative_baseline() {
+        let (mut session, _, _) = harness();
+        session
+            .apply_slot_updates(vec![slot("authoritative")], None)
+            .await
+            .unwrap();
+        for (id, text) in [(0, "candidate A"), (1, "candidate B")] {
+            let provenance = candidate(&session, id);
+            session
+                .apply_slot_updates(vec![slot(text)], Some(provenance))
+                .await
+                .unwrap();
+        }
+        session.on_asr_stream_reset().await.unwrap();
+        assert_eq!(
+            session.state.semantic_frame.slot_value("date"),
+            Some(&serde_json::json!("authoritative"))
+        );
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speculative_promotion_matches_the_closed_utterance_only() {
+        let (mut session, _, _) = harness();
+        let first = TaskId::new();
+        let second = TaskId::new();
+        for (task_id, utterance_id) in [(first, 0), (second, 1)] {
+            session.active_tasks.insert(
+                task_id,
+                ActiveTask {
+                    id: task_id,
+                    kind: ActiveTaskKind::SpeculativeRead,
+                    thought_epoch: 1,
+                    dependencies: Vec::new(),
+                    fingerprint: 0,
+                    cancellation: CancellationToken::new(),
+                    handle: None,
+                    candidate_generation: 0,
+                    candidate_utterance_id: Some(utterance_id),
+                },
+            );
+        }
+        session.close_candidates_for(0, AsrSource::Audio);
+        assert_eq!(session.active_tasks[&first].candidate_generation, u64::MAX);
+        assert_eq!(session.active_tasks[&second].candidate_generation, 0);
+        session.on_asr_stream_reset().await.unwrap();
+        assert!(session.active_tasks.contains_key(&first));
+        assert!(!session.active_tasks.contains_key(&second));
+        session
+            .on_agent_final(second, 1, "abandoned result".into())
+            .await
+            .unwrap();
+        assert!(session.speculative_results.is_empty());
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_commit_while_stopping_supersedes_the_deferred_record() {
+        let (mut session, recorder, _) = harness();
+        let id = track(&mut session, true, None);
+        session
+            .start_main_task(TurnId::new(), "obsolete".into(), Revision(1))
+            .await
+            .unwrap();
+        session.on_tts_failed(id, "failure".into()).await.unwrap();
+        session
+            .start_main_task(TurnId::new(), "latest".into(), Revision(2))
+            .await
+            .unwrap();
+        assert!(session.deferred_turn.is_none());
+        tokio::task::yield_now().await;
+        assert_eq!(recorder.requests().len(), 1);
+        assert_eq!(recorder.requests()[0].input, "latest");
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_speech_admission_retains_exactly_one_turn_resolution_owner() {
+        let (mut session, recorder, _) = harness();
+        session
+            .start_main_task(TurnId::new(), "request".into(), Revision(1))
+            .await
+            .unwrap();
+        let id = session.state.active_task_id.unwrap();
+        let epoch = session.state.epochs.thought;
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        session.speech_tx = tx;
+        session.state.evidence.insert(
+            format!("agent_final:{id}"),
+            crate::session::view::SessionEvidence::AgentFinal {
+                task_id: id,
+                text: "allowed reply".into(),
+            },
+        );
+        assert!(
+            session
+                .on_agent_final(id, epoch, "allowed reply".into())
+                .await
+                .is_err()
+        );
+        session.shutdown_active_work().await;
+        assert_eq!(recorder.resolutions().len(), 1);
+        assert!(
+            matches!(&recorder.resolutions()[0].1, TurnResolution::Audible { heard, .. } if heard == "[응답이 전달되지 않음]")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_restores_original_candidate_baseline_with_metadata() {
+        let (mut session, _, _) = harness();
+        session
+            .apply_slot_updates(vec![slot("A")], None)
+            .await
+            .unwrap();
+        session.state.semantic_frame.commit_pending();
+        let baseline = serde_json::to_value(&session.state.semantic_frame.slots["date"]).unwrap();
+        let provenance = candidate(&session, 0);
+        session
+            .apply_slot_updates(vec![slot("B")], Some(provenance.clone()))
+            .await
+            .unwrap();
+        session
+            .apply_slot_updates(vec![slot("D")], Some(provenance))
+            .await
+            .unwrap();
+        let thought = session.state.epochs.thought;
+        session.on_asr_stream_reset().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&session.state.semantic_frame.slots["date"]).unwrap(),
+            baseline
+        );
+        assert_eq!(session.state.epochs.thought, thought);
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_interleaving_retires_old_journal_and_clear_restores_absence() {
+        let (mut session, _, _) = harness();
+        session
+            .apply_slot_updates(vec![slot("A")], None)
+            .await
+            .unwrap();
+        let provenance = candidate(&session, 0);
+        session
+            .apply_slot_updates(vec![slot("B")], Some(provenance.clone()))
+            .await
+            .unwrap();
+        session
+            .apply_slot_updates(vec![slot("C")], None)
+            .await
+            .unwrap();
+        let baseline = serde_json::to_value(&session.state.semantic_frame.slots["date"]).unwrap();
+        let mut clear = slot("ignored");
+        clear.operation = crate::semantics::frame::SlotOperation::Clear;
+        session
+            .apply_slot_updates(vec![clear], Some(provenance))
+            .await
+            .unwrap();
+        session.on_asr_stream_reset().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&session.state.semantic_frame.slots["date"]).unwrap(),
+            baseline
+        );
+        let provenance = candidate(&session, 1);
+        let mut update = slot("temp");
+        update.slot = "new-slot".into();
+        session
+            .apply_slot_updates(vec![update], Some(provenance))
+            .await
+            .unwrap();
+        session.on_asr_stream_reset().await.unwrap();
+        assert!(!session.state.semantic_frame.slots.contains_key("new-slot"));
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_partial_candidate_preserves_it_on_reset_and_rejects_late_extraction() {
+        let (mut session, _, _) = harness();
+        let provenance = candidate(&session, 0);
+        session
+            .apply_slot_updates(vec![slot("committed")], Some(provenance.clone()))
+            .await
+            .unwrap();
+        session.close_candidates_for(0, AsrSource::Audio);
+        session
+            .apply_slot_updates(vec![slot("late")], Some(provenance))
+            .await
+            .unwrap();
+        session.on_asr_stream_reset().await.unwrap();
+        assert_eq!(
+            session.state.semantic_frame.slot_value("date"),
+            Some(&serde_json::json!("committed"))
+        );
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn injection_final_does_not_close_an_audio_candidate() {
+        let (mut session, _, _) = harness();
+        let provenance = candidate(&session, 0);
+        session
+            .apply_slot_updates(vec![slot("tentative")], Some(provenance))
+            .await
+            .unwrap();
+        session.close_candidates_for(
+            crate::ids::INJECTION_UTTERANCE_ID_BASE,
+            AsrSource::Injection,
+        );
+        session.on_asr_stream_reset().await.unwrap();
+        assert!(session.state.semantic_frame.slot_value("date").is_none());
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_failure_waits_for_ack_before_next_speech_and_resolves_once() {
+        let (mut session, recorder, sink) = harness();
+        let owner = TaskId::new();
+        let id = track(&mut session, false, Some(owner));
+        let dropped = SpeechAct::phatic("폐기할 후속 문장", session.state.epochs.speech, 60);
+        session
+            .turn_speech
+            .get_mut(&owner)
+            .unwrap()
+            .clauses
+            .push((dropped.id, dropped.text.clone()));
+        session.pending_speech.push_back(dropped);
+        let independent = SpeechAct::phatic("독립 안내", session.state.epochs.speech, 10);
+        let next = independent.id;
+        session.pending_speech.push_back(independent);
+        session
+            .on_tts_failed(id, "partial synthesis error".into())
+            .await
+            .unwrap();
+        session.start_next_speech_if_possible().await.unwrap();
+        assert!(session.state.active_speech_id.is_none());
+        assert_eq!(session.audible_ledger.in_flight_id(), Some(id));
+        assert_eq!(session.pending_speech.len(), 1);
+        assert!(
+            sink.0
+                .lock()
+                .iter()
+                .any(|command| matches!(command, PlaybackCommand::Abort { .. }))
+        );
+        let ack = VoiceEvent::PlaybackInterrupted {
+            meta: session.new_meta(),
+            speech_id: id,
+            played_samples: 2_400,
+            reason: InterruptionReason::ProviderError,
+        };
+        session.handle_event(ack.clone()).await.unwrap();
+        session.handle_event(ack).await.unwrap();
+        assert_eq!(recorder.resolutions().len(), 1);
+        assert!(matches!(
+            session.audible_ledger.history()[0].heard,
+            Heard::Partial { .. }
+        ));
+        session.start_next_speech_if_possible().await.unwrap();
+        assert_eq!(session.state.active_speech_id, Some(next));
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_turn_fast_settles_ownerless_and_stopping_speech() {
+        let (mut session, _, _) = harness();
+        let id = track(&mut session, false, None);
+        session
+            .start_main_task(TurnId::new(), "새 요청".into(), Revision(3))
+            .await
+            .unwrap();
+        assert!(session.speech_records.is_empty());
+        assert!(session.audible_ledger.in_flight_id().is_none());
+        let history = session.audible_ledger.history().len();
+        session
+            .handle_event(VoiceEvent::PlaybackInterrupted {
+                meta: session.new_meta(),
+                speech_id: id,
+                played_samples: 99_999,
+                reason: InterruptionReason::UserTurn,
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.audible_ledger.history().len(), history);
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn never_remains_protected_after_audio_done_and_releases_commit_snapshot_once() {
+        let (mut session, recorder, _) = harness();
+        let owner = TaskId::new();
+        let id = track(&mut session, true, Some(owner));
+        session
+            .on_tts_audio_done(id, session.state.epochs.speech)
+            .await
+            .unwrap();
+        session
+            .apply_slot_updates(vec![slot("commit")], None)
+            .await
+            .unwrap();
+        session
+            .start_main_task(TurnId::new(), "최신 요청".into(), Revision(3))
+            .await
+            .unwrap();
+        session
+            .apply_slot_updates(vec![slot("later")], None)
+            .await
+            .unwrap();
+        assert!(session.deferred_turn.is_some());
+        assert!(recorder.resolutions().is_empty());
+        session.maybe_release_deferred().await.unwrap();
+        assert!(recorder.requests().is_empty());
+        let ack = VoiceEvent::PlaybackCompleted {
+            meta: session.new_meta(),
+            speech_id: id,
+        };
+        session.handle_event(ack.clone()).await.unwrap();
+        session.handle_event(ack).await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(recorder.resolutions().len(), 1);
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].context.brief.contains("commit"));
+        assert!(!requests[0].context.brief.contains("later"));
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_latest_commit_releases_on_watchdog_without_extra_event() {
+        let (mut session, recorder, _) = harness();
+        let id = track(&mut session, true, None);
+        session
+            .start_main_task(TurnId::new(), "old".into(), Revision(2))
+            .await
+            .unwrap();
+        session
+            .start_main_task(TurnId::new(), "latest".into(), Revision(3))
+            .await
+            .unwrap();
+        session.last_playback_signal_us = Some(0);
+        tokio::time::advance(Duration::from_secs(16)).await;
+        session.on_control_tick().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!session.speech_records.contains_key(&id));
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input, "latest");
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_progress_cannot_refresh_a_successor_watchdog() {
+        let (mut session, _, _) = harness();
+        let old = track(&mut session, false, None);
+        session.settle_previous_turns().await.unwrap();
+        let successor = track(&mut session, false, None);
+        session.last_playback_signal_us = Some(123);
+        session
+            .handle_event(VoiceEvent::PlaybackProgress {
+                meta: session.new_meta(),
+                speech_id: old,
+                played_samples: 48_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.last_playback_signal_us, Some(123));
+        assert_eq!(session.state.active_speech_id, Some(successor));
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_owned_workers_and_resolves_a_running_turn_once() {
+        let (mut session, recorder, _) = harness();
+        session
+            .start_main_task(TurnId::new(), "요청".into(), Revision(1))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        session.shutdown_active_work().await;
+        session.shutdown_active_work().await;
+        assert!(session.workers.is_empty());
+        assert!(session.active_tasks.is_empty());
+        assert_eq!(recorder.resolutions().len(), 1);
     }
 }

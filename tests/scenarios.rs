@@ -503,19 +503,42 @@ timeline:
   - at_ms: 400
     event:
       type: local_speech_ended
+  - at_ms: 2600
+    event:
+      type: local_speech_started
+  - at_ms: 2700
+    event:
+      type: asr_final
+      text: "다른 날도 알아봐줘"
+  - at_ms: 3000
+    event:
+      type: local_speech_ended
 agent_script:
   - after_ms: 200
     type: final
     text: "확인했습니다. 두 곳이 가능합니다."
 expect:
-  # Both clauses must be attempted: reaching the second proves the queue
-  # advanced past the first failure instead of staying in Synthesizing.
+  # Each reply has two clauses, but a failed synthesis discards the rest of
+  # that reply: only the first clause of each reply is ever attempted.
   - type: metric_at_least
     name: voice_tts_failed_total
     value: 2
+  - type: metric_at_most
+    name: voice_tts_failed_total
+    value: 2
+  - type: metric_at_least
+    name: voice_reply_clauses_discarded_total
+    value: 2
+  # Nothing was delivered, so both replies resolve exactly once as
+  # undelivered and nothing completes playback.
+  - type: turn_resolution_count
+    exactly: 2
+  - type: turn_resolved
+    resolution: audible
+    heard_equals: "[응답이 전달되지 않음]"
   - type: never_event
     event: playback_completed
-settle_ms: 4000
+settle_ms: 6000
 "#
 );
 

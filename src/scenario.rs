@@ -146,9 +146,16 @@ pub enum ScenarioEvent {
     AsrPartial {
         revision: u64,
         text: String,
+        #[serde(default)]
+        utterance_id: Option<u64>,
     },
     AsrFinal {
         text: String,
+        #[serde(default)]
+        utterance_id: Option<u64>,
+    },
+    AsrStreamReset {
+        generation: u64,
     },
     InteractionDecision {
         user_state: String,
@@ -235,6 +242,10 @@ pub enum Expect {
         text: String,
     },
     MetricAtLeast {
+        name: String,
+        value: u64,
+    },
+    MetricAtMost {
         name: String,
         value: u64,
     },
@@ -371,7 +382,11 @@ impl ScenarioRunner {
             recorder: command_tx,
         });
 
-        let tts = Arc::new(FakeTts::new(24_000, 60, scenario.tts_chunks_per_request));
+        // The scenario harness wires TTS the same way the runtime assembly
+        // does: a buffered whole-text fake goes through the duplex bridge.
+        let raw_tts: Arc<dyn crate::tts::StreamingTts> =
+            Arc::new(FakeTts::new(24_000, 60, scenario.tts_chunks_per_request));
+        let tts = crate::tts::buffered::BufferedTtsAdapter::new(raw_tts);
         let fake = if scenario.agent_script.is_empty() {
             FakeAgent::finalizing(scenario.agent_final.clone())
         } else {
@@ -469,6 +484,8 @@ impl ScenarioRunner {
                     fingerprint: 0,
                     cancellation,
                     handle: None,
+                    candidate_generation: 0,
+                    candidate_utterance_id: None,
                 },
             );
         }
@@ -481,12 +498,13 @@ impl ScenarioRunner {
         let start = tokio::time::Instant::now();
         let mut timeline = scenario.timeline.clone();
         timeline.sort_by_key(|timed| timed.at_ms);
+        let mut utterance_source = ScenarioUtteranceSource::default();
 
         for timed in timeline {
             let target = start + Duration::from_millis(timed.at_ms);
             tokio::time::sleep_until(target).await;
 
-            let event = map_scenario_event(&timed.event, &meta_factory);
+            let event = map_scenario_event(&timed.event, &meta_factory, &mut utterance_source);
             if let Some(event) = event {
                 let _ = handle.try_emit(event);
             }
@@ -555,6 +573,7 @@ fn event_meta_us(event: &VoiceEvent) -> u64 {
         VoiceEvent::AsrPartial { meta, .. } => meta.monotonic_us,
         VoiceEvent::StableTranscriptChanged { meta, .. } => meta.monotonic_us,
         VoiceEvent::AsrUtteranceFinal { meta, .. } => meta.monotonic_us,
+        VoiceEvent::AsrStreamReset { meta, .. } => meta.monotonic_us,
         VoiceEvent::SemanticCue { meta, .. } => meta.monotonic_us,
         VoiceEvent::SemanticFrameUpdated { meta, .. } => meta.monotonic_us,
         VoiceEvent::InteractionDecision { meta, .. } => meta.monotonic_us,
@@ -579,31 +598,76 @@ fn event_meta_us(event: &VoiceEvent) -> u64 {
     }
 }
 
+/// Tracks recognizer identity independently of a VAD end, including late finals.
+/// Explicit DSL ids override automatic assignment for identity regressions.
+#[derive(Default)]
+struct ScenarioUtteranceSource {
+    current: u64,
+    boundary_pending: bool,
+    seen_asr: bool,
+}
+
 fn map_scenario_event(
     event: &ScenarioEvent,
     meta_factory: &Arc<dyn crate::meta::MetaFactory>,
+    utterance_source: &mut ScenarioUtteranceSource,
 ) -> Option<VoiceEvent> {
     let meta = meta_factory.new_meta();
 
+    if matches!(
+        event,
+        ScenarioEvent::AsrPartial { .. } | ScenarioEvent::AsrFinal { .. }
+    ) {
+        utterance_source.seen_asr = true;
+    }
     Some(match event {
-        ScenarioEvent::LocalSpeechStarted { vad_probability } => VoiceEvent::LocalSpeechStarted {
-            meta,
-            vad_probability: *vad_probability,
-        },
+        ScenarioEvent::LocalSpeechStarted { vad_probability } => {
+            if utterance_source.seen_asr {
+                utterance_source.boundary_pending = true;
+                utterance_source.seen_asr = false;
+            }
+            VoiceEvent::LocalSpeechStarted {
+                meta,
+                vad_probability: *vad_probability,
+            }
+        }
         ScenarioEvent::LocalSpeechEnded => VoiceEvent::LocalSpeechEnded {
             meta,
             duration_ms: 400,
         },
-        ScenarioEvent::AsrPartial { revision, text } => VoiceEvent::AsrPartial {
+        ScenarioEvent::AsrPartial {
+            revision,
+            text,
+            utterance_id,
+        } => {
+            if utterance_source.boundary_pending {
+                utterance_source.current += 1;
+                utterance_source.boundary_pending = false;
+            }
+            VoiceEvent::AsrPartial {
+                meta,
+                utterance_id: utterance_id.unwrap_or(utterance_source.current),
+                revision: Revision(*revision),
+                hypothesis: text.clone(),
+            }
+        }
+        ScenarioEvent::AsrFinal { text, utterance_id } => {
+            if utterance_source.boundary_pending {
+                utterance_source.current += 1;
+                utterance_source.boundary_pending = false;
+            }
+            let utterance_id = utterance_id.unwrap_or(utterance_source.current);
+            utterance_source.boundary_pending = true;
+            VoiceEvent::AsrUtteranceFinal {
+                meta,
+                utterance_id,
+                source: crate::events::AsrSource::Audio,
+                transcript: text.clone(),
+            }
+        }
+        ScenarioEvent::AsrStreamReset { generation } => VoiceEvent::AsrStreamReset {
             meta,
-            utterance_id: 0,
-            revision: Revision(*revision),
-            hypothesis: text.clone(),
-        },
-        ScenarioEvent::AsrFinal { text } => VoiceEvent::AsrUtteranceFinal {
-            meta,
-            utterance_id: 0,
-            transcript: text.clone(),
+            generation: *generation,
         },
         ScenarioEvent::InteractionDecision {
             user_state,
@@ -938,6 +1002,15 @@ fn evaluate(scenario: &Scenario, observed: &Observed<'_>) -> Vec<String> {
                 if observed < *value {
                     failures.push(format!(
                         "metric '{name}' was {observed}, expected at least {value}"
+                    ));
+                }
+            }
+
+            Expect::MetricAtMost { name, value } => {
+                let observed = metrics.counter(name);
+                if observed > *value {
+                    failures.push(format!(
+                        "metric '{name}' was {observed}, expected at most {value}"
                     ));
                 }
             }

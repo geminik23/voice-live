@@ -13,9 +13,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf88ca407ac36a4924c085d841a2b0f47827ee01ae69b6da4860ae80bf801a4a"
+checksum = "b4b7dcb9af17607883856422dfdf5a5c5ab56d444a837119edb06dbd8db95c9f"
 dependencies = [
  "ai-agents-context",
  "ai-agents-core",
@@ -43,9 +43,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-context"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccdacc2e4e50929bf30f185ead5cb5a3e108ad5d41c47383b127ebc8571d8e7d"
+checksum = "d1e73144b807e09ef58b32c8091c95d05038127192c63cf9d8b77f0572722272"
 dependencies = [
  "ai-agents-core",
  "async-trait",
@@ -61,9 +61,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-core"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ce3cc49c66c5a0eef6f15bcc664ac9985026dcd46d4a341bd7557517f96a884"
+checksum = "f30a91512c35668ac4220633a391a1dfaa44aa465ffb2a0d6ebce744b6365010"
 dependencies = [
  "async-trait",
  "chrono",
@@ -77,9 +77,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-disambiguation"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f8cfef9b8cf095ea11f6c71e7c3e6b4400466d5400b09bc6a98d421489d5e0a"
+checksum = "1d9d30c3fc372ae87cb378c50ac2ad0b70f56ac4cea0099a6c830c11168ec309"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -91,9 +91,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-eval"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea629af3fbd60a3be1d17c12220bdbc8dbc634048ce9d875dbb98d8ac2695c0b"
+checksum = "b6e4440cdca1e005111eb2e188d518f7594d28f02c4bb16b85c19fe4896a506c"
 dependencies = [
  "ai-agents-core",
  "ai-agents-facts",
@@ -125,9 +125,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-facts"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2cffcb4beb646d03cddbb74fc07ef49eeee498acf5956e65dbb1e4a88e341c3"
+checksum = "ba5ff7627ba9baae9d02bd0f4d4a977ac4c3948ce892faa157ca7629b7e8902c"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -144,9 +144,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-hitl"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a4f6b21dcf32b5d97c98f3d94a8fb33417e434ab694d8068cf425479fc1714f"
+checksum = "05a1d84ea2a893e009476a711d63b2790733e9428491d35b1a1683e65df977fe"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -160,9 +160,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-hooks"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63b063258ab2d4b698fa19dd36c1704fb2a01f129836fb6bb7548a78136ec449"
+checksum = "557213215bab0dd6c84a53905e68d73fd7139ae6a031748b35af002b265bc574"
 dependencies = [
  "ai-agents-core",
  "ai-agents-hitl",
@@ -179,9 +179,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-llm"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bf66323dfd94782f173b1e288c8dcc23996f4f4eaa155074cf5e0aec12d025"
+checksum = "188025aad5fc0894c8ee532fbe371ed3f6e8fd38ea6611867ba4934b49cab671"
 dependencies = [
  "ai-agents-core",
  "async-stream",
@@ -200,9 +200,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-memory"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e7e0fbff710aa7db8b12c7287d1608ed379dfb8390f9eacdd0a77b3d068e31b"
+checksum = "789849b775c4f0b778312263c56da52417d5eb76c430f370a7d2acc4be05035e"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -217,9 +217,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-observability"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26472776e5085b2ae8f3e9be98d5898062b3c985e7cd97f12a6a4f8caa172881"
+checksum = "890b256a1026c430611fdb5ad1ac3d3691966fa3be066c3fcdbee8da9a3b86ef"
 dependencies = [
  "ai-agents-core",
  "ai-agents-hitl",
@@ -241,9 +241,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-persona"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba7860957d90151a1b1fa346ac452fa543a9f06070d7b441377effb0d675f67b"
+checksum = "f9ec469b9fadeb3a401ad707563280d30e67c22970723cd1751aa4e78d4d6cde"
 dependencies = [
  "ai-agents-context",
  "ai-agents-core",
@@ -259,9 +259,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-process"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29db1d82f34c42aee003e9d3e3c9675ef7b77734f7943851186dd5e84fcd1689"
+checksum = "b943b0f93b837fd561cb77f15e826248068f3d2dade55067c0271bd47e5ef3d4"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -276,9 +276,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-reasoning"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a56b65e2a66fee89889809993ce142a05666a7b42a135bde22b1ab49fc2c5a1"
+checksum = "2ff31bcd97ef9f2623ff5a598b873f6e4ea68b558d9f5456db27cdbbfd049299"
 dependencies = [
  "chrono",
  "serde",
@@ -288,9 +288,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-recovery"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca536ba7d4556efca52502a8a5d162322e8062295d8c98f62ad44df7a9f7636f"
+checksum = "bb242b41ebf51cd402f4a7969dd868d3b3127d5b42c967acf7d71ae7dbc1e593"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -305,9 +305,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-relationships"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec5e379152119682b637d0f95bed673f55b49d450b7d6a351cfb6c6e94357aa5"
+checksum = "dc2b110ca5516d102294bf1c77804c74214759480bfeb0f63ebd0dd2e5b47b0d"
 dependencies = [
  "ai-agents-core",
  "async-trait",
@@ -322,9 +322,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-runtime"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d33ad7d3c540d40077e53f6a21c88f4d1aad74efc5800025fd5a1d0e4c68efd7"
+checksum = "cb5bca1339a0f9c58a52cc546740c82bcc8e75b569c827912f6a40322b8bb70f"
 dependencies = [
  "ai-agents-context",
  "ai-agents-core",
@@ -365,9 +365,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-skills"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87e2526031f3c6976cf596f996d9ef0edf8660ca66efc97120a5c63bf008caaa"
+checksum = "cd063e8b036de2ff69d233392bfd4d23cba50802dccc71a661ca0eee2a391011"
 dependencies = [
  "ai-agents-core",
  "ai-agents-disambiguation",
@@ -386,9 +386,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-state"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af970c8ba38e9dbe32aa0ef436284040528f8eb6ae8c8d7951ca91e8e0e43b5f"
+checksum = "0efd612f2f210ac9ceb66f2cce5dc4d6a0faf447655ba04aff662acfa3820e75"
 dependencies = [
  "ai-agents-core",
  "ai-agents-disambiguation",
@@ -405,9 +405,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-storage"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2049764dca82d2bb1b48e534ba0e0c64f1c35ca107e0e769d26d40143b6ce781"
+checksum = "6727b31d4631308991d1e5671fe84b532b681321cd67e5e46df13caf7555f826"
 dependencies = [
  "ai-agents-core",
  "async-trait",
@@ -422,9 +422,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-template"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d7e357b037daf781858518813e7d0a48e40872497b042ecb23e2795c1bb10e0"
+checksum = "d3ab41e714ec18a2f6b6d70f5a963e54609fcf7dac6ead195b59ca0f3f243498"
 dependencies = [
  "ai-agents-core",
  "minijinja",
@@ -437,9 +437,9 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-tools"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cec284ce3e829ecf33a8ebe7999f2394df16e5c8e06e79fe0d9a42c1d229fc5a"
+checksum = "3e6c1cff54ec93de4378bfc6d3e69db6cca16e7d4339748b48338dcce0e74dde"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -2408,7 +2408,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
