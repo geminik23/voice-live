@@ -65,7 +65,19 @@ $env:OPENAI_API_KEY = "..."
 
 Then set `asr.provider: together` and `tts.provider: qwen` in `full-duplex-demo/configs/voice-runtime.yaml` and run the same `cargo run` command. The provider adapters still need paid contract testing before relying on their wire formats.
 
-Other environment variables: `VOICE_BIND_ADDR` (default `0.0.0.0:8080`), `VOICE_WEB_DIR` (web root override), `RUST_LOG` (log filter), and `VOICE_KOREAN_FIXTURE` (path to a 16 kHz mono PCM16 WAV for the Together contract test). See the [environment variable reference](docs/deployment.md#environment-variables) for details and path rules.
+Other environment variables: `VOICE_BIND_ADDR` (default `0.0.0.0:8080`), `VOICE_WEB_DIR` (web root override), `RUST_LOG` (log filter), and `VOICE_KOREAN_FIXTURE` (path to a consented 16 kHz mono PCM16 WAV for the Together or Cartesia STT contract). See the [environment variable reference](docs/deployment.md#environment-variables) for details and path rules.
+
+## Cartesia streaming STT and TTS
+
+Cartesia manual streaming STT (`ink-whisper`) and native incremental TTS (`sonic-3.6`) are available through `asr.provider: cartesia` and `tts.provider: cartesia`, or host-injected `CartesiaStreamingAsr`/`CartesiaStreamingTts` factories. Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for both providers. The optional `voice-runtime.cartesia-tts.yaml` keeps typed input for TTS-only diagnosis, and the default sample remains keyless inject ASR plus silent mock TTS.
+
+Set `CARTESIA_API_KEY` and `CARTESIA_VOICE_ID` on the server using the shell syntax above, plus `OPENAI_API_KEY` for the sample's reservation task agent. The key is selected by both providers' `api_key_env`; the voice is selected by `tts.voice_env`. Do not put credentials or an account voice ID in committed configuration.
+
+```sh
+cargo run -p full-duplex-demo -- --config full-duplex-demo/configs/voice-runtime.cartesia.yaml
+```
+
+This setup sends microphone audio and conversation text externally and may incur charges. Premade TTS warmup is disabled. Offline wire/lifecycle and two-provider runtime tests pass, but actual Ink Whisper flush attribution, streaming partial quality, voice output, and latency remain unverified against the paid endpoint. The adapter uses ordered `flush_done` boundaries as an explicit integration assumption, not a vendor guarantee proven by local tests. See [Cartesia deployment](docs/deployment.md#cartesia-streaming-stt-and-tts), [STT settings and boundary assumptions](docs/configuration.md#cartesia-stt), and the [individual ignored contracts](docs/testing.md#cartesia-provider-regressions-and-paid-contracts) before live use.
 
 ## Replace speech providers
 

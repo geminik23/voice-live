@@ -45,6 +45,26 @@ macro_rules! scenario_test {
 }
 
 scenario_test!(
+    partial_commit_does_not_repeat_on_late_audio_final,
+    r#"
+name: partial_commit_does_not_repeat_on_late_audio_final
+timeline:
+  - at_ms: 0
+    event: { type: local_speech_started }
+  - at_ms: 100
+    event: { type: asr_partial, utterance_id: 0, revision: 1, text: "첫 요청입니다" }
+  - at_ms: 200
+    event: { type: local_speech_ended }
+  - at_ms: 1600
+    event: { type: asr_final, utterance_id: 0, text: "첫 요청입니다" }
+expect:
+  - type: committed_turn_count
+    exactly: 1
+settle_ms: 3000
+"#
+);
+
+scenario_test!(
     backchannel_ducks_then_resumes,
     r#"
 name: backchannel_during_agent_speech

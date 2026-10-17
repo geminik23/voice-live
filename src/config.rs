@@ -157,7 +157,30 @@ pub struct AsrConfig {
     #[serde(default = "default_asr_input_buffer_ms")]
     pub input_buffer_ms: u64,
     #[serde(default)]
+    pub cartesia: CartesiaAsrConfig,
+    #[serde(default)]
     pub partials: AsrPartialsConfig,
+}
+
+/// Cartesia manual STT limits, validated by its factory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CartesiaAsrConfig {
+    pub api_version: String,
+    pub finalize_timeout_ms: u64,
+    pub finish_timeout_ms: u64,
+    pub max_transcript_bytes: usize,
+}
+
+impl Default for CartesiaAsrConfig {
+    fn default() -> Self {
+        Self {
+            api_version: "2026-08-14".into(),
+            finalize_timeout_ms: 2_000,
+            finish_timeout_ms: 5_000,
+            max_transcript_bytes: 65_536,
+        }
+    }
 }
 
 fn default_asr_provider() -> String {
@@ -253,7 +276,26 @@ pub struct TtsConfig {
     #[serde(default = "default_tts_max_input_bytes")]
     pub max_input_bytes: usize,
     #[serde(default)]
+    pub cartesia: CartesiaTtsConfig,
+    #[serde(default)]
     pub premade: PremadeConfig,
+}
+
+/// Cartesia-specific options, validated only by its factory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CartesiaTtsConfig {
+    pub api_version: String,
+    pub max_buffer_delay_ms: u64,
+}
+
+impl Default for CartesiaTtsConfig {
+    fn default() -> Self {
+        Self {
+            api_version: "2026-08-14".into(),
+            max_buffer_delay_ms: 0,
+        }
+    }
 }
 
 fn default_tts_provider() -> String {

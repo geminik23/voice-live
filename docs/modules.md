@@ -51,9 +51,9 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | Module | Description |
 |---|---|
 | `view.rs` | Pure `SessionView` projection + `SessionEvidence` storage |
-| `supervisor.rs` | Pure-event orchestration with speech admission before projection/handling, separate synthesis/playback lifecycle, stopping ACK deadlines, failed-reply clause disposal, commit-time deferred Never context, candidate provenance/journal rollback, owned workers and exactly-once turn resolution on all exits |
+| `supervisor.rs` | Pure-event orchestration with consumed-audio and speech admission before projection/handling, separate synthesis/playback lifecycle, stopping ACK deadlines, failed-reply clause disposal, commit-time deferred Never context, candidate provenance/journal rollback, owned workers and exactly-once turn resolution on all exits |
 | `task_runner.rs` | Manages `ActiveTask` and consumes agent turns. Dropping the stream releases the framework root-turn gate |
-| `tts_worker.rs` | Complete authorized act → cache hook or duplex text admission/audio drain, request/open deadlines, response/format/sequence validation, and pre-admission cancellation registry |
+| `tts_worker.rs` | Complete authorized act → cache hook or duplex text admission/audio drain, request/open deadlines, response/format/sequence validation, pre-admission provider error preservation, and cancellation registry |
 | `deep_worker.rs` | `DeepWorker` trait, `DeepWorkRequest/Result`, `FakeDeepWorker` for scenarios. No automatic trigger; runs only via `VoiceSessionHandle::request_deep_work` (→ `VoiceEvent::DeepWorkRequested`) |
 
 ## agent/
@@ -72,11 +72,13 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `asr/fake.rs` | Duplex `MockAsr`, PCM recorder, persistent virtual-time event deadlines, and legacy façade; quiet input parks until cancelled instead of reporting EOF |
 | `asr/inject.rs` | `InjectionQueue` (per session) + `InjectableAsr` decorator. Adds a text-injection channel to any inner provider |
 | `asr/together.rs` | Together realtime adapter. `ParseState` owns the session-monotonic revision and utterance ID. Wire format still needs validation by contract tests |
+| `asr/cartesia.rs` | `CartesiaStreamingAsr::from_config` or host-owned `with_api_key`; Ink Whisper manual STT with independent paced raw PCM input and revisioned replacement output, verbatim delta accumulation, bounded pending FIFO flushes, absolute finalize/finish deadlines, confirmed-Final retention, terminal ownership, and native legacy facade. FIFO vendor flush attribution remains an explicitly unverified integration assumption |
 | `tts/mod.rs` | Legacy `synthesize`/`TtsStream`, additive `TextInputMode`, text-session input/output/control handles, capability/cache hooks, bounded PCM normalization, and `synthesize_via_text_stream` retaining native control ownership |
 | `tts/buffered.rs` | `BufferedTtsAdapter`: bounded text accumulation, finish-triggered synthesis, owner-enforced request deadline, normalized audio queue and separate terminal slot |
 | `tts/fake.rs` | `FakeTts` (guarantees chunk→done→None termination) |
 | `tts/premade.rs` | Success-only premade cache with matching text/language/voice and fixed factory settings; bounded warmup, complete-request cache hook, native capability forwarding, cancellable replay |
 | `tts/qwen.rs` | DashScope realtime adapter. Cancels by closing the socket if `response.cancel` is unsupported |
+| `tts/cartesia.rs` | `CartesiaStreamingTts::from_config` or host-owned `with_api_key`; native incremental Sonic WebSocket input, context-scoped raw PCM normalization, bounded I/O, absolute response deadline, separate terminal slot, typed/redacted errors, and owned legacy `synthesize` convenience. Initial Korean language path; provider behavior still requires paid validation |
 
 ## Remaining modules
 
@@ -86,7 +88,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `playback.rs` | `PlaybackCommand`, `ClientPlaybackSink` (runtime nonblocking overload shutdown or legacy standalone admission), `SimulatedPlaybackSink` (simulates the actual playback ACK flow in virtual-time tests), `UnacknowledgedPlaybackSink` (for ACK timeout scenarios) |
 | `tools/reservation.rs` | Shared in-memory reservation backend, pure-read `search_availability`, and `reserve_restaurant` framework tool enforcing confirmation + idempotency |
 | `scenario.rs` | Scenario DSL runner. YAML → virtual-time execution → expectation evaluation |
-| `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, fresh ASR retry and identity mapping, bounded client output |
+| `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, fresh ASR retry and identity mapping, one-second terminal drain after input closure to preserve fatal classification, bounded client output |
 | `protocol.rs` | `ClientControlMessage` / `ServerMessage`. Defines **what** is exchanged, not **how** it is transported |
 
 ## Per-session vs. shared

@@ -1,7 +1,8 @@
 # Full-duplex voice runtime configuration with Korean demo defaults.
 #
 # Providers: "together" (Nemotron streaming ASR), "qwen" (DashScope realtime
-# TTS), "inject" (dev text injection), "mock" (offline fakes).
+# TTS), "cartesia" (streaming STT/TTS), "inject" (dev text injection),
+# "mock" (offline fakes).
 # API keys are resolved from the environment, never from this file.
 
 version: 1
@@ -28,6 +29,12 @@ asr:
   open_timeout_ms: 10000
   write_timeout_ms: 2000
   input_buffer_ms: 1000
+  # Used only by the Cartesia STT factory; select its full sample for live input.
+  cartesia:
+    api_version: "2026-08-14"
+    finalize_timeout_ms: 2000
+    finish_timeout_ms: 5000
+    max_transcript_bytes: 65536
   partials:
     enabled: true
     stable_after_ms: 320
@@ -50,6 +57,10 @@ tts:
   open_timeout_ms: 10000
   request_timeout_ms: 30000
   max_input_bytes: 65536
+  # Used only by the Cartesia TTS factory; the keyless mock default is unchanged.
+  cartesia:
+    api_version: "2026-08-14"
+    max_buffer_delay_ms: 0
   premade:
     enabled: true
     phrases:

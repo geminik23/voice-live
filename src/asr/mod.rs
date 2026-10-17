@@ -241,6 +241,7 @@ impl AsrSession for LegacyDuplexFacade {
     }
 }
 
+pub mod cartesia;
 pub mod fake;
 pub mod inject;
 pub mod together;

@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::CognitiveAgent;
 use crate::agent::mock::MockReservationAgent;
+use crate::asr::cartesia::CartesiaStreamingAsr;
 use crate::asr::fake::MockAsr;
 use crate::asr::inject::InjectionQueue;
 use crate::asr::together::TogetherNemotronAsr;
@@ -30,6 +31,7 @@ use crate::semantics::extractor::SlotExtractor;
 use crate::session::VoiceSessionBuilder;
 use crate::session::deep_worker::DeepWorker;
 use crate::tts::buffered::BufferedTtsAdapter;
+use crate::tts::cartesia::CartesiaStreamingTts;
 use crate::tts::fake::FakeTts;
 use crate::tts::premade::PremadeTts;
 use crate::tts::qwen::QwenRealtimeTts;
@@ -106,22 +108,28 @@ impl VoiceRuntime {
     pub async fn build_from_arc(config: Arc<VoiceRuntimeConfig>) -> anyhow::Result<Arc<Self>> {
         let asr: Arc<dyn StreamingAsr> = match config.asr.provider.as_str() {
             "together" => Arc::new(TogetherNemotronAsr::from_config(&config.asr)?),
+            "cartesia" => Arc::new(CartesiaStreamingAsr::from_config(&config.asr)?),
             // `inject` is `mock` plus a text channel; the media worker drains
             // the queue itself so every provider can be driven by typed text.
             "inject" | "mock" => Arc::new(MockAsr::quiet()),
             other => {
-                anyhow::bail!("unknown asr.provider '{other}' (expected together, inject, or mock)")
+                anyhow::bail!(
+                    "unknown asr.provider '{other}' (expected together, cartesia, inject, or mock)"
+                )
             }
         };
 
         let raw_tts: Arc<dyn StreamingTts> = match config.tts.provider.as_str() {
             "qwen" => Arc::new(QwenRealtimeTts::from_config(&config.tts)?),
+            "cartesia" => Arc::new(CartesiaStreamingTts::from_config(&config.tts)?),
             "mock" => Arc::new(FakeTts::new(
                 config.tts.sample_rate_hz,
                 config.tts.chunk_ms,
                 3,
             )),
-            other => anyhow::bail!("unknown tts.provider '{other}' (expected qwen or mock)"),
+            other => {
+                anyhow::bail!("unknown tts.provider '{other}' (expected qwen, cartesia, or mock)")
+            }
         };
 
         Self::assemble(config, asr, raw_tts, false).await
@@ -797,6 +805,11 @@ enum AsrLinkState {
         token: CancellationToken,
     },
     Ready(AsrConnection),
+    // Input may close before the queued terminal is polled; preserve its retry classification.
+    Draining {
+        connection: AsrConnection,
+        due: tokio::time::Instant,
+    },
     RetryWaiting {
         due: tokio::time::Instant,
     },
@@ -846,7 +859,7 @@ impl AsrLink {
                     attempt.abort();
                 }
             }
-            AsrLinkState::Ready(mut connection) => {
+            AsrLinkState::Ready(mut connection) | AsrLinkState::Draining { mut connection, .. } => {
                 connection.control.cancel();
                 self.cleanup.spawn(async move {
                     let _ = tokio::time::timeout(
@@ -873,7 +886,7 @@ impl AsrLink {
     /// Cancels a ready connection and schedules a fresh reconnect. The queued
     /// audio dies with the connection; it is never replayed.
     async fn drop_connection(&mut self) {
-        if let AsrLinkState::Ready(mut connection) =
+        if let AsrLinkState::Ready(mut connection) | AsrLinkState::Draining { mut connection, .. } =
             std::mem::replace(&mut self.state, AsrLinkState::Stopped)
         {
             connection.control.cancel();
@@ -901,7 +914,9 @@ impl Drop for AsrLink {
                 token.cancel();
                 attempt.abort();
             }
-            AsrLinkState::Ready(connection) => connection.control.cancel(),
+            AsrLinkState::Ready(connection) | AsrLinkState::Draining { connection, .. } => {
+                connection.control.cancel()
+            }
             _ => {}
         }
     }
@@ -933,6 +948,17 @@ async fn poll_link(link: &mut AsrLink) -> LinkPoll {
             Ok(None) => LinkPoll::ConnectionClosed,
             Err(error) => LinkPoll::ConnectionError(error.to_string()),
         },
+        AsrLinkState::Draining { connection, due } => {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(*due) => LinkPoll::ConnectionError("ASR input closed without terminal within 1s".into()),
+                event = connection.events.next_event() => match event {
+                    Ok(Some(event)) => LinkPoll::Event(event),
+                    Ok(None) => LinkPoll::ConnectionClosed,
+                    Err(error) => LinkPoll::ConnectionError(error.to_string()),
+                }
+            }
+        }
         AsrLinkState::RetryWaiting { due } => {
             tokio::time::sleep_until(*due).await;
             LinkPoll::RetryDue
@@ -1531,15 +1557,15 @@ async fn handle_audio_frame(
             .await
         }
         AdmitOutcome::ConnectionLost => {
-            handle_connection_loss(
-                state,
-                link,
-                event_tx,
-                meta_factory,
-                metrics,
-                "asr connection lost during input".to_string(),
-            )
-            .await
+            if let AsrLinkState::Ready(connection) =
+                std::mem::replace(&mut link.state, AsrLinkState::Stopped)
+            {
+                link.state = AsrLinkState::Draining {
+                    connection,
+                    due: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                };
+            }
+            true
         }
     }
 }

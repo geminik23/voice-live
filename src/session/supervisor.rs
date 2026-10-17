@@ -161,6 +161,8 @@ pub struct VoiceSession {
     /// Highest audio-source utterance whose candidates are closed (committed
     /// or superseded by an authoritative final).
     candidate_closed_watermark: Option<u64>,
+    // Audio ids are session-monotonic; only a nonempty partial commit advances this boundary.
+    consumed_audio_watermark: Option<u64>,
     slot_journal: HashMap<crate::semantics::frame::SlotName, SlotJournalEntry>,
     deferred_turn: Option<DeferredTurn>,
     workers: tokio::task::JoinSet<()>,
@@ -372,6 +374,7 @@ impl VoiceSessionBuilder {
             turn_started_at_us: None,
             candidate_generation: 0,
             candidate_closed_watermark: None,
+            consumed_audio_watermark: None,
             slot_journal: HashMap::new(),
             deferred_turn: None,
             workers,
@@ -444,6 +447,21 @@ impl VoiceSession {
         // Speech events are admitted by identity and lifecycle before any
         // projection or handler runs, so a late chunk, a duplicate terminal,
         // or an old acknowledgement can never touch the current state.
+        let audio_id = match &event {
+            VoiceEvent::AsrPartial { utterance_id, .. }
+            | VoiceEvent::AsrUtteranceFinal {
+                utterance_id,
+                source: AsrSource::Audio,
+                ..
+            } => Some(*utterance_id),
+            _ => None,
+        };
+        if audio_id.is_some_and(|id| {
+            self.consumed_audio_watermark
+                .is_some_and(|consumed| id <= consumed)
+        }) {
+            return Ok(());
+        }
         if !self.admit_speech_event(&event) {
             return Ok(());
         }
@@ -1507,6 +1525,10 @@ impl VoiceSession {
         let sealed_source = self.transcript.current_utterance();
         let sealed = self.transcript.seal_current();
         if !sealed.trim().is_empty() {
+            self.consumed_audio_watermark = Some(
+                self.consumed_audio_watermark
+                    .map_or(sealed_source, |id| id.max(sealed_source)),
+            );
             self.turn_buffer.push_partial_seal(sealed);
         }
 
@@ -3039,6 +3061,158 @@ fn render_turn_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_commit_rejects_late_audio_before_projection() {
+        let (mut session, _, _) = harness();
+        session
+            .handle_event(VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                revision: Revision(1),
+                hypothesis: "첫 요청입니다".into(),
+            })
+            .await
+            .unwrap();
+        session.commit_user_turn("test").await.unwrap();
+        session
+            .handle_event(VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 1,
+                revision: Revision(2),
+                hypothesis: "다음 요청입니다".into(),
+            })
+            .await
+            .unwrap();
+        let revision = session.state.epochs.transcript;
+        for event in [
+            VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                revision: Revision(99),
+                hypothesis: "늦은 수정".into(),
+            },
+            VoiceEvent::AsrUtteranceFinal {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                source: AsrSource::Audio,
+                transcript: "첫 요청의 늦은 결과".into(),
+            },
+        ] {
+            session.handle_event(event).await.unwrap();
+            assert_eq!(session.state.epochs.transcript, revision);
+            assert_eq!(session.transcript.current_text(), "다음 요청입니다");
+            assert_eq!(session.state.current_hypothesis, "다음 요청입니다");
+            assert!(session.turn_buffer.is_empty());
+        }
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_first_commit_does_not_consume_empty_successor() {
+        let (mut session, _, _) = harness();
+        session
+            .handle_event(VoiceEvent::AsrUtteranceFinal {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                source: AsrSource::Audio,
+                transcript: "같은 요청입니다".into(),
+            })
+            .await
+            .unwrap();
+        session.commit_user_turn("test").await.unwrap();
+        session
+            .handle_event(VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 1,
+                revision: Revision(2),
+                hypothesis: "같은 요청입니다".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.transcript.current_text(), "같은 요청입니다");
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn injection_only_commit_does_not_consume_audio_identity() {
+        let (mut session, _, _) = harness();
+        session
+            .handle_event(VoiceEvent::AsrUtteranceFinal {
+                meta: session.new_meta(),
+                utterance_id: 10,
+                source: AsrSource::Injection,
+                transcript: "입력한 요청입니다".into(),
+            })
+            .await
+            .unwrap();
+        session.commit_user_turn("test").await.unwrap();
+        assert!(session.consumed_audio_watermark.is_none());
+        session
+            .handle_event(VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                revision: Revision(1),
+                hypothesis: "음성 요청입니다".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.transcript.current_text(), "음성 요청입니다");
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consumed_audio_guard_survives_reset_but_does_not_filter_injection() {
+        let (mut session, _, _) = harness();
+        session
+            .handle_event(VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                revision: Revision(1),
+                hypothesis: "같은 요청입니다".into(),
+            })
+            .await
+            .unwrap();
+        session
+            .handle_event(VoiceEvent::AsrUtteranceFinal {
+                meta: session.new_meta(),
+                utterance_id: 10,
+                source: AsrSource::Injection,
+                transcript: "추가 입력".into(),
+            })
+            .await
+            .unwrap();
+        session.commit_user_turn("test").await.unwrap();
+        assert_eq!(session.consumed_audio_watermark, Some(0));
+        session
+            .handle_event(VoiceEvent::AsrStreamReset {
+                meta: session.new_meta(),
+                generation: 2,
+            })
+            .await
+            .unwrap();
+        session
+            .handle_event(VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 1,
+                revision: Revision(2),
+                hypothesis: "같은 요청입니다".into(),
+            })
+            .await
+            .unwrap();
+        session
+            .handle_event(VoiceEvent::AsrUtteranceFinal {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                source: AsrSource::Injection,
+                transcript: "독립 입력".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.transcript.current_text(), "같은 요청입니다");
+        assert_eq!(session.turn_buffer.render_candidate(""), "독립 입력");
+        session.shutdown_active_work().await;
+    }
 
     #[test]
     fn expected_answer_type_classifies_assistant_questions() {

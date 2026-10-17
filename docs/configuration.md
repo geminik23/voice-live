@@ -14,7 +14,7 @@ audio:
   frame_ms: 20
 
 asr:
-  provider: inject          # together | inject | mock
+  provider: inject          # together | cartesia | inject | mock
   model: nvidia/nemotron-3.5-asr-streaming-0.6b
   endpoint: wss://api.together.ai/v1/realtime
   api_key_env: TOGETHER_API_KEY
@@ -25,13 +25,18 @@ asr:
   open_timeout_ms: 10000
   write_timeout_ms: 2000
   input_buffer_ms: 1000
+  cartesia:                 # used only by the Cartesia STT factory
+    api_version: "2026-08-14"
+    finalize_timeout_ms: 2000
+    finish_timeout_ms: 5000
+    max_transcript_bytes: 65536
   partials:
     enabled: true
     stable_after_ms: 320   # only prefixes unchanged for this long are stable
     stable_revisions: 2    # must match for N consecutive revisions to be stable
 
 tts:
-  provider: mock           # qwen | mock
+  provider: mock           # qwen | cartesia | mock
   model: qwen3-tts-flash
   endpoint: wss://dashscope.aliyuncs.com/api/v1/inference/qwen3-tts/realtime
   api_key_env: DASHSCOPE_API_KEY
@@ -43,6 +48,9 @@ tts:
   open_timeout_ms: 10000
   request_timeout_ms: 30000
   max_input_bytes: 65536
+  cartesia:                 # used only by the Cartesia TTS factory
+    api_version: "2026-08-14"
+    max_buffer_delay_ms: 0
   premade:
     enabled: true
     phrases: ["네", "네, 확인했어요."]   # pre-synthesize at startup for immediate playback
@@ -144,13 +152,50 @@ When `allow_text_injection` is enabled, the runtime owns a per-session injection
 | `inject` (ASR) | Development text injection: the browser text box acts as the user's utterance | `dev.allow_text_injection` |
 | `together` (ASR) | Live streaming recognition | `TOGETHER_API_KEY` |
 | `qwen` (TTS) | Live speech synthesis | `DASHSCOPE_API_KEY`, `QWEN_VOICE_ID` (or `tts.voice`) |
+| `cartesia` (ASR) | Ink Whisper manual streaming recognition | Explicit Cartesia endpoint/model/env; Korean, 16 kHz, `manual_commit: true`, `CARTESIA_API_KEY` |
+| `cartesia` (TTS) | Native incremental Sonic synthesis | Explicit Cartesia endpoint/model/env settings; `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID` (or `tts.voice`) |
 
 Unknown provider names fail the built-in runtime build; they do not silently fall back to `mock`. The injected builder uses the host's factories instead of resolving these names.
 
-Verify the wire-level fields of the `together`/`qwen` adapters with the paid
-contract tests before use (`cargo test --test provider_contracts -- --ignored`).
-The Together test requires a consented 16 kHz mono PCM WAV supplied through
-`VOICE_KOREAN_FIXTURE`.
+Validate each real provider with its individual ignored contract only after credential, cost, and external-transmission approval. Do not run all ignored tests as a keyless check. The Together and Cartesia STT contracts require a consented 16 kHz mono PCM WAV supplied through `VOICE_KOREAN_FIXTURE`; the Cartesia TTS contract sends synthetic Korean text and requires an approved voice. See [provider testing](testing.md#cartesia-provider-regressions-and-paid-contracts).
+
+## Cartesia STT
+
+Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together. Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, locale `ko-KR`, and `audio.input_sample_rate_hz: 16000`. Korean `ko`/`ko-KR` is normalized to `ko`. Other models, locales, rates, or automatic commit are rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
+
+| Key | Default | Validation and use |
+|---|---:|---|
+| `asr.cartesia.api_version` | `2026-08-14` | Currently the only accepted version, sent in `Cartesia-Version` |
+| `asr.cartesia.finalize_timeout_ms` | 2000 | Positive bounded duration; each finalize has a write deadline, then an independent absolute acknowledgement deadline from write completion |
+| `asr.cartesia.finish_timeout_ms` | 5000 | Positive bounded duration from the first successful finish admission, including queued PCM, pending flushes, close write, and done |
+| `asr.cartesia.max_transcript_bytes` | 65536 | Positive UTF-8 byte limit for confirmed prefix plus mutable tail and each delivered transcript |
+
+The factory validates its own settings and credentials; unused Cartesia settings do not reject a host-injected provider. Empty nested settings use serde defaults. Endpoints must omit userinfo and query parameters; the adapter owns the model/encoding/sample-rate/language query. WSS is required outside loopback. Authentication and successful WebSocket upgrade establish send-readiness; no application-level ready event is invented.
+
+PCM is binary mono signed little-endian PCM16. `asr.chunk_ms` bounds wire splitting and is capped at 100 ms; the adapter does not insert silent audio or drop supplied silence. It paces sends at approximately real time, rebasing after substantial lateness rather than replaying a large backlog as a burst. Input samples remain budgeted throughout writer ownership, conversion, and pacing. At most 64 command slots (or the smaller host limit) cover queued/writer-held audio and outstanding finalize markers. Pending markers retain their slots until acknowledgement. Finish is reserved independently of queue saturation. The event queue holds at most 16 transcript events, each limited by `max_transcript_bytes`; control and terminal storage are separate and bounded. WebSocket frames/messages are limited to 262144 bytes.
+
+Confirmed transcript deltas append verbatim; mutable tails replace, never append. No delta trimming or inserted spaces occur inside the adapter. Full replacement Partial snapshots have connection-monotonic revisions, and one full confirmed Final is emitted per `flush_done`, including an empty boundary when necessary. `request_id` identifies the connection, not an utterance. Local utterance IDs advance only at boundaries; runtime remapping keeps identities monotonic across reconnects. Silence auto-finalization confirms prefix text without independently ending the runtime utterance. Already selected partial-based turns are not rewritten by a late Final.
+
+**Integration assumption:** pending finalizes and transcript boundaries are attributed FIFO: all text for a flush must precede its acknowledgement, and successor text must follow it. PCM continues while acknowledgements are pending; there is no per-flush stop-and-wait pause. Official schema/SDK descriptions support the manual command flow but do not completely establish multiple-outstanding-finalize and silence-race semantics for Ink Whisper. Local tests verify adapter behavior under that ordering, not the real server guarantee. The ignored contract and live tests must validate it before relying on the combination. Wrong connection IDs, unsolicited acknowledgements, missing acknowledgements, malformed events, and budget failures terminate the stream; an indistinguishable duplicate acknowledgement or semantic misattribution cannot always be detected locally.
+
+`finish_input()` drains admitted PCM and pending flushes, sends plain text `close`, and accepts only normal `done` as graceful completion. Unconfirmed tails never become Final. Its original deadline survives finished-input Drop, pings, output backpressure, and acknowledgement activity. A later error preserves already-admitted confirmed Finals before the error, while discarding obsolete queued partials; terminal failure never depends on free output capacity. Explicit cancellation, output/control Drop, legacy `close`, and runtime stop retain bounded abort semantics and do not promise graceful final transcripts. Reconnect is fresh, without PCM replay.
+
+## Cartesia TTS
+
+The full Cartesia sample selects both providers. `full-duplex-demo/configs/voice-runtime.cartesia-tts.yaml` remains available for typed input plus Cartesia TTS diagnosis. The keyless default sample remains inject ASR plus mock TTS.
+
+Set all provider-specific common fields explicitly: `tts.provider: cartesia`, endpoint `wss://api.cartesia.ai/tts/websocket`, model `sonic-3.6`, `api_key_env: CARTESIA_API_KEY`, `voice_env: CARTESIA_VOICE_ID`, language `ko`, and rate `24000`. Changing just the provider name keeps the Qwen defaults and is not a supported migration. The factory accepts `sonic-3.6`, `sonic-3.5`, `sonic-3`, and `sonic-latest`; model aliases and account/voice availability still require paid validation. The initial language path accepts `ko`, `ko-KR`, and `Korean`, normalized to `ko`, and rejects other languages rather than silently falling back.
+
+| Key | Default | Validation and use |
+|---|---|---|
+| `tts.cartesia.api_version` | `2026-08-14` | Currently the only supported schema version; sent as `Cartesia-Version`, not inferred from a test date |
+| `tts.cartesia.max_buffer_delay_ms` | 0 | Integer 0–5000; sent explicitly and unchanged on every continuation and finish |
+
+Cartesia settings and credentials are validated by its factory, not by generic YAML loading or unused provider strings on the host-injected path. Missing nested settings preserve old YAML compatibility. Endpoint queries and embedded credentials are rejected. Production endpoints must use WSS; local test servers may use WS on loopback. Voice is required at session open. Requested rates must be 8000, 16000, 22050, 24000, 44100, or 48000 Hz; output is raw mono `pcm_s16le`. `tts.chunk_ms` does not control Cartesia's server chunks: the adapter bounds and normalizes received chunks instead.
+
+A response owns one socket and a unique context, independent text writing and audio reading, a 64-command budget including writer-held text, a 16-item normalized audio queue, and a separate terminal slot. Finish reserves no command-queue capacity: the writer drains accepted fragments before sending empty text with `continue:false`. Accepted text counts toward the cumulative byte budget; a fragment whose JSON representation cannot fit the wire budget is also rejected. WebSocket frames/messages are limited to 262144 bytes, decoded raw audio to 65536 bytes, and normalized audio to 8192 bytes. Socket writes are bounded at two seconds and the remaining response deadline. The absolute deadline starts at first successful nonempty admission, never resets on append, and applies even when output is unpolled or full. Successful finish followed by input Drop permits output drain; other cancellation/Drop paths close ownership. Late continuations are conservatively rejected after one second without received audio once audio has started; context expiry never creates a replacement context. This does not promise arbitrary host think-time.
+
+The dedicated sample disables premade warmup and uses the reservation task spec. It requires `OPENAI_API_KEY` as well as Cartesia credentials; task-spec probe failure is strict, not a mock fallback. Enabling premade synthesis later can incur costs before browser input.
 
 ## Language scope
 

@@ -8,6 +8,61 @@ fn demo_root() -> PathBuf {
 }
 
 #[test]
+fn dual_cartesia_sample_wires_both_providers_and_relative_task_spec() {
+    let config =
+        VoiceRuntimeConfig::from_file(demo_root().join("configs/voice-runtime.cartesia.yaml"))
+            .unwrap();
+    assert_eq!(config.asr.provider, "cartesia");
+    assert_eq!(config.asr.endpoint, "wss://api.cartesia.ai/stt/websocket");
+    assert_eq!(config.asr.model, "ink-whisper");
+    assert_eq!(config.asr.api_key_env, "CARTESIA_API_KEY");
+    assert_eq!(config.asr.locale, "ko-KR");
+    assert!(config.asr.manual_commit);
+    assert_eq!(config.asr.chunk_ms, 100);
+    assert_eq!(config.asr.cartesia.api_version, "2026-08-14");
+    assert_eq!(config.asr.cartesia.finalize_timeout_ms, 2000);
+    assert_eq!(config.asr.cartesia.finish_timeout_ms, 5000);
+    assert_eq!(config.asr.cartesia.max_transcript_bytes, 65536);
+    assert_eq!(config.tts.provider, "cartesia");
+    assert_eq!(config.tts.api_key_env, "CARTESIA_API_KEY");
+    assert_eq!(config.tts.voice_env, "CARTESIA_VOICE_ID");
+    assert!(!config.tts.premade.enabled);
+    assert!(config.dev.allow_text_injection);
+    let spec = config.agents.task.spec.unwrap();
+    assert!(spec.exists());
+    AgentBuilder::from_yaml_file(spec).unwrap();
+    let legacy = VoiceRuntimeConfig::from_yaml_str("version: 1").unwrap();
+    assert_eq!(legacy.asr.cartesia.finalize_timeout_ms, 2000);
+    assert_eq!(legacy.asr.cartesia.finish_timeout_ms, 5000);
+}
+
+#[test]
+fn cartesia_tts_sample_is_explicit_and_preserves_keyless_defaults() {
+    let config =
+        VoiceRuntimeConfig::from_file(demo_root().join("configs/voice-runtime.cartesia-tts.yaml"))
+            .unwrap();
+    assert_eq!(config.asr.provider, "inject");
+    assert!(config.dev.allow_text_injection);
+    assert_eq!(config.tts.provider, "cartesia");
+    assert_eq!(config.tts.endpoint, "wss://api.cartesia.ai/tts/websocket");
+    assert_eq!(config.tts.model, "sonic-3.6");
+    assert_eq!(config.tts.api_key_env, "CARTESIA_API_KEY");
+    assert_eq!(config.tts.voice_env, "CARTESIA_VOICE_ID");
+    assert_eq!(config.tts.language, "ko");
+    assert_eq!(config.tts.sample_rate_hz, 24000);
+    assert_eq!(config.tts.cartesia.api_version, "2026-08-14");
+    assert_eq!(config.tts.cartesia.max_buffer_delay_ms, 0);
+    assert!(!config.tts.premade.enabled);
+    let spec = config.agents.task.spec.unwrap();
+    assert!(spec.exists());
+    AgentBuilder::from_yaml_file(spec).unwrap();
+    let keyless =
+        VoiceRuntimeConfig::from_file(demo_root().join("configs/voice-runtime.yaml")).unwrap();
+    assert_eq!(keyless.asr.provider, "inject");
+    assert_eq!(keyless.tts.provider, "mock");
+}
+
+#[test]
 fn demo_runtime_and_agent_yaml_files_parse() {
     let root = demo_root();
     let runtime_path = root.join("configs/voice-runtime.yaml");

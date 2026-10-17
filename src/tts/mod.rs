@@ -325,6 +325,7 @@ impl AudioNormalizer {
 }
 
 pub mod buffered;
+pub mod cartesia;
 pub mod fake;
 pub mod premade;
 pub mod qwen;

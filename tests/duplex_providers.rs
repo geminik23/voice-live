@@ -841,6 +841,172 @@ dev:
     );
 }
 
+struct EarlyErrorTts;
+struct EarlyErrorEvents;
+#[async_trait]
+impl TtsStream for EarlyErrorEvents {
+    async fn next_event(&mut self) -> anyhow::Result<Option<TtsEvent>> {
+        Ok(Some(TtsEvent::Error {
+            recoverable: false,
+            message: "Cartesia TTS error (status=429, code=quota_exceeded)".into(),
+        }))
+    }
+}
+#[async_trait]
+impl StreamingTts for EarlyErrorTts {
+    async fn synthesize(
+        &self,
+        _: TtsRequest,
+        _: CancellationToken,
+    ) -> anyhow::Result<Box<dyn TtsStream>> {
+        unreachable!()
+    }
+    fn text_input_mode(&self) -> TextInputMode {
+        TextInputMode::Incremental
+    }
+    fn supports_text_stream(&self) -> bool {
+        true
+    }
+    async fn open_text_stream(
+        &self,
+        options: TtsSessionOptions,
+        limits: TtsInputLimits,
+        token: CancellationToken,
+    ) -> Result<TtsDuplexSession, TtsOpenError> {
+        let (native, _) = NativeIncrementalTts::new();
+        let mut session = native.open_text_stream(options, limits, token).await?;
+        session.events = Box::new(EarlyErrorEvents);
+        Ok(session)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn tts_error_before_admission_preserves_provider_reason() {
+    let (speech_tx, speech_rx) = mpsc::channel(2);
+    let (event_tx, mut events) = mpsc::channel(16);
+    let clock: voice_live::clock::ClockRef = Arc::new(voice_live::clock::TokioClock::new());
+    let shutdown = CancellationToken::new();
+    let worker = tokio::spawn(run_tts_worker(
+        Arc::new(EarlyErrorTts),
+        speech_rx,
+        event_tx,
+        Arc::new(voice_live::meta::ClockMetaFactory::new(clock)),
+        shutdown.clone(),
+        Arc::new(TtsCancellationRegistry::default()),
+        TtsWorkerSettings {
+            language: "Korean".into(),
+            voice: "voice".into(),
+            max_input_bytes: 1024,
+            request_timeout: Duration::from_secs(5),
+            open_timeout: Duration::from_secs(2),
+            preferred_sample_rate_hz: Some(24_000),
+        },
+    ));
+    speech_tx
+        .send((SpeechAct::phatic("네", 1, 10), CancellationToken::new()))
+        .await
+        .unwrap();
+    let event = events.recv().await.unwrap();
+    shutdown.cancel();
+    worker.await.unwrap();
+    assert!(
+        matches!(event, voice_live::VoiceEvent::TtsFailed { message, .. } if message.contains("quota_exceeded"))
+    );
+}
+
+struct InputRacingFatalAsr(Arc<AtomicUsize>);
+struct FatalInput(Arc<Notify>);
+struct FatalEvents(Arc<Notify>);
+
+#[async_trait]
+impl AsrAudioInput for FatalInput {
+    fn try_push_audio(&mut self, _: Vec<i16>) -> Result<AsrAudioPush, AsrInputError> {
+        self.0.notify_one();
+        Err(AsrInputError::Closed)
+    }
+    async fn push_audio(&mut self, pcm: Vec<i16>) -> Result<AsrAudioPush, AsrInputError> {
+        self.try_push_audio(pcm)
+    }
+    fn try_commit_utterance(&mut self) -> Result<(), AsrInputError> {
+        Err(AsrInputError::Closed)
+    }
+    async fn commit_utterance(&mut self) -> Result<(), AsrInputError> {
+        self.try_commit_utterance()
+    }
+    fn finish_input(&mut self) -> Result<(), AsrInputError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AsrEventStream for FatalEvents {
+    async fn next_event(&mut self) -> anyhow::Result<Option<AsrEvent>> {
+        self.0.notified().await;
+        Ok(Some(AsrEvent::Error {
+            recoverable: false,
+            message: "quota_exceeded".into(),
+        }))
+    }
+}
+
+#[async_trait]
+impl StreamingAsr for InputRacingFatalAsr {
+    async fn open(&self, _: AsrSessionConfig) -> anyhow::Result<Box<dyn AsrSession>> {
+        unreachable!()
+    }
+    fn supports_duplex(&self) -> bool {
+        true
+    }
+    async fn open_duplex(
+        &self,
+        _: AsrSessionConfig,
+        _: AsrDuplexLimits,
+        _: CancellationToken,
+    ) -> Result<AsrDuplexSession, AsrOpenError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let notify = Arc::new(Notify::new());
+        Ok(AsrDuplexSession {
+            input: Box::new(FatalInput(notify.clone())),
+            events: Box::new(FatalEvents(notify)),
+            control: Box::new(FlagControl {
+                closed: Arc::new(AtomicBool::new(false)),
+            }),
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fatal_asr_after_input_close_is_not_retried_and_injection_survives() {
+    let opens = Arc::new(AtomicUsize::new(0));
+    let (tts, _, _) = CountingTts::new(1);
+    let runtime = injected_runtime(
+        INJECTED_CONFIG,
+        Arc::new(InputRacingFatalAsr(opens.clone())),
+        tts,
+    )
+    .await
+    .unwrap();
+    let (session, mut client) = start_session(&runtime).await;
+    wait_for_opens(&opens, 1).await;
+    session
+        .input_tx
+        .send(ClientInput::Audio(voice_live::media::AudioFrame {
+            sequence: 0,
+            pcm: vec![100; 320],
+        }))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "closed input must not hide the fatal terminal"
+    );
+    runtime.inject_user_text(session.session_id, "다음 요청입니다");
+    assert!(saw_message(&mut client, "speech_done", Duration::from_secs(10)).await);
+    runtime.close_session(session.session_id).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn fatal_asr_open_is_not_retried_but_typed_text_still_flows() {
     let (asr, opens, _) =

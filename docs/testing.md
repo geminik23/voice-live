@@ -76,6 +76,28 @@ Supervisor regressions directly assert metadata/absence-preserving journal rollb
 
 Paid contracts are still ignored by default. They use actual outer timeouts across open and I/O, require an authoritative ASR Final, transmit fixture audio concurrently with transcript drain, and require valid TTS audio plus successful terminal and bounded cleanup. Official provider docs and local fakes are not evidence that a real account/model/locale combination works.
 
+## Cartesia provider regressions and paid contracts
+
+`cargo test --test cartesia_providers` runs real localhost WebSocket fakes, not Cartesia endpoints. It checks header/version authentication, unchanged context settings, verbatim fragments, audio before finish, normal and audio-bearing terminals, context-less errors before/after input, wrong contexts, base64/PCM/format budgets, queue saturation with reserved finish, independent absolute deadlines, context expiry, cancellation/Drop, cancelled output polls, legacy ownership, and factory-only validation. The target also verifies native premade warmup/cache reuse and a channel runtime path from actual PCM/VAD through both Cartesia adapters to authorized playback, chunk/completion ACKs, and exactly-once turn resolution, without text injection or paid providers. Socket tests use bounded real time; runtime policy regressions use paused virtual time.
+
+`cargo test --test cartesia_asr` covers manual STT: header/query construction, raw little-endian PCM and plain-text finalize/close, exact delta concatenation and tail replacement, connection identity versus utterance identity, monotonic revisions, duplicate snapshot suppression, bounded PCM/command permits including writer-held data and outstanding flushes, pipelined finalize, continuous-silence/repeated-flush stress with positive ack latency, pending/finish deadlines, graceful confirmed-only drain, full/unpolled output, Ping handling during pacing, EOF and malformed events, redacted retry classification, cancelled admission/output polls, legacy facade, factory/injection validation, and Drop ownership. Regressions preserve acknowledged Finals across later receive failure and preserve the original finish deadline after finished-input Drop.
+
+`tests/duplex_providers.rs` additionally verifies non-retryable ASR errors racing with input closure and preservation of TTS provider errors before text admission. Supervisor regressions cover consumed audio after partial commit, preserving a successor hypothesis and transcript epoch, Final-first empty successors, mixed injection/audio, same-text fresh identities, and reset behavior. The scenario `partial_commit_does_not_repeat_on_late_audio_final` asserts exactly one committed turn instead of two. These regressions were first observed failing against the old behavior before their fixes.
+
+The ignored test `cartesia_tts_korean_streaming_contract` requires `CARTESIA_API_KEY` and an approved `CARTESIA_VOICE_ID`. It sends two synthetic Korean text fragments, requires valid first audio before finish, drains a normal terminal, and bounds open/request/cleanup. It does not use the LLM or `VOICE_KOREAN_FIXTURE`. Run only after account, cost, and external-transmission approval:
+
+```sh
+cargo test --locked --test provider_contracts cartesia_tts_korean_streaming_contract -- --ignored --nocapture
+```
+
+The ignored `cartesia_stt_korean_streaming_contract` requires `CARTESIA_API_KEY` and `VOICE_KOREAN_FIXTURE`, a consented mono 16 kHz signed PCM16 Korean WAV of at most 15 seconds. It transmits the fixture twice at real-time pace, continues PCM while flushes are pending, and requires two nonempty ordered utterance Finals, normal done/closure, and a nonempty partial before the first finalize admission. It reports first-partial/total elapsed time on the host's monotonic clock, not mixed client/server clocks. A failure of the pre-finalize partial requirement means the selected model/fixture has not established streaming UX; it must be investigated, not silently waived or replaced with another model.
+
+```sh
+cargo test --locked --test provider_contracts cartesia_stt_korean_streaming_contract -- --ignored --nocapture
+```
+
+Both tests compile in the default suite but remain ignored and have not been run against Cartesia. The adapter's FIFO association of finalizes and `flush_done` is an explicit integration assumption; fake-server success and even a finite live fixture run do not establish all vendor silence/overlap semantics. Inspect repeated utterances, silence auto-finalization, empty flushes, first-partial cadence/latency, and boundary attribution during subsequent live validation. PCM validity is not evidence that natural speech sounds correct; listening, real microphone input, physical interruption, actual LLM heard-memory, and browser playback need separate checks.
+
 ## Platform validation
 
 **The supported targets are native Linux, Windows, and macOS runtimes.** Changing development hosts does not remove support for other operating systems or make WSL/Docker a substitute for native execution. Validate both the default `framework` feature and the `--no-default-features` core.

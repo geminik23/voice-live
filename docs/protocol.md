@@ -16,6 +16,8 @@ transport-agnostic.
 - Audio output: mono PCM16 at the response's actual `speech_started.sample_rate` (built-in default 24 kHz)
 - All API keys stay on the server and are never sent to the browser.
 
+Cartesia STT and TTS use this same browser protocol; provider finalize/close commands, connection/context IDs, continuations, and credentials stay server-side. There are no new client messages. Local server VAD controls manual STT finalization. General answers still follow authoritative AgentFinal, every SpeechAct passes the Claim Gate, and playback ACKs retain their existing heard-only meaning. Provider replacement does not establish real microphone or playback verification.
+
 ## Client → server
 
 ### Binary: audio frame

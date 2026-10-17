@@ -96,6 +96,22 @@ cargo test --test provider_contracts -- --ignored
 
 For an unverified provider combination, start diagnosis with the `provider_error` events in the logs and `target/voice-traces/<date>/<session>/events.jsonl`.
 
+## Cartesia streaming STT and TTS
+
+`full-duplex-demo/configs/voice-runtime.cartesia.yaml` selects Cartesia Ink Whisper manual streaming STT and native Sonic TTS. The default configuration stays keyless. For typed-input TTS-only diagnosis, use `voice-runtime.cartesia-tts.yaml` instead; it deliberately keeps inject ASR.
+
+Set `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID`, and `OPENAI_API_KEY` in your server environment, then run:
+
+```sh
+cargo run -p full-duplex-demo -- --config full-duplex-demo/configs/voice-runtime.cartesia.yaml
+```
+
+For Bash/Zsh/Git Bash, use `export CARTESIA_API_KEY=...` and `export CARTESIA_VOICE_ID=...`; for PowerShell, use `$env:CARTESIA_API_KEY = "..."` and `$env:CARTESIA_VOICE_ID = "..."`. Keep secrets out of committed files and browser code. The existing reservation task agent requires the OpenAI key; a failed task-spec probe is not silently replaced by a mock agent in this live-provider setup. The full configuration captures microphone audio; the TTS-only configuration still requests browser microphone permission but uses typed input for recognition. The server does not automatically load a `.env` file: export the variables into its process environment.
+
+The full sample explicitly selects `ink-whisper`, 16 kHz mono `pcm_s16le`, locale `ko-KR` normalized to `ko`, and `manual_commit: true`; local VAD enqueues finalizes without pausing PCM for acknowledgements. TTS selects `sonic-3.6`, raw mono PCM16 at 24 kHz, `ko`, and zero managed text buffering delay. Both use API version `2026-08-14`. Premade warmup is disabled; enabling it can incur synthesis costs at startup. STT traffic may begin at browser session start, before a complete utterance. Microphone audio and conversation text leave the host and can incur Cartesia/OpenAI charges. Approve account/voice use, cost limits, fixture consent, and data transmission before running; zero-data-retention is not assumed for a standard account.
+
+Run the individual [ignored STT and TTS contracts](testing.md#cartesia-provider-regressions-and-paid-contracts) only after approval, then validate both providers in the browser. STT requires a consented Korean WAV through `VOICE_KOREAN_FIXTURE`; TTS requires an approved voice. The tests do not call the LLM. Socket upgrade is send-readiness, not proof of model/voice compatibility. Offline tests cover both adapters in one runtime, but live Ink Whisper flush attribution, partial quality, natural speech output, timing, cancellation, and physical playback remain unverified. In particular, FIFO transcript/flush attribution is an explicit assumption to verify, not an established vendor guarantee. See [STT boundaries and limits](configuration.md#cartesia-stt) and [TTS continuations](configuration.md#cartesia-tts).
+
 ## Host-supplied speech providers
 
 A host can inject `Arc<dyn StreamingAsr>` and `Arc<dyn StreamingTts>` through `SpeechProviders` and `VoiceRuntime::build_with_providers`. See [injected settings and migration](configuration.md#injected-provider-settings-and-migration) and the [module contracts](modules.md#asr-tts). Factories are shared but each session/response has its own stream and control owner. No web framework, provider registry, or dynamic plugin loader is added to the library.
@@ -113,9 +129,11 @@ Together uses its documented `session.created` readiness and JSON/base64 PCM pro
 | `TOGETHER_API_KEY` | ASR | - |
 | `DASHSCOPE_API_KEY` | TTS | - |
 | `QWEN_VOICE_ID` | TTS voice; read from the variable named by `tts.voice_env` when `tts.voice` is empty | - |
+| `CARTESIA_API_KEY` | Cartesia STT/TTS credential; selected by `asr.api_key_env` and `tts.api_key_env` in the full Cartesia sample | - |
+| `CARTESIA_VOICE_ID` | Approved Cartesia voice; selected by `tts.voice_env` when `tts.voice` is empty | - |
 | `OPENAI_API_KEY` | Task/Interaction LLM | - |
 | `VOICE_WEB_DIR` | Override the browser client directory | `../web` relative to the config file |
-| `VOICE_KOREAN_FIXTURE` | Together contract tests only: path to a consented 16 kHz mono PCM16 WAV; the server does not read it | - |
+| `VOICE_KOREAN_FIXTURE` | Together/Cartesia STT contracts: consented 16 kHz mono PCM16 WAV; the Cartesia contract sends a fixture of at most 15 seconds twice. The server does not read it | - |
 
 All keys remain in the Rust gateway and are not sent to the browser.
 
