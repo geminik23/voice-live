@@ -312,7 +312,7 @@ timeline:
     event:
       type: asr_partial
       revision: 1
-      text: "토요일 저녁 7시로 예약해줘"
+      text: "금요일 저녁 7시로 예약해줘"
   - at_ms: 300
     event:
       type: local_speech_ended
@@ -334,9 +334,10 @@ agent_script:
 expect:
   - type: audible_excludes
     text: "금요일 기준"
-  - type: metric_at_least
-    name: voice_task_stale_result_dropped_total
-    value: 1
+  - type: turn_resolved
+    resolution: discard
+  - type: turn_resolution_count
+    exactly: 1
 settle_ms: 1000
 "#
 );
@@ -786,7 +787,7 @@ timeline:
     event:
       type: asr_partial
       revision: 1
-      text: "토요일 저녁 7시로 예약해줘"
+      text: "금요일 저녁 7시로 예약해줘"
   - at_ms: 300
     event:
       type: local_speech_ended

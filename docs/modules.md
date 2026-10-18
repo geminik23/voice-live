@@ -26,8 +26,9 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 |---|---|
 | `state.rs` | `FloorState`, `TaskState`, `SpeechState`, `UserSpeechState`, `InteractionAction`, `InteractionDecision(Envelope)`, `InterruptionReason` |
 | `policy.rs` | `ReflexPolicy`. Sentence-ending decisions, backchannel words, hard stops, overlap classification, and tick decisions. Punctuation-only patterns ("...") use raw tail matching (avoids empty-pattern matches). Overlap classification lives only in `classify_overlap`; `decide_on_tick` merely converts its result into an action |
-| `snapshot.rs` | `InteractionSnapshot` - read-only state passed to the brain |
-| `brain.rs` | `InteractionBrain` trait, `NoopInteractionBrain` (default), `ScriptedInteractionBrain` (tests) |
+| `snapshot.rs` | `InteractionSnapshot` - bounded current candidate, recent committed user turns, confirmed-heard assistant context, and session state passed to the brain |
+| `brain.rs` | `InteractionBrain` trait with legacy decisions and optional semantic assessments, `NoopInteractionBrain` (default), `ScriptedInteractionBrain` (tests) |
+| `semantic.rs` | Bounded, validated semantic assessment and slot updates; no playback or tool execution authority |
 
 ## semantics/
 
@@ -35,8 +36,8 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 |---|---|
 | `cue.rs` | `CueExtractor`. Application-owned literal hard stops and configured correction/negation/intent/entity regexes; no implicit language grammar |
 | `text.rs` | Pure `TextAnalyzer`, `UserTextAnalysis`, bounded `TextRules`/ordered `QuestionRule`, and compiled `ConfiguredTextAnalyzer`; no clock, I/O, state mutation, or authorization |
-| `frame.rs` | `SemanticFrame`, `SemanticValue(status)`, slot operations, dependency fingerprint. `SlotOperation::Clear` actually removes the slot |
-| `extractor.rs` | `SlotExtractor`, `NoopSlotExtractor`, explicit `configured_fallback`, and optional `HeuristicKoreanSlotExtractor` compatibility helper. Extracts date/time/party size and detects `X 말고 Y` corrections for **all three slots** (only a correction emits `Replace`, and only `Replace` invalidates dependent tasks). Values are compared as `Value` values: `to_string()` adds JSON quotes, so the strings would never match. Can be replaced by `RuntimeSlotExtractor` (LLM) when the framework is enabled |
+| `frame.rs` | `SemanticFrame`, turn-local negation, `SemanticValue(status)`, slot operations, dependency fingerprint. `SlotOperation::Clear` actually removes the slot |
+| `extractor.rs` | `SlotExtractor`, `NoopSlotExtractor`, explicit `configured_fallback`, and optional `HeuristicKoreanSlotExtractor` compatibility helper. Extracts date/time/party size and detects `X 말고 Y` corrections for **all three slots**. The supervisor invalidates dependencies when an accepted value changes, including Clear and absence-to-value; provisional cues do not cancel work. Values are compared as `Value` values. Can be replaced by `RuntimeSlotExtractor` (LLM) when the framework is enabled |
 | `partial_policy.rs` | Gate for partial controller calls. Urgent calls run immediately; semantic deltas have a minimum interval and a maximum flush interval. Injected clock |
 
 ## speech/
@@ -53,10 +54,10 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | Module | Description |
 |---|---|
 | `view.rs` | Pure `SessionView` projection + `SessionEvidence` storage |
-| `supervisor.rs` | Pure-event orchestration with consumed-audio and speech admission before projection/handling, separate synthesis/playback lifecycle, stopping ACK deadlines, failed-reply clause disposal, commit-time deferred Never context, candidate provenance/journal rollback, owned workers and exactly-once turn resolution on all exits |
+| `supervisor.rs` | Event orchestration with consumed-audio and speech admission, bounded semantic and compatibility extraction, candidate provenance/journal rollback, dependency-scoped work invalidation, deep-task admission, playback recovery, and worker-finished turn resolution |
 | `task_runner.rs` | Manages `ActiveTask` and consumes agent turns. Dropping the stream releases the framework root-turn gate |
 | `tts_worker.rs` | Complete authorized act → cache hook or duplex text admission/audio drain, request/open deadlines, response/format/sequence validation, pre-admission provider error preservation, and cancellation registry |
-| `deep_worker.rs` | `DeepWorker` trait, `DeepWorkRequest/Result`, `FakeDeepWorker` for scenarios. No automatic trigger; runs only via `VoiceSessionHandle::request_deep_work` (→ `VoiceEvent::DeepWorkRequested`) |
+| `deep_worker.rs` | `DeepWorker` trait, `DeepWorkRequest/Result`, `FakeDeepWorker` for scenarios. No automatic trigger; `VoiceSessionHandle::request_deep_work` sends `DeepWorkRequested`. Results must match a pending task and its original epoch, and use the request's dependencies |
 
 ## agent/
 
@@ -65,7 +66,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `mod.rs` | `CognitiveAgent`/`AgentTurnStream` traits - boundary separating the runtime from the framework. `AgentTurnRequest` separates `input` (only committed utterances) from `context: TurnContext` (turn environment for the system prompt). `resolve_turn(task_id, TurnResolution::{Audible, Discard})` reconciles turn memory |
 | `mock.rs` | `FakeAgent` (scripted; `AgentRecorder` records received requests and resolutions), `MockReservationAgent` (explicit Korean compatibility helper, no implicit selection) |
 | `proof.rs` | Framework-only `VoiceAgentHooks` and bound host tools; immutable SDK execution-scope origin, retry-safe turn tokens, bounded terminal proof projection, and no current-turn reassignment; canonical terminal retirement is independent of optional SDK stream chunks |
-| `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, `RuntimeInteractionBrain`, `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*` |
+| `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, `RuntimeInteractionBrain` (legacy), stateless `RuntimeSemanticBrain`, `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*`. The slot extractor rejects a whole malformed response or a response over 16384 bytes, limits updates to 32 and slot names to 128 bytes, accepts only `set`, `replace`, and `clear`, and checks confidence in 0–1. As before, `old_value: null` is represented as a present JSON null |
 
 ## asr/ tts/
 
@@ -91,7 +92,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `playback.rs` | `PlaybackCommand`, `ClientPlaybackSink` (runtime nonblocking overload shutdown or legacy standalone admission), `SimulatedPlaybackSink` (simulates the actual playback ACK flow in virtual-time tests), `UnacknowledgedPlaybackSink` (for ACK timeout scenarios) |
 | `tools/reservation.rs` | Explicit reservation example: shared in-memory backend, `search_availability` with `searched` receipts, and confirmed/idempotent `reserve_restaurant` with `committed` receipts; not a core speech-meaning registry |
 | `scenario.rs` | Scenario DSL runner. YAML → virtual-time execution → expectation evaluation |
-| `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, `RuntimePolicies`/`build_with_policies` host overrides and per-session slot factories, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, fresh ASR retry and identity mapping, one-second terminal drain after input closure to preserve fatal classification, bounded client output |
+| `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, `RuntimePolicies`/`build_with_policies` host overrides and per-session interaction/slot factories, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, fresh ASR retry and identity mapping, one-second terminal drain after input closure to preserve fatal classification, bounded client output |
 | `protocol.rs` | `ClientControlMessage` / `ServerMessage`. Defines **what** is exchanged, not **how** it is transported |
 
 ## Per-session vs. shared

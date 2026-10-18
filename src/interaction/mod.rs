@@ -1,9 +1,11 @@
 pub mod brain;
 pub mod policy;
+pub mod semantic;
 pub mod snapshot;
 pub mod state;
 
 pub use policy::{OverlapOutcome, ReflexPolicy};
+pub use semantic::{SemanticAssessment, SemanticUpdate};
 pub use snapshot::InteractionSnapshot;
 pub use state::{
     ExpectedAnswerType, FloorState, InteractionAction, InteractionDecision,

@@ -23,8 +23,8 @@ VoiceEvent bus (events.rs)
     ├─▶ Session Supervisor (session/supervisor.rs)
     │      - 40 ms control tick (checks only deterministic timeouts)
     │      - transcript reconciler (revisioned partial)
-    │      - reflex policy (Korean sentence endings, backchannel, hard stop)
-    │      - call Interaction Brain (LLM) only when uncertain
+    │      - immediate VAD/stop and deterministic timing
+    │      - bounded semantic worker or explicit compatibility policy
     │      - SpeechAct priority queue + Claim Gate
     │
     ├─▶ Task Agent (ai-agents RuntimeAgent)
@@ -81,7 +81,7 @@ Audio frames never wait for an LLM or tool. Mic input, VAD, and playback run at 
 
 ## Event model and epochs
 
-All asynchronous results flow through `VoiceEvent`, and the supervisor applies events to the `SessionView` projection. The projection is pure and performs no external I/O.
+Provider, task, and playback events flow through `VoiceEvent`; the bounded semantic worker returns through private session channels. The supervisor checks provenance before applying a result. `SessionView::apply` is a pure projection and performs no external I/O.
 
 ```text
 Epochs { transcript, interaction, thought, speech }
@@ -89,10 +89,12 @@ Epochs { transcript, interaction, thought, speech }
 
 - **transcript**: ASR partial revision. Decisions based on old partials are discarded. The adapter guarantees a revision that **increases monotonically per session** (synthesizing a counter if the provider does not supply one). If this value stops changing, both stale-result detection and the stable-prefix timer stop working.
 - **interaction**: Invalidates Interaction Brain decisions. It increases whenever the floor actually changes (abort / resume / turn commit), so late LLM decisions based on an earlier floor are not applied.
-- **thought**: Increases on corrections or the start of a new turn. Task results from earlier epochs are discarded.
+- **thought**: Increases when accepted slot values change or a new main turn starts. Each task retains its original epoch and identity. A slot change retires only tasks with matching dependencies, so an unaffected active task may still return its original epoch; a new main turn retires the previous main and outstanding deep work.
 - **speech**: Increases on abort or playback ACK timeout. TTS chunks from earlier epochs are dropped.
 
-Logical invalidation ensures correctness even when physical HTTP cancellation is impossible.
+An interaction decision cannot commit or take the floor while local VAD is active. The semantic worker checks candidate identity, transcript content, speech activity, interaction/thought/speech epochs, and frame revision before applying results. It allows an identical-text revision to remain valid, but rejects a changed candidate or speech boundary. Legacy decision workers carry a separate activity marker so a result from before speech ends is rejected.
+
+Logical invalidation ensures correctness even when physical HTTP cancellation is impossible, but only for the boundaries that actually advance the relevant epoch.
 
 ## Three commit boundaries
 
@@ -162,7 +164,7 @@ Memory edits do not acquire the framework's root-turn gate. Therefore:
 3. **Do not split native tool exchanges.** Restore the exact previous snapshot, or replace only the assistant *text* for that turn. Find the replacement target by exact content match, searching backward and stopping at that turn's user message.
 4. **Confirm turn completion with a signal.** If the consumer disappears, the forwarder promptly drops the framework stream and signals completion only after the drop.
 
-To prevent a missing resolution from stalling the session, the next turn waits at most 10 seconds before leaving the previous turn “as generated” and proceeding.
+The supervisor reports a resolution only after its main worker has finished the `start_turn` path, so cancellation cannot resolve before the adapter has registered its savepoint. To prevent a missing resolution from stalling the session, the next turn waits at most 10 seconds before leaving the previous turn “as generated” and proceeding.
 
 ### A new turn interrupts the previous reply
 
@@ -199,14 +201,14 @@ Rejected speech is recorded in the `voice_claim_rejected_total` metric and settl
 VAD onset → immediate Duck (gain 0.15, fade 60ms, preserve buffer)
           → wait confirm_ms(240ms)
           → classify:
-              backchannel word → ResumeAgent (discard partial)
+              backchannel      → ResumeAgent (discard partial)
               empty/echo       → ResumeAgent
-              correction       → Abort + slot invalidation
+              correction       → Abort + applicable slot updates
               other            → Abort (SemanticInterruption)
 explicit hard stop → immediate Abort; speak an ACK only when configured
 ```
 
-If the user finishes speaking during Duck, playback resumes; for a genuine interruption, the current clause is discarded. On abort, the hard stop ACK (`PRIORITY_HARD_STOP_ACK`) survives in the queue and plays after the user stops. Surviving acts are **retagged with the new speech epoch**; otherwise, the epoch filter discards them after they pass through the queue.
+A classified backchannel or empty overlap resumes playback; a genuine interruption aborts the current clause. An unknown overlap is resolved conservatively after the configured wait rather than automatically resuming merely because speech ended. On abort, the hard stop ACK (`PRIORITY_HARD_STOP_ACK`) survives in the queue and plays after the user stops. Surviving acts are **retagged with the new speech epoch**; otherwise, the epoch filter discards them after they pass through the queue.
 
 `Interruptibility` is interpreted on the abort path as follows:
 
@@ -218,11 +220,13 @@ If the user finishes speaking during Duck, playback resumes; for a genuine inter
 
 However, **a hard stop takes precedence over `Never`**. Continuing to speak after the user explicitly says “그만” is a trap, not a feature.
 
-The Korean sample deliberately excludes `"아니"` from its hard-stop list and treats it as a correction cue. Core validation does not prohibit a particular language's word; applications own their vocabulary.
+The sample does not install language-specific hard-stop words. An explicitly configured compatibility analyzer may still use application-owned vocabulary; core validation does not prohibit a particular language's word.
 
 ## Neutral control and the explicit Korean example
 
-The deterministic reflex policy owns time/state decisions. A synchronous, pure `TextAnalyzer` supplies advisory user cues and assistant question hints; it owns no I/O, clock, memory, or authorization. With no configured or host-supplied language rules, analysis is unknown/empty, hard silence still commits, and unknown overlap still aborts conservatively. No Korean heuristic or LLM is an implicit fallback. The following behavior belongs to explicitly selected Korean sample resources, not library defaults.
+With semantic interaction enabled, one asynchronous request interprets a bounded current candidate and confirmed-heard context. At most one request is in flight; changes are coalesced into the latest next request. The session retains immediate VAD duck, explicit stop, playback, and hard-silence control. A recognized stop is delivered independently of a slow host slot extractor. During overlap the session waits for a bounded semantic result, resumes for backchannels, and otherwise aborts conservatively after at most two configured interaction timeouts. Empty overlap resumes without waiting for a model. If the model is unavailable or its response is invalid, no language heuristic is silently installed.
+
+An explicit host `TextAnalyzer` or legacy decision brain selects the compatibility path. There, the synchronous analyzer supplies advisory cues and question hints while the deterministic reflex policy owns timing and state decisions. The following examples describe explicitly selected Korean compatibility resources, not the shipped semantic sample or library defaults.
 
 - **Incomplete ending** (ends as-is): `-는데/-고/-면/-다가/그게/...` → KeepListening even past soft silence (prevents premature commit)
 - **Complete ending**: `-해 주세요/-할게요/-인가요?/-됩니다/-해줘`, etc. → commit at soft silence (500ms)
@@ -248,7 +252,7 @@ Cancellation, timeout, or stream Drop may happen after an external effect but be
 
 When the assistant is silent, the user has **paused** (`floor == UserPausing`, mic closed), the candidate sentence ends incompletely, and silence is between the soft and hard thresholds, the assistant says “네” first. It is limited to `maximum_per_user_turn` times per turn with a `minimum_interval_ms` spacing.
 
-Only uncertain states (between soft and hard thresholds with no clear ending) escalate to the Interaction Brain (LLM), which is rate-limited by `minimum_interval_ms` (250ms). Without an LLM (`NoopInteractionBrain`), the deterministic policy works on its own.
+Semantic requests are triggered by meaningful candidate or context changes, including final and injected text, not by every audio frame or control tick. `minimum_interval_ms` limits request starts; `timeout_ms` bounds each request. Without an available semantic model, the configured semantic path retains neutral timing and does not fall back to the Korean example.
 
 ## Self-echo defense
 
@@ -262,22 +266,16 @@ Connection resets clear only uncommitted hypotheses and work derived from them. 
 
 A bounded slot journal stores the original `Option<SemanticValue>` before candidate writes, including absence, confidence, status, and source revision. Repeated writes by the same candidate retain the baseline. Host writes retire the entry, so a later candidate write records the latest authoritative baseline. Rollback restores this metadata directly and advances frame revision without running correction policy or invalidating unrelated committed main turns. The journal does not undo tool side effects or revive cancelled tasks.
 
+The compatibility extractor runs at most one request at a time and coalesces later changes into the latest pending input. Results must match the current candidate text and audio identity; request order remains recorded for accepted slot updates, including Clear. Per-slot host-write barriers prevent older extractions from overwriting host changes without blocking unrelated slots. A bounded overflow fails closed. Lexical cues are provisional and do not invalidate tasks; extraction compares against the authoritative baseline rather than treating a cue as a verified value. If an audio Final arrives while extraction for that candidate is relevant, the runtime retries against the assembled final text and waits at most the configured extraction timeout before committing. On failure, it restores the last accepted candidate value or its original baseline.
+
 ## Dependency-scoped invalidation
 
-When a correction cue detects a slot replacement (`X 말고 Y`):
-
-1. Update the slot in `SemanticFrame` (Revised state).
-2. Cancel only active tasks dependent on that slot.
-3. Increment the `thought` epoch.
-4. Discard speculative results with overlapping dependencies.
-5. Drop results from the previous epoch that arrive later.
-
-Unrelated tasks, such as looking up the user's profile, remain active.
+An accepted slot change, including setting a previously absent value or clearing an existing one, invalidates tasks and stored speculative or deep results that declare that slot as a dependency. An unchanged accepted value does not cancel work. The thought epoch increases, but unaffected active tasks retain their original task identity and epoch rather than being silently made stale. A cancelled main turn is resolved once; cancelling it does not undo an external effect. Provisional lexical cues are not sufficient on their own to cancel a task.
 
 ## Speculative read / Deep worker
 
 - **Speculative read**: When intent confidence for a stable prefix exceeds the threshold, run a preliminary request in a dedicated YAML/RuntimeAgent instance that registers only pure-read tools (a separate instance is required because root turns are serialized). Store the result with a dependency fingerprint and include it in the main turn's context brief under `speculative_results:`.
-- **Deep worker**: A separate runtime for long-running work. Apply `DeepWorkResult` only when its epoch matches, and include it in the main turn's context brief under `deep_worker_results:`.
+- **Deep worker**: A separate runtime for long-running work. Admission requires an outstanding deep task ID and its original epoch; the session consumes that ownership once and uses the dependencies recorded at request time. An unrelated slot change does not invalidate it; a relevant change, timeout, or new main turn does. Accepted results are included in the main turn's context brief under `deep_worker_results:`. An externally emitted `DeepWorkResult` must also match an outstanding task and cannot inject an unregistered or duplicate result.
 
   **The deep worker has no automatic trigger.** The agent stream has no signal that “this turn will take a long time,” so the host explicitly requests it through `VoiceSessionHandle::request_deep_work`. The session is responsible only for epoch scoping and result injection. The scenario DSL can drive this path with a `deep_work_requested` event.
 

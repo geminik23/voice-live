@@ -32,20 +32,7 @@ tts:
     enabled: false
 
 turn_control:
-  slot_fallback: korean_example
-  hard_stop_phrases: [잠깐, 잠깐만, 그만, 멈춰, 멈추세요, 취소, 취소해, 정정할게]
-  incomplete_endings: [는데, 는데요, 하고, 라서, 다가, 그게, "..."]
-  complete_endings: [해 주세요, 해주세요, 할게요, 인가요, 해줘, 됩니다, 세요, 예요, 습니다]
-  backchannel_words: [네, 네네, 응, 어, 아, 음, 그렇군요, 맞아요, 예, 알겠습니다]
-  text_rules:
-    correction: ["말고|아니|바꿔|변경|다시|정정"]
-    negation: ['하지\s*마|싫어|필요\s*없']
-    intents: {reservation: ["예약|booking"], search: ["찾아|검색"], cancellation: ["취소"]}
-    entities: {party_size: '\d{1,2}\s*(명|사람|인분)', time: '\d{1,2}\s*시', date: '오늘|내일|[월화수목금토일]요일'}
-    questions:
-      - {pattern: '몇 명', answer_type: number}
-      - {pattern: '어디|중에', answer_type: choice}
-      - {pattern: '\?|할까요|맞나요|인가요', answer_type: yes_no}
+  slot_fallback: neutral
 
 speech:
   mode: strict
@@ -74,6 +61,9 @@ speech:
       argument_defaults: {window_seat_requested: false}
 
 agents:
+  interaction:
+    enabled: true
+    spec: ../agents/voice-interaction.yaml
   task:
     spec: ../agents/reservation.yaml
     timeout_ms: 30000

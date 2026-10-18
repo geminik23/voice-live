@@ -120,6 +120,15 @@ fn folded(text: &str) -> String {
         .to_lowercase()
 }
 
+fn backchannel_key(text: &str) -> String {
+    folded(
+        &text
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>(),
+    )
+}
+
 fn ending(text: &str, patterns: &[String]) -> bool {
     let raw = text.trim_end();
     let text = folded(raw.trim_end_matches(['.', '?', '!', '。', '？', '！']));
@@ -135,11 +144,15 @@ impl TextAnalyzer for ConfiguredTextAnalyzer {
     fn user(&self, text: &str) -> UserTextAnalysis {
         UserTextAnalysis {
             cues: self.cues.extract(text),
-            backchannel: self
-                .config
-                .backchannel_words
-                .iter()
-                .any(|w| folded(w) == folded(text.trim_end_matches(['.', '?', '!']))),
+            backchannel: {
+                let key = backchannel_key(text);
+                !key.is_empty()
+                    && self
+                        .config
+                        .backchannel_words
+                        .iter()
+                        .any(|word| backchannel_key(word) == key)
+            },
             complete: ending(text, &self.config.complete_endings),
             incomplete: self
                 .config

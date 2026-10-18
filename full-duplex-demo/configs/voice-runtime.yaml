@@ -68,25 +68,7 @@ tts:
       - "네, 확인했어요."
 
 turn_control:
-  slot_fallback: korean_example
-  incomplete_endings: [는데, 는데요, 하고, 라서, 다가, 그게, 그러니까, "..."]
-  complete_endings: [해 주세요, 해주세요, 할게요, 할게, 인가요, 맞나요, 맞아요, 해줘, 됩니다, 세요, 예요, 이에요, 습니다]
-  backchannel_words: [네, 네네, 응, 어, 아, 음, 그렇군요, 맞아요, 그래, 예, 알겠습니다]
-  text_rules:
-    correction: ["말고|아니|바꿔|변경|다시|정정"]
-    negation: ['하지\s*마|싫어|필요\s*없|안\s*(돼|되|해)']
-    intents:
-      reservation: ["예약|booking"]
-      search: ["찾아|검색"]
-      cancellation: ["취소"]
-    entities:
-      party_size: '\d{1,2}\s*(명|사람|인분)'
-      time: '\d{1,2}\s*시|\d{1,2}:\d{2}'
-      date: '오늘|내일|모레|주말|[월화수목금토일]요일'
-    questions:
-      - {pattern: '몇 명', answer_type: number}
-      - {pattern: '어디|중에', answer_type: choice}
-      - {pattern: '\?|할까요|맞나요|드릴까요|하시겠어요|어떠세요|인가요', answer_type: yes_no}
+  slot_fallback: neutral
   soft_silence_ms: 500
   hard_silence_ms: 1100
   require_semantic_completion: true
@@ -99,21 +81,10 @@ turn_control:
     enabled: true
     minimum_interval_ms: 2500
     maximum_per_user_turn: 2
-  # "아니" is deliberately absent: it is a common discourse marker and is
-  # classified as a correction cue instead of an immediate abort.
-  hard_stop_phrases:
-    - 잠깐
-    - 잠깐만
-    - 그만
-    - 멈춰
-    - 멈추세요
-    - 취소
-    - 취소해
-    - 정정할게
 
 agents:
   interaction:
-    enabled: false
+    enabled: true
     spec: ../agents/voice-interaction.yaml
     minimum_interval_ms: 250
     timeout_ms: 900

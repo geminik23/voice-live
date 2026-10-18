@@ -10,6 +10,8 @@ pub type SlotName = String;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SemanticFrame {
     pub intent: Option<SemanticValue<String>>,
+    #[serde(default)]
+    pub negated: bool,
     pub slots: HashMap<SlotName, SemanticValue<Value>>,
     /// Hash of slot names this frame was last resolved against, used to
     /// invalidate dependency-scoped speculative work.
@@ -86,6 +88,11 @@ impl SemanticFrame {
     }
 
     pub fn commit_pending(&mut self) {
+        if let Some(intent) = &mut self.intent
+            && intent.status == SemanticValueStatus::Tentative
+        {
+            intent.status = SemanticValueStatus::Committed;
+        }
         for value in self.slots.values_mut() {
             if value.status == SemanticValueStatus::Tentative {
                 value.status = SemanticValueStatus::Committed;

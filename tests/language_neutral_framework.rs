@@ -140,3 +140,98 @@ async fn published_framework_proof_origin_and_rendered_memory_keep_original_fina
     }
     panic!("rendered text did not replace the exact original proposal");
 }
+
+#[tokio::test]
+async fn semantic_provider_uses_only_current_heard_context_per_request() {
+    use voice_live::interaction::brain::InteractionBrain;
+    use voice_live::interaction::{InteractionSnapshot, UserSpeechState};
+
+    let mut mock = MockLLMProvider::new("semantic");
+    mock.set_responses(vec![r#"{"state":"answer","complete":true}"#.into()], true);
+    let brain = voice_live::agent::framework::RuntimeSemanticBrain::new(
+        Arc::new(mock.clone()),
+        "Interpret the current speech.".into(),
+    );
+    let first = InteractionSnapshot {
+        turn_candidate: "first partial".into(),
+        heard_assistant: "Which day?".into(),
+        ..InteractionSnapshot::default()
+    };
+    assert_eq!(
+        brain.assess(first).await.unwrap().state,
+        UserSpeechState::Answer
+    );
+    let second = InteractionSnapshot {
+        turn_candidate: "revised answer".into(),
+        heard_assistant: "How many people?".into(),
+        ..InteractionSnapshot::default()
+    };
+    assert_eq!(
+        brain.assess(second).await.unwrap().state,
+        UserSpeechState::Answer
+    );
+    let calls = mock.call_history();
+    assert_eq!(calls.len(), 2);
+    let second_messages = &calls[1].messages;
+    assert_eq!(second_messages.len(), 2);
+    let content = &second_messages[1].content;
+    assert!(content.contains("revised answer"));
+    assert!(content.contains("How many people?"));
+    assert!(!content.contains("first partial"));
+    assert!(!content.contains("Which day?"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_host_factory_runs_with_mock_task_agent_per_session() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use voice_live::interaction::brain::InteractionBrain;
+
+    let mut mock = MockLLMProvider::new("semantic");
+    mock.set_responses(vec![r#"{"state":"complete","complete":true}"#.into()], true);
+    let factories = Arc::new(AtomicUsize::new(0));
+    let count = factories.clone();
+    let provider = mock.clone();
+    let policies = voice_live::RuntimePolicies {
+        interaction_brain: Some(Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Arc::new(voice_live::agent::framework::RuntimeSemanticBrain::new(
+                Arc::new(provider.clone()),
+                "Interpret the current speech.".into(),
+            )) as Arc<dyn InteractionBrain>
+        })),
+        ..Default::default()
+    };
+    let config = voice_live::VoiceRuntimeConfig::from_yaml_str(
+        "asr: {provider: inject}\ntts: {provider: mock}\ndev: {allow_text_injection: true}\nobservability: {event_log: false}",
+    ).unwrap();
+    let runtime = voice_live::VoiceRuntime::build_with_policies(config, None, policies)
+        .await
+        .unwrap();
+    let (tx1, _rx1) = tokio::sync::mpsc::channel(256);
+    let (tx2, _rx2) = tokio::sync::mpsc::channel(256);
+    let first = runtime.create_session(tx1).await.unwrap();
+    let second = runtime.create_session(tx2).await.unwrap();
+    assert!(runtime.inject_user_text(first.session_id, "first client request"));
+    assert!(runtime.inject_user_text(second.session_id, "second client request"));
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(factories.load(Ordering::SeqCst), 2);
+    let calls = mock.call_history();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.messages[1].content.contains("first client request"))
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.messages[1].content.contains("second client request"))
+    );
+    for call in calls {
+        let input = &call.messages[1].content;
+        assert!(
+            !(input.contains("first client request") && input.contains("second client request"))
+        );
+    }
+    runtime.close_session(first.session_id).await;
+    runtime.close_session(second.session_id).await;
+}

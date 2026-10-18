@@ -68,16 +68,12 @@ turn_control:
     enabled: true
     minimum_interval_ms: 2500
     maximum_per_user_turn: 2
-  hard_stop_phrases: [잠깐, 그만, 멈춰, 취소, ...]
-    # This example deliberately omits the common discourse marker "아니".
-  incomplete_endings: [는데, 고, 면, 다가, 그게, ...]
-  complete_endings: [해 주세요, 할게요, 인가요, 됩니다, 해줘, ...]
-  backchannel_words: [네, 응, 어, 아, 음, 그렇군요, ...]
+  slot_fallback: neutral    # explicit compatibility heuristics are optional
   answer_min_silence_ms: 320   # silence threshold for committing a short answer after a question
 
 agents:
   interaction:
-    enabled: false          # when true, use an LLM only for uncertain cases
+    enabled: true           # sample setting; library default is false
     spec: ../agents/voice-interaction.yaml
     minimum_interval_ms: 250
     timeout_ms: 900
@@ -199,13 +195,13 @@ The dedicated sample disables premade warmup and uses the reservation task spec.
 
 ## Language scope
 
-The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The shipped Korean reservation examples explicitly configure these resources. ASR locale (`ko-KR`) and TTS language (`Korean`) remain independent provider defaults, not supported-language restrictions or LLM response-language instructions. Agent/application instructions own the response language. Unknown text analysis yields no advisory signals; hard-silence and conservative overlap control still operate without an LLM. Multilingual end-to-end quality remains unverified.
+The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The reservation samples configure Korean spoken resources and enable semantic LLM interpretation without Korean rule collections. ASR locale (`ko-KR`) and TTS language (`Korean`) remain independent provider defaults, not supported-language restrictions or LLM response-language instructions. Agent/application instructions own the response language. If semantic inference is unavailable, neutral timing and conservative overlap control remain active. Multilingual end-to-end quality remains unverified.
 
 Cartesia selectors are trimmed, limited to 63 ASCII bytes, and accept a 2–8 letter primary subtag followed by nonempty 1–8 alphanumeric subtags separated by `-`. `_` is accepted as a separator alias. Empty values, `auto`, malformed separators, control characters, and query delimiters are rejected. ASR lowercases the primary code; TTS retains the selector's case and region/script content. Factory and session validation use the same resolver. Together retains its encoded full locale and Qwen its provider-native language string. No discovery, language detection, translation, or silent provider/model fallback is performed.
 
 ## Text policy and spoken resources
 
-Library text-rule collections are empty by default. Configure `turn_control.hard_stop_phrases`, `backchannel_words`, `complete_endings`, and `incomplete_endings` explicitly; they are literals, not regexes. Hard-stop literals use case-insensitive substring matching without stripping punctuation. Backchannels use case folding and collapsed whitespace, ignoring trailing ASCII sentence punctuation, with no six-character cutoff. Endings use folded suffix matching with trailing sentence punctuation removed; punctuation-only endings match the raw tail. Incomplete endings take precedence over complete endings. Explicit hard stop takes precedence over backchannel and correction; unknown overlap still aborts conservatively.
+Library text-rule collections are empty by default. Configure `turn_control.hard_stop_phrases`, `backchannel_words`, `complete_endings`, and `incomplete_endings` explicitly; they are literals, not regexes. Hard-stop literals use case-insensitive substring matching without stripping punctuation. Compatibility backchannels use case folding and collapsed whitespace while ignoring punctuation, with no six-character cutoff. Endings use folded suffix matching with trailing sentence punctuation removed; punctuation-only endings match the raw tail. Incomplete endings take precedence over complete endings. Explicit hard stop takes precedence over backchannel and correction; unknown overlap still aborts conservatively.
 
 | Key | Library default | Contract |
 |---|---|---|
@@ -224,7 +220,11 @@ Library text-rule collections are empty by default. Configure `turn_control.hard
 
 At most 256 text rules are accepted, each 1–1024 bytes; regexes are checked against a 1 MiB compilation limit and syntax minimum-length analysis rejects zero-width paths, including assertion-only word boundaries that do not match the empty string. Rules compile at construction, not on the audio/control tick. Spoken automatic resources are at most 4096 bytes. Progress templates are limited to 128, require nonempty text of at most 4096 bytes, and a positive, overflow-safe `expire_after_ms`. Their existing latency setting controls eligibility, not a delayed scheduling guarantee.
 
-Host composition uses `VoiceRuntime::build_with_policies(config, optional_providers, RuntimePolicies)` or the direct builder's `with_text_analyzer`, `with_slot_extractor`, and `with_speech_renderer`. Explicit host overrides win over configured implementations; missing host overrides do not disable a configured framework extractor. The runtime slot-extractor override is a per-session factory. Framework initialization failures fall back only to the configured slot fallback. `VoiceSessionBuilder::try_build` reports invalid configuration; the compatible `build` convenience method panics on invalid configuration.
+When `agents.interaction.enabled` is true, a successfully configured semantic provider receives bounded current transcript, recent committed user turns, and confirmed heard assistant text. The runtime permits one request in flight and follows with the latest changed snapshot. A missing, failed, or timed-out provider yields neutral timing behavior rather than silently installing the Korean example heuristic. Explicit host `TextAnalyzer` or legacy decision-brain overrides select the compatibility path; an explicit host slot-extractor factory overrides model slot updates. In semantic mode the configured `slot_fallback` is not used, including when the model is unavailable. With interaction disabled, configured compatibility rules and `slot_fallback` retain their existing purpose.
+
+The interaction spec now describes semantic interpretation and must return `state`, optional `complete`, `stop`, `negated`, `intent`, `updates`, and `confidence`; the earlier `user_state`/`action` JSON is not accepted by this semantic path. The configured adapter calls the spec's default LLM provider directly with its plain system prompt and current snapshot, without retaining prior partials in agent memory. Agent state machines, tools, templated system prompts, and model routing in an old controller spec are not executed by this adapter. Update custom specs or explicitly supply a legacy `InteractionBrain` when retaining the old contract.
+
+Host composition uses `VoiceRuntime::build_with_policies(config, optional_providers, RuntimePolicies)` or the direct builder. `RuntimePolicies::interaction_brain` and `slot_extractor` are per-session factories; existing exhaustive struct literals must add the new field or use `..Default::default()`. `InteractionSnapshot` now includes `heard_assistant` and `recent_user_turns`, and `SemanticFrame` includes `negated`; exhaustive struct literals require migration. `VoiceSessionBuilder::try_build` reports invalid configuration; the compatible `build` convenience method panics on invalid configuration.
 
 ## Strict proposals and migration
 
@@ -237,7 +237,7 @@ A strict Final is a bounded JSON proposal, not spoken text. The original Final i
 
 At most 128 response resources are accepted, names have at most 128 bytes, text has 1–4096 bytes, operation IDs at most 256 bytes, and receipt/default mappings and bindings at most 32 entries each. Configured receipt/default values have at most 1024 serialized bytes. Proposals have at most 16384 bytes. Unknown proposal fields, meanings, missing proof, mismatched targets, conflicting same-operation call records, failed/skipped/truncated/cancelled outcomes, and unavailable renderers fail closed before TTS. An executor success flag alone never establishes a business commit. A custom `SpeechRenderer` is trusted application code responsible for its domain validation and rendering, not an untrusted model classifier.
 
-Minimal YAML and direct builders no longer implicitly select Korean grammar or canned replies. The shipped examples provide explicit Korean rules/resources and structured task-agent instructions. Existing arbitrary `Final { text }` integrations can select `speech.mode: legacy`; that mode retains the old language-dependent transaction detector and does not provide the strict guarantee. Locale never selects legacy mode. Arbitrary natural-language factuality is not proven in either mode; strict guarantees cover only trusted resources and validated domain outcomes. Do not place arbitrary model prose in prompt resources or weaken proof requirements to preserve a free-text caller.
+Minimal YAML and direct builders no longer implicitly select Korean grammar or canned replies. The shipped examples provide Korean spoken resources, semantic LLM configuration, and structured task-agent instructions. Existing arbitrary `Final { text }` integrations can select `speech.mode: legacy`; that mode retains the old language-dependent transaction detector and does not provide the strict guarantee. Locale never selects legacy mode. Arbitrary natural-language factuality is not proven in either mode; strict guarantees cover only trusted resources and validated domain outcomes. Do not place arbitrary model prose in prompt resources or weaken proof requirements to preserve a free-text caller.
 
 `CognitiveEvent`/`VoiceEvent` add `InvocationProof`, and `EvidenceKind`/`SessionEvidence` add exact authorized-speech bindings. Exhaustive Rust matches and struct literals may require migration. Browser messages are unchanged. New automatic phrases and domain policies need actual callers, configuration, and tests; adding a locale string alone does not supply them.
 

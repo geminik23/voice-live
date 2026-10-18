@@ -93,6 +93,7 @@ pub struct VoiceRuntime {
 /// Host overrides are independent of provider names and applied before configured fallbacks.
 #[derive(Default)]
 pub struct RuntimePolicies {
+    pub interaction_brain: Option<Arc<dyn Fn() -> Arc<dyn InteractionBrain> + Send + Sync>>,
     pub text_analyzer: Option<Arc<dyn crate::semantics::text::TextAnalyzer>>,
     pub slot_extractor: Option<Arc<dyn Fn() -> Arc<dyn SlotExtractor> + Send + Sync>>,
     pub speech_renderer: Option<Arc<dyn crate::speech::render::SpeechRenderer>>,
@@ -320,6 +321,15 @@ impl VoiceRuntime {
             shutdown.clone(),
         ));
 
+        let interaction_brain = self
+            .policies
+            .interaction_brain
+            .as_ref()
+            .map(|factory| factory())
+            .unwrap_or(brains.interaction_brain);
+        let semantic_mode = self.policies.text_analyzer.is_none()
+            && (interaction_brain.supports_semantics()
+                || (self.config.agents.interaction.enabled && interaction_brain.is_noop()));
         let mut builder = VoiceSessionBuilder::new(
             Arc::clone(&self.config),
             playback,
@@ -328,8 +338,7 @@ impl VoiceRuntime {
         )
         .with_session_id(session_id)
         .with_clock(clock)
-        .with_interaction_brain(brains.interaction_brain)
-        .with_slot_extractor(brains.slot_extractor)
+        .with_interaction_brain(interaction_brain)
         .with_metrics(Arc::clone(&self.metrics))
         .with_trace(trace_tx)
         .with_shutdown(shutdown.clone());
@@ -339,6 +348,8 @@ impl VoiceRuntime {
         }
         if let Some(factory) = &self.policies.slot_extractor {
             builder = builder.with_slot_extractor(factory());
+        } else if !semantic_mode {
+            builder = builder.with_slot_extractor(brains.slot_extractor);
         }
         if let Some(renderer) = &self.policies.speech_renderer {
             builder = builder.with_speech_renderer(Arc::clone(renderer));
@@ -609,7 +620,7 @@ impl BrainProvider {
                         .unwrap_or_default(),
                 )),
                 speculative_agent: None,
-                interaction_brain: Arc::new(NoopInteractionBrain),
+                interaction_brain: configured_semantic_brain(&self.config),
                 slot_extractor: crate::semantics::extractor::configured_fallback(
                     &self.config.turn_control,
                 ),
@@ -631,6 +642,42 @@ impl BrainProvider {
     }
 }
 
+fn configured_semantic_brain(config: &VoiceRuntimeConfig) -> Arc<dyn InteractionBrain> {
+    #[cfg(feature = "framework")]
+    if config.agents.interaction.enabled
+        && let Some(spec) = &config.agents.interaction.spec
+    {
+        let build = || -> anyhow::Result<Arc<dyn InteractionBrain>> {
+            let raw = std::fs::read_to_string(spec)?;
+            let value: serde_yaml::Value = serde_yaml::from_str(&raw)?;
+            let system = value
+                .get("system_prompt")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                system.len() <= 16_384 && !system.contains("{{"),
+                "invalid semantic system prompt"
+            );
+            let runtime = ai_agents::agent::AgentBuilder::from_yaml_file(spec)?
+                .auto_configure_llms()?
+                .build()?;
+            let provider = runtime.llm_registry().default()?;
+            Ok(Arc::new(
+                crate::agent::framework::RuntimeSemanticBrain::new(provider, system.to_string()),
+            ))
+        };
+        match build() {
+            Ok(brain) => return brain,
+            Err(error) => {
+                tracing::warn!(%error, "semantic brain unavailable; using neutral fallback")
+            }
+        }
+    }
+    #[cfg(not(feature = "framework"))]
+    let _ = config;
+    Arc::new(NoopInteractionBrain)
+}
+
 #[cfg(feature = "framework")]
 fn uses_only_development_providers(config: &VoiceRuntimeConfig) -> bool {
     matches!(config.asr.provider.as_str(), "mock" | "inject") && config.tts.provider == "mock"
@@ -643,9 +690,9 @@ async fn build_framework_brains(
     reservation_store: &Arc<Mutex<crate::tools::reservation::ReservationStore>>,
 ) -> anyhow::Result<SessionBrains> {
     use crate::agent::framework::{
-        AiAgentsCognitiveAgent, RuntimeDeepWorker, RuntimeInteractionBrain, RuntimeSlotExtractor,
-        VoiceAgentHooks, build_runtime_agent, build_runtime_agent_with_memory,
-        build_runtime_agent_with_tools, conversation_memory_for_spec,
+        AiAgentsCognitiveAgent, RuntimeDeepWorker, VoiceAgentHooks, build_runtime_agent,
+        build_runtime_agent_with_memory, build_runtime_agent_with_tools,
+        conversation_memory_for_spec,
     };
     use crate::tools::reservation::{speculative_tools, task_tools};
 
@@ -691,41 +738,8 @@ async fn build_framework_brains(
         None
     };
 
-    // The controller spec backs both the floor brain and the slot extractor,
-    // but they must not share a runtime: root turns serialize per runtime, and
-    // a slot extraction running during a floor decision would deadlock the tick.
-    let (interaction_brain, slot_extractor): (Arc<dyn InteractionBrain>, Arc<dyn SlotExtractor>) =
-        match &config.agents.interaction.spec {
-            Some(spec) if config.agents.interaction.enabled => {
-                let brain_runtime = build_runtime_agent(spec, VoiceAgentHooks::new()).await;
-                let extractor_runtime = build_runtime_agent(spec, VoiceAgentHooks::new()).await;
-
-                let brain: Arc<dyn InteractionBrain> = match brain_runtime {
-                    Ok(runtime) => Arc::new(RuntimeInteractionBrain::new(
-                        runtime,
-                        config.agents.interaction.timeout_ms,
-                    )),
-                    Err(error) => {
-                        tracing::warn!(%error, "interaction brain unavailable; reflex policy only");
-                        Arc::new(NoopInteractionBrain)
-                    }
-                };
-
-                let extractor: Arc<dyn SlotExtractor> = match extractor_runtime {
-                    Ok(runtime) => Arc::new(RuntimeSlotExtractor::new(runtime)),
-                    Err(error) => {
-                        tracing::warn!(%error, "slot extractor unavailable; using configured fallback");
-                        crate::semantics::extractor::configured_fallback(&config.turn_control)
-                    }
-                };
-
-                (brain, extractor)
-            }
-            _ => (
-                Arc::new(NoopInteractionBrain),
-                crate::semantics::extractor::configured_fallback(&config.turn_control),
-            ),
-        };
+    let interaction_brain = configured_semantic_brain(config);
+    let slot_extractor = crate::semantics::extractor::configured_fallback(&config.turn_control);
 
     let deep_worker: Option<Arc<dyn DeepWorker>> = match &config.agents.deep.spec {
         Some(spec) if config.agents.deep.enabled => {

@@ -76,13 +76,15 @@ With the framework feature, `cargo test --test language_neutral_framework` drive
 
 The existing Korean scenarios explicitly install Korean example rules and select legacy raw-text compatibility to retain their historical coverage; `ScenarioRunner` itself now defaults to neutral/strict. New scenarios must supply explicit rules and a strict proposal/resource, or explicitly choose `config.speech.mode: legacy` when testing compatibility behavior. No scenario DSL field or browser wire message was added. `CognitiveEvent`/`VoiceEvent` consumers must handle the additive `InvocationProof` event, which is intentionally not logged with its arguments/output.
 
+Semantic supervisor tests exercise injected and final-only inputs, single-flight coalescing, stale decisions, actual-heard context, interruption, neutral timeout, and speculative invalidation. `language_neutral_framework` uses a mock LLM provider to verify current-only model context and per-session runtime construction without a real key. These checks do not prove real model interpretation or device behavior.
+
 These checks are offline and do not rerun or supersede historical paid English results. Physical microphone/browser behavior, real model proposal adherence, supported language combinations, and naturalness still require separate validation.
 
 ## Duplex provider regressions
 
 `cargo test --test duplex_providers` drives public provider traits and runtime injection with virtual-time test-local fakes. It covers capability dispatch, strict injected task-spec probing, provider/session isolation, actual PCM admission, fatal/transient open behavior, input saturation, typed injection during reconnect, native audio before finish, buffered finish/byte limits, standalone native convenience ownership, cache hits in the actual runtime, and Drop behavior. Output-unconsumed tests verify absolute native deadlines and buffered timeout delivery through a separate terminal slot even with a full audio queue.
 
-Supervisor regressions directly assert metadata/absence-preserving journal rollback, host/candidate interleaving, matching closure and stale extraction rejection, failed-reply disposal, partial-audio Abort and ACK settlement, exactly-once resolutions, ownerless new-turn fast settlement, stale ACK/watchdog isolation, Never protection after synthesis completes, preserved deferred commit context, latest deferred supersession, watchdog-driven release, and owned worker cleanup. Provider normalization rejects zero/changeable rates, odd/oversized PCM, and invalid sequences while bounding output chunks.
+Supervisor regressions cover active-VAD commit rejection, candidate and host interleaving, same-revision extraction ordering, revised and final input, timeout recovery, Clear and absence-to-value invalidation, unaffected main/deep results, late deep events, and exactly-once turn resolution after worker termination. They also cover journal rollback, playback recovery, question audibility, Never protection, and worker cleanup. The four former pending slot-ordering/invalidation regressions now run in the normal library suite. The framework slot parser has focused malformed, oversized, mixed, and valid-response tests. Provider normalization rejects zero/changeable rates, odd/oversized PCM, and invalid sequences while bounding output chunks.
 
 Paid contracts are still ignored by default. They use actual outer timeouts across open and I/O, require an authoritative ASR Final, transmit fixture audio concurrently with transcript drain, and require valid TTS audio plus successful terminal and bounded cleanup. Official provider docs and local fakes are not evidence that a real account/model/locale combination works.
 
@@ -279,6 +281,8 @@ expect:
 ### Timeline event types
 
 `local_speech_started`, `local_speech_ended`, `asr_partial`, `asr_final`, `asr_stream_reset`, `interaction_decision`, `tool_started`, `tool_completed`, `tool_executed`, `agent_final`, `deep_work_requested`, `deep_result`.
+
+The `deep_result` timeline event creates an uncorrelated task ID and is therefore observed in the trace but not admitted as an actual deep result. Use `deep_work_requested` with a configured fake deep worker when testing result admission.
 
 `asr_partial` and `asr_final` accept an optional `utterance_id` for identity tests. With automatic IDs, a matching Final or a trailing partial after VAD end retains the recognizer identity; VAD end alone does not increment it. The next speech start or the next recognizer event after a Final advances the automatic ID. The DSL defaults to the audio origin. `asr_stream_reset` carries `generation` and drives uncommitted candidate invalidation without removing authoritative finals or committed turns.
 

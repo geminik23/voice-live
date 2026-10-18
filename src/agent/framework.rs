@@ -10,7 +10,7 @@ use tokio::sync::{OwnedMutexGuard, mpsc, watch};
 
 use ai_agents::agent::{Agent, AgentBuilder, AgentStreamEvent, RuntimeAgent, StreamChunk};
 use ai_agents::hooks::AgentHooks;
-use ai_agents::llm::Role;
+use ai_agents::llm::{ChatMessage, LLMProvider, Role};
 use ai_agents::memory::{InMemoryStore, Memory, MemoryConfig, MemorySnapshot};
 use ai_agents::tools::Tool;
 
@@ -513,6 +513,53 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
     }
 }
 
+/// Stateless semantic inference using the configured provider without conversation memory.
+pub struct RuntimeSemanticBrain {
+    provider: Arc<dyn LLMProvider>,
+    system_prompt: String,
+}
+
+impl RuntimeSemanticBrain {
+    pub fn new(provider: Arc<dyn LLMProvider>, system_prompt: String) -> Self {
+        Self {
+            provider,
+            system_prompt,
+        }
+    }
+}
+
+#[async_trait]
+impl InteractionBrain for RuntimeSemanticBrain {
+    async fn decide(&self, _: InteractionSnapshot) -> Option<InteractionDecisionEnvelope> {
+        None
+    }
+
+    fn supports_semantics(&self) -> bool {
+        true
+    }
+
+    async fn assess(
+        &self,
+        snapshot: InteractionSnapshot,
+    ) -> Option<crate::interaction::SemanticAssessment> {
+        let input = serde_json::to_string(&snapshot).ok()?;
+        if input.len() > 16_384 || self.system_prompt.len() > 16_384 {
+            return None;
+        }
+        let system = format!(
+            "{}\nInterpret the user's speech in context. Return only JSON with state \
+             (uncertain, incomplete, complete, backchannel, interruption, correction, answer, side_speech, noise_or_echo), \
+             complete (boolean or null), stop (boolean), negated (boolean), intent (string or null), updates (array of slot, operation set/replace/clear, \
+             old_value, new_value, confidence), and confidence (0 to 1). \
+             Do not select playback actions or assume unheard assistant words were delivered.",
+            self.system_prompt
+        );
+        let messages = [ChatMessage::system(&system), ChatMessage::user(&input)];
+        let response = self.provider.complete(&messages, None).await.ok()?;
+        crate::interaction::SemanticAssessment::parse(&response.content)
+    }
+}
+
 /// Interaction brain backed by a fast controller RuntimeAgent. Output is JSON
 /// and validated by the host before it becomes a decision.
 pub struct RuntimeInteractionBrain {
@@ -625,41 +672,55 @@ impl crate::semantics::SlotExtractor for RuntimeSlotExtractor {
             return Vec::new();
         };
 
-        let Ok(value) = serde_json::from_str::<Value>(response.content.trim()) else {
-            return Vec::new();
-        };
-
-        let Some(updates) = value.get("updates").and_then(|u| u.as_array()) else {
-            return Vec::new();
-        };
-
-        updates
-            .iter()
-            .filter_map(|update| {
-                let slot = update.get("slot")?.as_str()?.to_string();
-                let operation = match update.get("operation")?.as_str()? {
-                    "replace" => SlotOperation::Replace,
-                    "clear" => SlotOperation::Clear,
-                    _ => SlotOperation::Set,
-                };
-                let new_value = update.get("new_value")?.clone();
-                let old_value = update.get("old_value").cloned();
-                let confidence = update
-                    .get("confidence")
-                    .and_then(|c| c.as_f64())
-                    .unwrap_or(0.8) as f32;
-
-                Some(SlotUpdate {
-                    slot,
-                    operation,
-                    old_value,
-                    new_value,
-                    confidence,
-                    source_revision,
-                })
-            })
-            .collect()
+        parse_slot_updates(&response.content, source_revision)
     }
+}
+
+fn parse_slot_updates(raw: &str, source_revision: Revision) -> Vec<SlotUpdate> {
+    if raw.len() > 16_384 {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(raw.trim()) else {
+        return Vec::new();
+    };
+    let Some(updates) = value.get("updates").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if updates.len() > 32 {
+        return Vec::new();
+    }
+
+    updates
+        .iter()
+        .map(|update| {
+            let slot = update.get("slot")?.as_str()?;
+            if slot.trim().is_empty() || slot.len() > 128 {
+                return None;
+            }
+            let operation = match update.get("operation")?.as_str()? {
+                "set" => SlotOperation::Set,
+                "replace" => SlotOperation::Replace,
+                "clear" => SlotOperation::Clear,
+                _ => return None,
+            };
+            let confidence = match update.get("confidence") {
+                Some(value) => value.as_f64()?,
+                None => 0.8,
+            };
+            if !(0.0..=1.0).contains(&confidence) {
+                return None;
+            }
+            Some(SlotUpdate {
+                slot: slot.to_string(),
+                operation,
+                old_value: update.get("old_value").cloned(),
+                new_value: update.get("new_value")?.clone(),
+                confidence: confidence as f32,
+                source_revision,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 /// Deep worker backed by a separate RuntimeAgent so long work never blocks
@@ -694,5 +755,34 @@ impl crate::session::deep_worker::DeepWorker for RuntimeDeepWorker {
             summary: response.content,
             dependencies: request.dependencies,
         })
+    }
+}
+
+#[cfg(test)]
+mod slot_response_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_or_oversized_slot_responses() {
+        let unknown = r#"{"updates":[{"slot":"date","operation":"delete","new_value":"Friday"}]}"#;
+        assert!(parse_slot_updates(unknown, Revision(1)).is_empty());
+        let invalid_confidence = r#"{"updates":[{"slot":"date","operation":"set","new_value":"Friday","confidence":2}]}"#;
+        assert!(parse_slot_updates(invalid_confidence, Revision(1)).is_empty());
+        let oversized = "x".repeat(16_385);
+        assert!(parse_slot_updates(&oversized, Revision(1)).is_empty());
+        let mixed = r#"{"updates":[{"slot":"date","operation":"set","new_value":"Saturday"},{"slot":"time","operation":"delete","new_value":"19:00"}]}"#;
+        assert!(parse_slot_updates(mixed, Revision(1)).is_empty());
+        let too_many = serde_json::json!({
+            "updates": vec![serde_json::json!({"slot":"date","operation":"set","new_value":"Saturday"}); 33]
+        })
+        .to_string();
+        assert!(parse_slot_updates(&too_many, Revision(1)).is_empty());
+        let valid = r#"{"updates":[{"slot":"date","operation":"set","new_value":"Saturday","confidence":0.9}]}"#;
+        let updates = parse_slot_updates(valid, Revision(2));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].operation, SlotOperation::Set);
+        assert_eq!(updates[0].old_value, None);
+        assert_eq!(updates[0].new_value, serde_json::json!("Saturday"));
+        assert_eq!(updates[0].source_revision, Revision(2));
     }
 }

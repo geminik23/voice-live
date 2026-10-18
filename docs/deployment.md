@@ -6,7 +6,7 @@ The `voice-live` library and `full-duplex-demo` server target **native execution
 
 - All platforms: install stable Rust with rustup and the native build tools for your target. `cargo` and `rustc` must be available on your shell's PATH. The runtime explicitly enables Rustls's `ring` crypto backend for WSS; certificate verification and WebPKI trust roots remain enabled.
 - Linux: install your distribution's build tools, including a C/C++ compiler and linker.
-- Windows: for the MSVC target, install the Visual Studio Build Tools C++ components and Windows SDK. You can run directly from PowerShell; Git Bash, WSL, and Docker are not required. Shell-specific PATH setup belongs to the development environment, not hardcoded library configuration.
+- Windows: for the MSVC target, install the Visual Studio Build Tools C++ components and Windows SDK. Windows ARM64 additionally needs a Clang compiler on PATH for `ring`. You can run directly from PowerShell; Git Bash, WSL, and Docker are not required. Shell-specific PATH setup belongs to the development environment, not hardcoded library configuration.
 - macOS: install native build tools such as Xcode Command Line Tools.
 - Node.js is used to validate the browser script; it is not required to run the Rust server.
 
@@ -30,7 +30,7 @@ Paths are resolved as follows:
 
 Use portable relative paths such as `../agents/reservation.yaml` in shared YAML. `/` separators also work on Windows. Configure OS-specific absolute paths on each host instead of fixing them in the repository. Quote CLI paths containing spaces and match filename case exactly for case-sensitive filesystems such as those commonly used on Linux.
 
-The sample config uses `asr.provider: inject` and `dev.allow_text_injection: true`. It explicitly supplies Korean text rules, slot fallback, automatic phrases, strict response resources, and a keyless `mock_response` prompt. Minimal library configuration no longer invents these resources. The mock asks for reservation details rather than asserting invented availability.
+The sample uses `asr.provider: inject`, `dev.allow_text_injection: true`, and `agents.interaction.enabled: true`. It supplies Korean spoken resources and a keyless mock task proposal, but no Korean text-rule fallback. If the semantic provider is unavailable, the session uses neutral timing and control rather than guessing language-specific meaning. The mock asks for reservation details rather than asserting invented availability.
 
 - Text typed in the input box at the bottom of the page becomes the user's utterance. It follows the same commit → agent → claim gate → TTS → playback path as speech.
 - With the microphone enabled, you can also check full-duplex behavior such as duck/resume/abort using mock TTS.
@@ -46,7 +46,7 @@ The web client sets `ws.binaryType = 'arraybuffer'` and decodes the `ArrayBuffer
 
 ### Manual browser playback ACK check without API keys
 
-1. From the repository root, run the `cargo run -p full-duplex-demo -- --config ...` command above. Without real keys configured, the sample uses inject ASR, mock TTS, and a mock agent. If `OPENAI_API_KEY` is set, the task agent may use a real LLM; use a separate shell without the key for a key-free check.
+1. From the repository root, run the `cargo run -p full-duplex-demo -- --config ...` command above. Without real keys configured, the sample uses inject ASR, mock TTS, a mock task agent, and neutral semantic fallback. If `OPENAI_API_KEY` is set, the task agent or the independently configured semantic provider can call a real LLM and transmit transcript/context text. Use a separate shell without the key for a key-free check.
 2. On the same computer, open `http://localhost:8080` in a browser, then open developer tools to **Console** and **Network → WS → `/api/voice/ws` → Messages/Frames**.
 3. Click **Start session** and allow microphone access. This demo opens the microphone even when using only text injection. A remote browser not on `localhost` requires HTTPS/WSS.
 4. Type `예약하고 싶어요` into the text input at the bottom and click **Send**. Check that received frames include `speech_started`, binary PCM chunks, and `speech_done` in that order. After playback ends, check sent frames for `playback_chunk_completed` and `playback_completed`. The Console should have no `TypeError`. Mock TTS is silent, so the chunks play without audible speech.
@@ -83,7 +83,7 @@ tts:
   provider: qwen
 agents:
   interaction:
-    enabled: true    # Optional LLM judgment for ambiguous cases
+    enabled: true    # Semantic interpretation uses the configured model
   task:
     spec: ../agents/reservation.yaml
 ```

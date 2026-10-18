@@ -80,6 +80,8 @@ turn_control:
     .unwrap();
     let analyzer = ConfiguredTextAnalyzer::new(&cfg.turn_control).unwrap();
     assert!(analyzer.user("I understand completely").backchannel);
+    assert!(analyzer.user("I understand completely,").backchannel);
+    assert!(!analyzer.user("...").backchannel);
     let policy = voice_live::interaction::policy::ReflexPolicy::from_config(&cfg.turn_control);
     assert_eq!(
         policy.classify_overlap("stop please", "", &cfg.turn_control, &cfg.echo),
@@ -231,6 +233,7 @@ async fn runtime_host_overrides_reach_real_sessions_and_factories_are_per_sessio
     cfg.speech.mock_response = Some("ask".into());
     cfg.turn_control.slot_fallback = voice_live::config::SlotFallback::KoreanExample;
     let policies = voice_live::RuntimePolicies {
+        interaction_brain: None,
         text_analyzer: Some(Arc::new(HostAnalyzer(analyses.clone()))),
         slot_extractor: Some(Arc::new(move || {
             calls.fetch_add(1, Ordering::SeqCst);

@@ -37,13 +37,13 @@ cargo test
 # Include the demo's tests.
 cargo test --workspace
 
-# Start the keyless demo (text injection + mock ASR/TTS/agent).
+# Without OPENAI_API_KEY, start the demo with text injection and mock ASR/TTS/agent.
 cargo run -p full-duplex-demo -- --config full-duplex-demo/configs/voice-runtime.yaml
 # Open http://localhost:8080 and click Start session.
 # Enter text in the input field to submit a user utterance.
 ```
 
-The mock TTS produces **silent PCM**. To verify audio chunks and playback ACKs without API keys, follow the [manual browser check](docs/deployment.md#manual-browser-playback-ack-check).
+The mock TTS produces **silent PCM**. The sample enables semantic LLM analysis: if `OPENAI_API_KEY` is present, recognized or injected text and heard conversation context can be sent to the model even when the task agent is mock, potentially incurring charges. For a keyless check, use a shell without that key and follow the [manual browser check](docs/deployment.md#manual-browser-playback-ack-check).
 
 To use real providers, configure environment variables without committing secrets. For Linux/macOS Bash or Zsh, or Windows Git Bash:
 
@@ -85,7 +85,7 @@ Hosts can pass `SpeechProviders { asr, tts }` to `VoiceRuntime::build_with_provi
 
 ## Language-neutral policy and speech authorization
 
-The library does not implicitly install Korean grammar, slot extraction, backchannel text, or failure prompts. Configure application rules/resources or inject a pure `TextAnalyzer`, per-session slot-extractor factory, and trusted `SpeechRenderer` through `RuntimePolicies`. The shipped Korean samples select their resources explicitly; provider selectors do not choose linguistic policy or LLM response language. Cartesia ASR accepts syntax-valid primary language codes and TTS preserves full regional/script selectors, without claiming every model/voice supports them.
+The library does not implicitly install a language grammar, slot heuristic, or spoken prompts. The demo enables an optional semantic LLM to interpret turn completion, corrections, interruption, and slot updates; if unavailable, timing and explicit controls remain active without silently selecting a language heuristic. A host can provide a per-session interaction brain or slot extractor, a pure `TextAnalyzer`, and a trusted `SpeechRenderer` through `RuntimePolicies`. The reservation examples supply Korean spoken resources, not an implicit language policy. Provider selectors do not choose LLM response language or prove model/voice support.
 
 The default `speech.mode: strict` accepts bounded proposals and renders only trusted application wording backed by matching domain receipts where required. Existing free-text integrations must explicitly select `legacy`, which retains the older heuristic limitations. This is not a guarantee of arbitrary natural-language truth. See [policy, resources, and migration](docs/configuration.md#text-policy-and-spoken-resources) and [authorization boundaries](docs/architecture.md#claim-gate). The keyless sample still exercises the complete pipeline using an explicit prompt resource and silent mock audio.
 
