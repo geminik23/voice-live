@@ -38,7 +38,7 @@ The sample uses `asr.provider: inject`, `dev.allow_text_injection: true`, and `a
 
 ### Browser requirements and current limitations
 
-The browser must support WebSocket, Web Audio, AudioWorklet, and `getUserMedia`. Microphone access requires browser and OS permissions and a secure context. For local development, use `http://localhost:8080`; for access from another device, use HTTPS/WSS. Currently, `Start session` requests microphone permission even when using only text injection. The sample `mock` TTS emits silent PCM, so it cannot verify that natural speech is audible.
+The browser must support WebSocket, Web Audio, AudioWorklet, and `getUserMedia`. Microphone access requires browser and OS permissions and a secure context. For local development, use `http://localhost:8080`; for access from another device, use HTTPS/WSS. Currently, `Start session` requests microphone permission even when using only text injection. If permission is denied, the page closes the session socket, shows `microphone blocked` with a note in the log, and re-enables Start; allow the microphone for the site and start again. The sample `mock` TTS emits silent PCM, so it cannot verify that natural speech is audible.
 
 The web client sets `ws.binaryType = 'arraybuffer'` and decodes the `ArrayBuffer` directly. `node --test full-duplex-demo/tests/web_playback.test.cjs` checks the real inline script's WebSocket initialization, binary PCM delivery, and ACK after simulated playback completes. It covers more than `node --check` (syntax only), but does not guarantee actual audio output or microphone permission behavior in a browser/OS combination.
 
@@ -136,7 +136,7 @@ Together uses its documented `session.created` readiness and JSON/base64 PCM pro
 
 Use `VoiceRuntime::build_with_policies(config, providers, RuntimePolicies)` to supply a pure shared `TextAnalyzer`, per-session slot-extractor factory, or trusted `SpeechRenderer`. Pass `None` for `providers` to retain built-in factories. Explicit host overrides take precedence; otherwise configured framework extraction and the declared fallback remain active. Direct sessions expose matching builder injection points and `try_build` validation. The library adds no locale negotiation or transport dependency.
 
-The shipped task spec returns `{"text", "outcome", "question"}` replies for a bounded reservation example. Another spec can return plain text, which is spoken unchecked; it needs its own `speech.outcomes` rules and `tools.effects` declarations before it can report business outcomes. Changing `tts.language` changes the `speech_language` the task agent is asked to reply in, but not the automatic resources (backchannel, stop acknowledgement, failure, progress), `asr.locale`, or any grammar; set those together. With `tts.language` unset, the brief has no `speech_language` and the shipped spec tells the agent to reply in the user's language. A custom framework agent using `VoiceAgentHooks` must register tools through `hooks.bind_tool`; unbound results cannot authorize strict business speech. The adapter uses a stable session actor and an immutable per-turn sender token for execution provenance, not as user authentication.
+The shipped task spec returns `{"text", "outcome", "question"}` replies for a bounded reservation example. All shipped agent specs use `gpt-5.4-mini`. The task spec gives the model the server-local date each turn through an ai-agents `builtin` `datetime` context, so relative dates such as "tomorrow" resolve correctly; it also tells the model to read only the last four characters of a confirmation ID. Another spec can return plain text, which is spoken unchecked; it needs its own `speech.outcomes` rules and `tools.effects` declarations before it can report business outcomes. Changing `tts.language` changes the `speech_language` the task agent is asked to reply in, but not the automatic resources (backchannel, stop acknowledgement, failure, progress), `asr.locale`, or any grammar; set those together. With `tts.language` unset, the brief has no `speech_language` and the shipped spec tells the agent to reply in the user's language. A custom framework agent using `VoiceAgentHooks` must register tools through `hooks.bind_tool`; unbound results cannot authorize strict business speech. The adapter uses a stable session actor and an immutable per-turn sender token for execution provenance, not as user authentication.
 
 ## Environment variables
 
@@ -207,8 +207,9 @@ voice_turn_resolved_total            Turns settled in memory using the heard res
 voice_turn_heard_partially_total     Resolved turns heard only partially (interrupted, unplayed, or claim rejected)
 voice_turn_discarded_total           Turns rolled back from memory (stale, failed, or superseded)
 voice_task_superseded_total          Turns canceled when the next turn commits during inference
+voice_semantic_timeout_total         Semantic interpretation requests that missed agents.interaction.timeout_ms
 ```
 
-Watch logs for `reply not found in memory` (memory retains the generated reply) and `previous turn was never resolved` (missing resolution, a bug signal; recovery occurs after 10 seconds).
+Watch logs for `semantic interpretation unavailable` or `timed out` (turns fall back to neutral timing), `reply not found in memory` (memory retains the generated reply) and `previous turn was never resolved` (missing resolution, a bug signal; recovery occurs after 10 seconds).
 
 The `voice_false_interrupt` family of metrics is measured through scenario replay. For live sessions, observe it indirectly via the ratio of `playback_abort` to `user_turn_committed`.

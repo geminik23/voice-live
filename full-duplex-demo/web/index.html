@@ -304,15 +304,26 @@ async function startSession() {
   gainNode = playbackCtx.createGain();
   gainNode.connect(playbackCtx.destination);
 
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      sampleRate: 48000,
-    },
-    video: false,
-  });
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 48000,
+      },
+      video: false,
+    });
+  } catch (error) {
+    // Without a microphone there is no session: say why and allow a retry.
+    log(`microphone unavailable: ${error.name || error}. Allow the microphone for this site, then start again.`);
+    setStatus('microphone blocked');
+    ws.onclose = null;
+    ws.close();
+    running = false;
+    startBtn.disabled = false;
+    return;
+  }
 
   captureCtx = new AudioContext({ sampleRate: 48000 });
 

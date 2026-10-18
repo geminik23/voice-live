@@ -6,7 +6,7 @@ use ai_agents::tools::{Tool, ToolExecutionContext, ToolExecutionRecord, ToolResu
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -54,6 +54,9 @@ impl ExecutionKey {
 pub struct VoiceAgentHooks {
     origins: Mutex<HashMap<String, Origin>>,
     calls: Mutex<HashMap<ExecutionKey, Option<String>>>,
+    /// Tool IDs wrapped by ind_tool; their start and completion come from
+    /// these hooks, so the stream's copies of those events are duplicates.
+    bound: Mutex<HashSet<String>>,
 }
 impl VoiceAgentHooks {
     pub fn new() -> Arc<Self> {
@@ -89,10 +92,16 @@ impl VoiceAgentHooks {
     }
     /// Wraps a host tool without changing its policy, safety classification, or arguments.
     pub fn bind_tool(self: &Arc<Self>, tool: Arc<dyn Tool>) -> Arc<dyn Tool> {
+        self.bound.lock().insert(tool.id().to_string());
         Arc::new(BoundTool {
             inner: tool,
             hooks: Arc::clone(self),
         })
+    }
+
+    /// Whether ind_tool wrapped this tool ID.
+    pub fn is_bound(&self, tool: &str) -> bool {
+        self.bound.lock().contains(tool)
     }
 }
 
@@ -239,13 +248,14 @@ impl AgentHooks for VoiceAgentHooks {
             cancelled: record.cancelled,
             output_truncated: record.output_truncated || oversized_output || oversized_args,
         };
+        let output = proof.output.clone();
         emit(&origin, proof).await;
         let _ = origin
             .tx
             .send(CognitiveEvent::ToolCompleted {
                 tool: record.canonical_id.clone(),
                 success: record.success,
-                output: String::new(),
+                output,
             })
             .await;
         let _ = origin

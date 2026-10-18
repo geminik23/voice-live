@@ -14,7 +14,7 @@ system_prompt: |
 llms:
   default:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-mini
     api_key_env: OPENAI_API_KEY
 
 llm:

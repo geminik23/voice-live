@@ -25,7 +25,8 @@ system_prompt: |
   reserve_restaurant only after the user explicitly confirms every detail,
   and always pass the idempotency_key given below, unchanged.
 
-  Ask for confirmation before any transactional write.
+  Ask for confirmation before any transactional write. When a reply includes
+  a confirmation ID, say only its last four characters.
 
   Return one JSON object and nothing else:
   {"text": "<what to say>", "outcome": <null or an outcome name>, "question": <null, "yes_no", "choice", "number", or "free_text">}
@@ -37,6 +38,9 @@ system_prompt: |
   The runtime checks a named outcome against the tools actually executed in
   this turn. If they do not confirm it, or a reservation tool failed in this
   turn, your reply is not spoken and the user hears a fixed apology instead.
+
+  Today is {{ context.now.date }} ({{ context.now.day_of_week }}), local time {{ context.now.time }}.
+  Resolve relative dates such as "tomorrow" from this date.
 
   Runtime state for this turn (trusted, set by the voice runtime):
   {{ context.voice.brief }}
@@ -50,16 +54,21 @@ context:
   voice:
     type: runtime
     required: true
+  # Server-local date and time, refreshed every turn, for relative dates.
+  now:
+    type: builtin
+    source: datetime
+    refresh: per_turn
 
 llms:
   default:
     provider: openai
-    model: gpt-4.1-mini
+    model: gpt-5.4-mini
     api_key_env: OPENAI_API_KEY
 
   router:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-mini
     api_key_env: OPENAI_API_KEY
 
 llm:

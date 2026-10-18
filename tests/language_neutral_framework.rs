@@ -46,6 +46,17 @@ impl Tool for Create {
 
 #[tokio::test]
 async fn published_framework_proof_origin_and_rendered_memory_keep_original_final_identity() {
+    proof_origin_and_rendered_memory(false).await;
+}
+
+/// With SDK tool events on (as in the demo spec), a bound tool still reports
+/// exactly one start and one completion, and the completion carries the output.
+#[tokio::test]
+async fn bound_tool_events_are_not_duplicated_when_sdk_tool_events_are_on() {
+    proof_origin_and_rendered_memory(true).await;
+}
+
+async fn proof_origin_and_rendered_memory(include_tool_events: bool) {
     let proposal = r#"{"text":"Continue?"}"#;
     let mut mock = MockLLMProvider::new("offline");
     mock.set_responses(
@@ -57,9 +68,9 @@ async fn published_framework_proof_origin_and_rendered_memory_keep_original_fina
     );
     let hooks = VoiceAgentHooks::new();
     let memory: Arc<dyn Memory> = Arc::new(InMemoryStore::new(40));
-    let runtime = AgentBuilder::from_yaml(
-        "name: OfflineProof\nsystem_prompt: Offline proof test\ntools: [create]\nstreaming: {enabled: true, include_tool_events: false}",
-    )
+    let runtime = AgentBuilder::from_yaml(&format!(
+        "name: OfflineProof\nsystem_prompt: Offline proof test\ntools: [create]\nstreaming: {{enabled: true, include_tool_events: {include_tool_events}}}"
+    ))
     .unwrap()
     .system_prompt("Use create, then return a proposal.")
     .llm(Arc::new(mock))
@@ -101,8 +112,9 @@ async fn published_framework_proof_origin_and_rendered_memory_keep_original_fina
                 assert_eq!(tool, "create");
                 started += 1;
             }
-            Some(CognitiveEvent::ToolCompleted { tool, .. }) => {
+            Some(CognitiveEvent::ToolCompleted { tool, output, .. }) => {
                 assert_eq!(tool, "create");
+                assert!(output.contains("committed"), "{output}");
                 completed += 1;
             }
             Some(CognitiveEvent::Final { text }) => {

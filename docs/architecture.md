@@ -186,7 +186,7 @@ A strict Final is `{"text": …, "outcome": …, "question": …}`, or plain tex
 
 - **No outcome.** The text is spoken as general (phatic) speech. It carries no business evidence, and the runtime does not check what it says.
 - **Named outcome.** `speech.outcomes.<name>` names an operation, a claim class, receipt fields, and target bindings. Every record of that operation executed in this turn must be usable, carry the receipt fields, and match its executed arguments; otherwise nothing of the reply is spoken. Records are found by operation from the executor's own observations. The model never supplies or repeats a call ID, arguments, or evidence reference.
-- **Unconfirmed write.** If a tool not declared `pure_read` in `tools.effects` was started and not completed, completed unsuccessfully, or left an unusable record in this turn, none of the reply is spoken, whatever it names. This check does not read the reply text, so it works in any language.
+- **Unconfirmed write.** If a tool that may write (declared in `tools.effects` with an effect other than `pure_read`, or undeclared but actually run in this turn) was started and not completed, completed unsuccessfully, or left an unusable record in this turn, none of the reply is spoken, whatever it names. This check does not read the reply text, so it works in any language.
 - **Rejection.** A malformed or unconfirmed reply is not spoken. The user hears `speech.failure_text` instead (when configured), and memory records the reply as `[voice-live:undelivered]` while keeping the turn's tool history.
 - **Question.** The optional `question` value is only a turn-taking hint, never evidence. It reaches interaction state only after the clause has played in full.
 
@@ -262,7 +262,7 @@ Cancellation, timeout, or stream Drop may happen after an external effect but be
 
 When the assistant is silent, the user has **paused** (`floor == UserPausing`, mic closed), the candidate sentence ends incompletely, and silence is between the soft and hard thresholds, the assistant says “네” first. It is limited to `maximum_per_user_turn` times per turn with a `minimum_interval_ms` spacing.
 
-Semantic requests are triggered by meaningful candidate or context changes, including final and injected text, not by every audio frame or control tick. `minimum_interval_ms` limits request starts; `timeout_ms` bounds each request. Without an available semantic model, the configured semantic path retains neutral timing and does not fall back to the Korean example.
+Semantic requests are triggered by meaningful candidate or context changes, including final and injected text, not by every audio frame or control tick. `minimum_interval_ms` limits request starts; `timeout_ms` bounds each request; a timed-out request counts in `voice_semantic_timeout_total`, and the first timeout and the first provider failure of a streak are logged. Without an available semantic model, the configured semantic path retains neutral timing and does not fall back to the Korean example.
 
 ## Self-echo defense
 

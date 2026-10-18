@@ -104,3 +104,51 @@ test('WebSocket ArrayBuffer audio is scheduled and acknowledged after playback',
     { type: 'playback_completed', speech_id: 'speech-1', speech_epoch: 3 },
   ]);
 });
+
+test('a denied microphone closes the socket, explains why, and allows a retry', async () => {
+  const elements = new Map();
+  let socket;
+  class FakeWebSocket {
+    constructor() {
+      this.readyState = FakeWebSocket.OPEN;
+      this.closed = false;
+      socket = this;
+    }
+    send() {}
+    close() { this.closed = true; }
+  }
+  FakeWebSocket.OPEN = 1;
+  class FakeAudioContext {
+    constructor() { this.destination = {}; this.currentTime = 0; }
+    createGain() { return { connect() {}, gain: {} }; }
+  }
+  const document = {
+    getElementById(id) {
+      if (!elements.has(id)) {
+        elements.set(id, { appendChild() {}, addEventListener() {} });
+      }
+      return elements.get(id);
+    },
+    createElement() { return {}; },
+  };
+  const context = vm.createContext({
+    document,
+    window: { addEventListener() {} },
+    WebSocket: FakeWebSocket,
+    AudioContext: FakeAudioContext,
+    location: { protocol: 'http:', host: 'localhost:8080' },
+    navigator: {
+      mediaDevices: {
+        getUserMedia: () => Promise.reject(Object.assign(new Error('denied'), { name: 'NotAllowedError' })),
+      },
+    },
+  });
+  vm.runInContext(script, context, { filename: 'web/index.html' });
+  const started = context.startSession();
+  socket.onopen();
+  await started;
+  assert.equal(socket.closed, true);
+  assert.equal(vm.runInContext('running', context), false);
+  assert.equal(vm.runInContext('startBtn.disabled', context), false);
+  assert.match(vm.runInContext('statusEl.textContent', context), /microphone blocked/);
+});

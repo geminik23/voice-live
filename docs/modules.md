@@ -18,7 +18,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `media.rs` | Audio frame codec, sequence tracker, and resampler. `build_resampler` chooses `DecimatingResampler` for integer ratios (windowed-sinc anti-alias; phase calculated from the absolute stream index), otherwise `LinearResampler` (low-pass then linear interpolation; carries over the last sample of the previous chunk to rebase phase, avoiding length-proportional drift). Failures are not silently ignored |
 | `replay.rs` | PCM16 WAV source + realtime replay API using actual 20ms timestamps |
 | `transcript.rs` | `TranscriptReconciler` (revisioned partials, stable-prefix computation), `TurnAssemblyBuffer` |
-| `vad.rs` | Energy VAD. The floor adapts only while idle (speech does not raise the floor); onset/offset hysteresis |
+| `vad.rs` | Energy VAD with onset/offset hysteresis. The floor adapts while idle and ignores digital silence; while speech is on, a one-second window whose quietest frame stays above the offset level raises the floor, so stationary noise cannot hold speech on |
 
 ## interaction/
 
@@ -65,8 +65,8 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 |---|---|
 | `mod.rs` | `CognitiveAgent`/`AgentTurnStream` traits - boundary separating the runtime from the framework. `AgentTurnRequest` separates `input` (only committed utterances) from `context: TurnContext` (turn environment for the system prompt). `resolve_turn(task_id, TurnResolution::{Audible, Discard})` reconciles turn memory |
 | `mock.rs` | `FakeAgent` (scripted; `AgentRecorder` records received requests and resolutions) |
-| `proof.rs` | Framework-only `VoiceAgentHooks` and bound host tools; immutable SDK execution-scope origin, retry-safe turn tokens, bounded terminal proof projection, and no current-turn reassignment; canonical terminal retirement is independent of optional SDK stream chunks |
-| `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, `RuntimeInteractionBrain` (legacy), stateless `RuntimeSemanticBrain`, `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*`. The slot extractor rejects a whole malformed response or a response over 16384 bytes, limits updates to 32 and slot names to 128 bytes, accepts only `set`, `replace`, and `clear`, and checks confidence in 0–1. As before, `old_value: null` is represented as a present JSON null |
+| `proof.rs` | Framework-only `VoiceAgentHooks` and bound host tools (the hooks remember bound IDs so the adapter drops the SDK stream's duplicate completion; the hook's completion carries the bounded output); immutable SDK execution-scope origin, retry-safe turn tokens, bounded terminal proof projection, and no current-turn reassignment; canonical terminal retirement is independent of optional SDK stream chunks |
+| `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, `RuntimeSemanticBrain` (logs the first failure of a streak and its recovery), `RuntimeInteractionBrain` (legacy), stateless `RuntimeSemanticBrain`, `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*`. The slot extractor rejects a whole malformed response or a response over 16384 bytes, limits updates to 32 and slot names to 128 bytes, accepts only `set`, `replace`, and `clear`, and checks confidence in 0–1. As before, `old_value: null` is represented as a present JSON null |
 
 ## asr/ tts/
 
@@ -89,7 +89,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | Module | Description |
 |---|---|
 | `provider.rs` | `ProviderSessionControl` cancellation/close contract and private owned worker cleanup; custom providers must enforce Drop and bounded teardown themselves |
-| `playback.rs` | `PlaybackCommand`, `ClientPlaybackSink` (runtime nonblocking overload shutdown or legacy standalone admission), `SimulatedPlaybackSink` (simulates the actual playback ACK flow in virtual-time tests), `UnacknowledgedPlaybackSink` (for ACK timeout scenarios) |
+| `playback.rs` | `PlaybackCommand`, `ClientPlaybackSink` (runtime nonblocking overload shutdown, which is not reported as an error once the session is already closing, or legacy standalone admission), `SimulatedPlaybackSink` (simulates the actual playback ACK flow in virtual-time tests), `UnacknowledgedPlaybackSink` (for ACK timeout scenarios) |
 | `tools/reservation.rs` | Explicit reservation example: shared in-memory backend, `search_availability` with `searched` receipts, and confirmed/idempotent `reserve_restaurant` with `committed` receipts; not a core speech-meaning registry |
 | `scenario.rs` | Scenario DSL runner. YAML → virtual-time execution → expectation evaluation |
 | `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, `RuntimePolicies`/`build_with_policies` host overrides and per-session interaction/slot factories, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, fresh ASR retry and identity mapping, one-second terminal drain after input closure to preserve fatal classification, bounded client output |

@@ -414,6 +414,8 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
                             // ToolStarted is forwarded by the hook with its
                             // complete argument object, so this chunk is a duplicate.
                             StreamChunk::ToolCallStart { .. } => None,
+                            // A bound tool's completion also comes from the hook.
+                            StreamChunk::ToolResult { name, .. } if hooks.is_bound(&name) => None,
                             StreamChunk::ToolResult {
                                 name,
                                 output,
@@ -517,6 +519,9 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
 pub struct RuntimeSemanticBrain {
     provider: Arc<dyn LLMProvider>,
     system_prompt: String,
+    /// Set while requests keep failing, so a broken model or key is logged
+    /// once instead of on every utterance.
+    failing: std::sync::atomic::AtomicBool,
 }
 
 impl RuntimeSemanticBrain {
@@ -524,6 +529,22 @@ impl RuntimeSemanticBrain {
         Self {
             provider,
             system_prompt,
+            failing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Callers fall back to neutral timing on None; this keeps the reason visible.
+    fn report(&self, failure: Option<String>) {
+        use std::sync::atomic::Ordering;
+        match failure {
+            Some(reason) if !self.failing.swap(true, Ordering::Relaxed) => {
+                tracing::warn!(%reason, "semantic interpretation unavailable; using neutral timing")
+            }
+            Some(reason) => tracing::debug!(%reason, "semantic interpretation still unavailable"),
+            None if self.failing.swap(false, Ordering::Relaxed) => {
+                tracing::info!("semantic interpretation recovered")
+            }
+            None => {}
         }
     }
 }
@@ -555,8 +576,20 @@ impl InteractionBrain for RuntimeSemanticBrain {
             self.system_prompt
         );
         let messages = [ChatMessage::system(&system), ChatMessage::user(&input)];
-        let response = self.provider.complete(&messages, None).await.ok()?;
-        crate::interaction::SemanticAssessment::parse(&response.content)
+        let response = match self.provider.complete(&messages, None).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.report(Some(error.to_string()));
+                return None;
+            }
+        };
+        let assessment = crate::interaction::SemanticAssessment::parse(&response.content);
+        self.report(
+            assessment
+                .is_none()
+                .then(|| "model reply is not a valid assessment".to_string()),
+        );
+        assessment
     }
 }
 
@@ -784,5 +817,23 @@ mod slot_response_tests {
         assert_eq!(updates[0].old_value, None);
         assert_eq!(updates[0].new_value, serde_json::json!("Saturday"));
         assert_eq!(updates[0].source_revision, Revision(2));
+    }
+}
+
+#[cfg(test)]
+mod semantic_brain_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn a_failing_model_is_reported_and_its_recovery_clears_the_state() {
+        let mut broken = ai_agents_llm::mock::MockLLMProvider::new("broken");
+        broken.set_error("model_not_found");
+        let brain = RuntimeSemanticBrain::new(Arc::new(broken), String::new());
+        assert!(brain.assess(InteractionSnapshot::default()).await.is_none());
+        assert!(brain.failing.load(Ordering::Relaxed));
+
+        brain.report(None);
+        assert!(!brain.failing.load(Ordering::Relaxed));
     }
 }

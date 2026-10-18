@@ -299,6 +299,8 @@ struct TestAgent {
     record: Option<InvocationProof>,
     stale: bool,
     fail: bool,
+    /// Sent before the Final, after any proof.
+    events: Vec<CognitiveEvent>,
     resolutions: Mutex<Vec<TurnResolution>>,
 }
 #[async_trait]
@@ -316,6 +318,9 @@ impl CognitiveAgent for TestAgent {
             })
             .await
             .unwrap();
+        }
+        for event in &self.events {
+            tx.send(event.clone()).await.unwrap();
         }
         tx.send(if self.fail {
             CognitiveEvent::Failed {
@@ -351,12 +356,24 @@ async fn exercise_with(
     stale: bool,
     fail: bool,
 ) -> (Vec<String>, Vec<TurnResolution>) {
+    exercise_events(cfg, final_text, record, stale, fail, Vec::new()).await
+}
+
+async fn exercise_events(
+    cfg: VoiceRuntimeConfig,
+    final_text: &str,
+    record: Option<InvocationProof>,
+    stale: bool,
+    fail: bool,
+    events: Vec<CognitiveEvent>,
+) -> (Vec<String>, Vec<TurnResolution>) {
     let texts = Arc::new(Mutex::new(Vec::new()));
     let agent = Arc::new(TestAgent {
         final_text: final_text.into(),
         record,
         stale,
         fail,
+        events,
         resolutions: Mutex::new(Vec::new()),
     });
     let shutdown = CancellationToken::new();
@@ -453,6 +470,27 @@ async fn unconfirmed_write_replaces_any_reply_with_failure_text() {
     )
     .await;
     assert_eq!(texts, ["Nothing was found for that date."]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_to_an_unregistered_tool_does_not_count_as_a_write() {
+    // The model asked for a tool that does not exist. The framework reports a
+    // failed result, but nothing ran, so nothing can have been written.
+    let unknown = CognitiveEvent::ToolCompleted {
+        tool: "search_reservation_availability".into(),
+        success: false,
+        output: "Tool error: not registered".into(),
+    };
+    let (texts, _) = exercise_events(
+        config_with_failure_text(),
+        "I could not check that right now.",
+        None,
+        false,
+        false,
+        vec![unknown],
+    )
+    .await;
+    assert_eq!(texts, ["I could not check that right now."]);
 }
 
 #[tokio::test(start_paused = true)]

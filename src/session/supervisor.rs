@@ -1833,15 +1833,27 @@ impl VoiceSession {
         let stop_key = key.clone();
         let shutdown = self.shutdown.clone();
         let timeout = Duration::from_millis(self.config.agents.interaction.timeout_ms);
+        let metrics = Arc::clone(&self.metrics);
         self.workers.spawn(async move {
             let revision = snapshot.transcript_revision;
             let extraction_snapshot = snapshot.clone();
             let work = async {
                 let semantic = async {
-                    let assessment = tokio::time::timeout(timeout, brain.assess(snapshot))
-                        .await
-                        .ok()
-                        .flatten();
+                    let assessment =
+                        match tokio::time::timeout(timeout, brain.assess(snapshot)).await {
+                            Ok(assessment) => assessment,
+                            Err(_) => {
+                                // Warn on the first timeout only; the counter keeps the rest visible.
+                                if metrics.counter("voice_semantic_timeout_total") == 0 {
+                                    tracing::warn!(
+                                        timeout_ms = timeout.as_millis() as u64,
+                                        "semantic interpretation timed out; using neutral timing"
+                                    );
+                                }
+                                metrics.inc("voice_semantic_timeout_total");
+                                None
+                            }
+                        };
                     if assessment
                         .as_ref()
                         .is_some_and(|value| value.valid() && value.stop)
@@ -3257,17 +3269,39 @@ impl VoiceSession {
         Ok(())
     }
 
-    /// A tool not declared `pure_read` may have written. If any such call in
-    /// this turn failed, was never completed, or left an unusable record, the
-    /// reply cannot be checked against what actually happened.
+    /// A tool declared as a write, or an undeclared tool that actually ran,
+    /// may have written. If any such call in this turn failed, was never
+    /// completed, or left an unusable record, the reply cannot be checked
+    /// against what actually happened. A call to a tool that never ran (for
+    /// example a name the model made up) cannot have written anything.
     fn write_unconfirmed(
         &self,
         task_id: TaskId,
         proofs: &[crate::speech::render::InvocationProof],
     ) -> bool {
         use crate::session::view::SessionEvidence;
-        let may_write =
-            |tool: &str| self.config.tools.effects.get(tool) != Some(&ToolEffect::PureRead);
+        let ran = |tool: &str| {
+            proofs.iter().any(|p| p.operation == tool)
+                || self.state.evidence.values().any(|evidence| match evidence {
+                    SessionEvidence::ToolStarted {
+                        task_id: t,
+                        tool: name,
+                        ..
+                    } => *t == task_id && name == tool,
+                    SessionEvidence::ToolExecuted {
+                        task_id: t,
+                        tool: name,
+                        executed,
+                        ..
+                    } => *t == task_id && name == tool && *executed,
+                    _ => false,
+                })
+        };
+        let may_write = |tool: &str| match self.config.tools.effects.get(tool) {
+            Some(ToolEffect::PureRead) => false,
+            Some(_) => true,
+            None => ran(tool),
+        };
         proofs
             .iter()
             .any(|p| may_write(&p.operation) && !p.usable())
@@ -4842,6 +4876,34 @@ mod tests {
             brain.snapshots.lock().as_slice(),
             ["Friday", "Saturday evening"]
         );
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn semantic_timeout_is_counted_instead_of_disappearing() {
+        let (mut session, _, _) = harness();
+        // Never released, so every request runs into the interaction timeout.
+        let brain = Arc::new(BlockingSemanticBrain {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+            snapshots: parking_lot::Mutex::new(Vec::new()),
+        });
+        session.semantic_mode = true;
+        session.interaction_brain = brain;
+        session.semantic_slot_override = false;
+        session
+            .handle_event(VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                revision: Revision(1),
+                hypothesis: "Friday".into(),
+            })
+            .await
+            .unwrap();
+        session.maybe_spawn_semantic();
+        let result = session.semantic_rx.recv().await.unwrap();
+        assert!(result.assessment.is_none());
+        assert_eq!(session.metrics.counter("voice_semantic_timeout_total"), 1);
         session.shutdown_active_work().await;
     }
 
