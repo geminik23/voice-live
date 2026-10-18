@@ -144,6 +144,11 @@ pub struct VoiceSession {
     pub audible_ledger: AudibleLedger,
     pub claim_gate: ClaimGate,
     pub cue_extractor: CueExtractor,
+    pub text_analyzer: Arc<dyn crate::semantics::text::TextAnalyzer>,
+    pub speech_renderer: Arc<dyn crate::speech::render::SpeechRenderer>,
+    invocation_proofs: HashMap<TaskId, Vec<crate::speech::render::InvocationProof>>,
+    proof_conflicts: HashSet<TaskId>,
+    speech_questions: HashMap<SpeechId, crate::interaction::ExpectedAnswerType>,
     pub policy: ReflexPolicy,
     pub partial_policy: PartialControllerPolicy,
 
@@ -222,6 +227,8 @@ pub struct VoiceSessionBuilder {
     pub metrics: MetricsRef,
     pub trace_tx: Option<mpsc::Sender<VoiceEvent>>,
     pub shutdown: CancellationToken,
+    text_analyzer: Option<Arc<dyn crate::semantics::text::TextAnalyzer>>,
+    speech_renderer: Option<Arc<dyn crate::speech::render::SpeechRenderer>>,
 }
 
 impl VoiceSessionBuilder {
@@ -232,6 +239,7 @@ impl VoiceSessionBuilder {
         task_agent: Arc<dyn CognitiveAgent>,
     ) -> Self {
         let clock: ClockRef = Arc::new(TokioClock::new());
+        let slot_extractor = crate::semantics::extractor::configured_fallback(&config.turn_control);
         Self {
             session_id: None,
             config,
@@ -242,12 +250,30 @@ impl VoiceSessionBuilder {
             task_agent,
             speculative_agent: None,
             interaction_brain: Arc::new(NoopInteractionBrain),
-            slot_extractor: Arc::new(crate::semantics::extractor::HeuristicKoreanSlotExtractor),
+            slot_extractor,
             deep_worker: None,
             metrics: Metrics::new(),
             trace_tx: None,
             shutdown: CancellationToken::new(),
+            text_analyzer: None,
+            speech_renderer: None,
         }
+    }
+
+    pub fn with_text_analyzer(
+        mut self,
+        analyzer: Arc<dyn crate::semantics::text::TextAnalyzer>,
+    ) -> Self {
+        self.text_analyzer = Some(analyzer);
+        self
+    }
+
+    pub fn with_speech_renderer(
+        mut self,
+        renderer: Arc<dyn crate::speech::render::SpeechRenderer>,
+    ) -> Self {
+        self.speech_renderer = Some(renderer);
+        self
     }
 
     pub fn with_session_id(mut self, session_id: crate::ids::SessionId) -> Self {
@@ -297,12 +323,28 @@ impl VoiceSessionBuilder {
     }
 
     pub fn build(self) -> (VoiceSession, VoiceSessionHandle) {
+        self.try_build().expect("invalid session configuration")
+    }
+
+    pub fn try_build(self) -> Result<(VoiceSession, VoiceSessionHandle)> {
+        self.config.validate()?;
         let session_id = self.session_id.unwrap_or_default();
         let (event_tx, event_rx) = mpsc::channel::<VoiceEvent>(1024);
         let (speech_tx, speech_rx) = mpsc::channel::<(SpeechAct, CancellationToken)>(64);
         let tts_registry = Arc::new(TtsCancellationRegistry::default());
 
         let cue_extractor = CueExtractor::from_config(&self.config.turn_control);
+        let text_analyzer = self.text_analyzer.unwrap_or_else(|| {
+            crate::semantics::text::ConfiguredTextAnalyzer::shared(&self.config.turn_control)
+                .expect("validated text rules")
+        });
+        let policy = ReflexPolicy::with_analyzer(Arc::clone(&text_analyzer));
+        let speech_renderer = self.speech_renderer.unwrap_or_else(|| {
+            Arc::new(
+                crate::speech::render::ConfiguredRenderer::new(&self.config.speech.responses)
+                    .expect("validated response resources"),
+            )
+        });
         let asr_partials = self.config.asr.partials.clone();
         let interaction_interval = self.config.agents.interaction.minimum_interval_ms;
         let audible_capacity = self.config.speech.audible_history_max_clauses;
@@ -362,7 +404,12 @@ impl VoiceSessionBuilder {
             audible_ledger: AudibleLedger::with_capacity(audible_capacity),
             claim_gate: ClaimGate,
             cue_extractor,
-            policy: ReflexPolicy::new(),
+            policy,
+            text_analyzer,
+            speech_renderer,
+            invocation_proofs: HashMap::new(),
+            proof_conflicts: HashSet::new(),
+            speech_questions: HashMap::new(),
             partial_policy: PartialControllerPolicy::from_config(interaction_interval),
             last_interaction_run_us: None,
             partial_last_snapshot: None,
@@ -387,7 +434,7 @@ impl VoiceSessionBuilder {
             event_tx,
         };
 
-        (session, handle)
+        Ok((session, handle))
     }
 }
 
@@ -580,6 +627,30 @@ impl VoiceSession {
                     .await?;
             }
 
+            VoiceEvent::InvocationProof {
+                task_id,
+                thought_epoch,
+                proof,
+                ..
+            } => {
+                if self.is_task_result_current(task_id, thought_epoch)
+                    && self
+                        .active_tasks
+                        .get(&task_id)
+                        .is_some_and(|t| t.kind == ActiveTaskKind::MainTurn)
+                {
+                    let records = self.invocation_proofs.entry(task_id).or_default();
+                    if !proof.bounded()
+                        || records.len() >= 128
+                        || records.iter().any(|p| p.record_id == proof.record_id)
+                    {
+                        self.proof_conflicts.insert(task_id);
+                    } else {
+                        records.push(proof);
+                    }
+                }
+            }
+
             VoiceEvent::AgentFinal {
                 task_id,
                 thought_epoch,
@@ -641,8 +712,13 @@ impl VoiceSession {
 
             VoiceEvent::PlaybackCompleted { speech_id, .. } => {
                 self.last_playback_signal_us = None;
+                let question = self.speech_questions.remove(&speech_id);
                 self.settle_speech_record(speech_id);
                 self.audible_ledger.mark_completed(speech_id);
+                if let Some(question) = question {
+                    self.state.assistant_asked_question = true;
+                    self.state.expected_answer_type = Some(question);
+                }
                 self.start_next_speech_if_possible().await?;
             }
 
@@ -694,6 +770,7 @@ impl VoiceSession {
         }
 
         self.resolve_settled_turns();
+        self.retire_question_metadata();
         self.maybe_release_deferred().await?;
         Ok(())
     }
@@ -759,6 +836,7 @@ impl VoiceSession {
     }
 
     fn settle_speech_record(&mut self, speech_id: SpeechId) {
+        self.speech_questions.remove(&speech_id);
         if let Some(mut record) = self.speech_records.remove(&speech_id) {
             record.playback = PlaybackLifecycle::Settled;
         }
@@ -917,11 +995,11 @@ impl VoiceSession {
         // `start_next_speech_if_possible` would silently discard them anyway.
         self.pending_speech
             .retain(|act| act.priority >= crate::speech::act::PRIORITY_HARD_STOP_ACK);
-        for act in &mut self.pending_speech {
-            act.speech_epoch = new_epoch;
-        }
+        self.retag_pending_speech(new_epoch);
 
-        if reason == InterruptionReason::HardStop {
+        if reason == InterruptionReason::HardStop
+            && !self.config.speech.hard_stop_ack_text.trim().is_empty()
+        {
             let ack = SpeechAct::phatic(
                 self.config.speech.hard_stop_ack_text.clone(),
                 new_epoch,
@@ -1060,7 +1138,7 @@ impl VoiceSession {
             self.maybe_spawn_speculative(&stable_prefix);
         }
 
-        let cues = self.cue_extractor.extract(&hypothesis);
+        let cues = self.text_analyzer.user(&hypothesis).cues;
 
         for cue in cues.clone() {
             let event = VoiceEvent::SemanticCue {
@@ -1410,7 +1488,7 @@ impl VoiceSession {
             return;
         }
 
-        let cues = self.cue_extractor.extract(stable_prefix);
+        let cues = self.text_analyzer.user(stable_prefix).cues;
         let intent = cues
             .iter()
             .find_map(|cue| match cue {
@@ -1786,6 +1864,10 @@ impl VoiceSession {
         }
 
         self.state.task = crate::interaction::TaskState::Reasoning;
+        let started = format!("tool_started:{task_id}:{tool}");
+        self.state.evidence.remove(&started);
+        self.pending_speech
+            .retain(|act| !act.evidence.iter().any(|r| r.id == started));
         let _ = (success, output);
         self.maybe_commit_transaction_action(task_id, &tool);
 
@@ -1843,6 +1925,95 @@ impl VoiceSession {
             );
             self.metrics.inc("voice_action_commit_total");
         }
+    }
+
+    async fn on_strict_final(&mut self, task_id: TaskId, original: String) -> Result<()> {
+        use crate::speech::render::RenderedReply;
+        let proofs = self.invocation_proofs.remove(&task_id).unwrap_or_default();
+        let conflict = self.proof_conflicts.remove(&task_id);
+        let rendered = if conflict {
+            Err(anyhow::anyhow!("conflicting invocation records"))
+        } else {
+            self.speech_renderer.render(&original, &proofs)
+        };
+        self.active_tasks.remove(&task_id);
+        let mut spoken = Vec::new();
+        if let Ok(RenderedReply {
+            text,
+            class,
+            question,
+            records,
+        }) = rendered
+        {
+            let valid_records = records
+                .iter()
+                .all(|id| proofs.iter().any(|p| p.record_id == *id && p.usable()));
+            let requires_records = matches!(class, ClaimClass::Transactional | ClaimClass::Factual);
+            if valid_records
+                && (!requires_records || !records.is_empty())
+                && !text.trim().is_empty()
+                && text.len() <= 16_384
+                && class != ClaimClass::Process
+            {
+                let clauses = split_clauses(&text);
+                let count = clauses.len();
+                self.turn_speech.insert(
+                    task_id,
+                    TurnSpeech {
+                        final_text: original.clone(),
+                        clauses: Vec::new(),
+                    },
+                );
+                for (index, clause) in clauses.into_iter().enumerate() {
+                    let id = SpeechId::new();
+                    let evidence_id = format!("authorized:{id}");
+                    self.state.evidence.insert(
+                        evidence_id.clone(),
+                        crate::session::view::SessionEvidence::AuthorizedSpeech {
+                            task_id,
+                            speech_id: id,
+                            speech_epoch: self.state.epochs.speech,
+                            text: clause.clone(),
+                            class,
+                        },
+                    );
+                    let act = SpeechAct {
+                        id,
+                        speech_epoch: self.state.epochs.speech,
+                        class,
+                        text: clause.clone(),
+                        priority: crate::speech::act::PRIORITY_FINAL,
+                        interruptibility: Interruptibility::AfterClause,
+                        evidence: vec![crate::speech::EvidenceRef::new(
+                            evidence_id,
+                            crate::speech::EvidenceKind::AuthorizedSpeech,
+                        )],
+                        expires_at_monotonic_us: None,
+                    };
+                    if index + 1 == count
+                        && let Some(question) = question
+                    {
+                        self.speech_questions.insert(id, question);
+                    }
+                    if self.authorize_and_enqueue(act, Some(task_id)).await? {
+                        spoken.push((id, clause));
+                    }
+                }
+            } else {
+                self.metrics.inc("voice_claim_rejected_total");
+            }
+        } else {
+            self.metrics.inc("voice_claim_rejected_total");
+        }
+        self.turn_speech.insert(
+            task_id,
+            TurnSpeech {
+                final_text: original,
+                clauses: spoken,
+            },
+        );
+        self.state.task = crate::interaction::TaskState::Completed;
+        Ok(())
     }
 
     // Agent final response processing.
@@ -1906,6 +2077,9 @@ impl VoiceSession {
             }
         }
 
+        if self.config.speech.mode == crate::speech::render::SpeechMode::Strict {
+            return self.on_strict_final(task_id, text).await;
+        }
         self.active_tasks.remove(&task_id);
         self.state.task = crate::interaction::TaskState::Finalizing;
 
@@ -1958,6 +2132,9 @@ impl VoiceSession {
             };
 
             let id = act.id;
+            if let Some(question) = self.text_analyzer.question(&clause) {
+                self.speech_questions.insert(id, question);
+            }
             self.turn_speech
                 .get_mut(&task_id)
                 .expect("reply owner registered")
@@ -1978,11 +2155,6 @@ impl VoiceSession {
                 clauses: spoken,
             },
         );
-
-        if let Some(answer_type) = expected_answer_type(&text) {
-            self.state.assistant_asked_question = true;
-            self.state.expected_answer_type = Some(answer_type);
-        }
 
         self.state.task = crate::interaction::TaskState::Completed;
         Ok(())
@@ -2025,8 +2197,12 @@ impl VoiceSession {
             self.resolve_turn(task_id, TurnResolution::Discard);
         }
 
+        if self.config.speech.failure_text.trim().is_empty() {
+            self.metrics.inc("voice_agent_failed_total");
+            return Ok(());
+        }
         let act = SpeechAct::phatic(
-            "죄송합니다. 응답을 준비하지 못했어요. 다시 말씀해 주세요.",
+            self.config.speech.failure_text.clone(),
             self.state.epochs.speech,
             crate::speech::act::PRIORITY_CLARIFICATION,
         );
@@ -2078,6 +2254,37 @@ impl VoiceSession {
         self.pending_speech.insert(position, act);
     }
 
+    fn retag_pending_speech(&mut self, epoch: u64) {
+        for act in &mut self.pending_speech {
+            if let Some(reference) = act
+                .evidence
+                .iter()
+                .find(|r| r.kind == crate::speech::EvidenceKind::AuthorizedSpeech)
+                && let Some(crate::session::view::SessionEvidence::AuthorizedSpeech {
+                    speech_id,
+                    speech_epoch,
+                    text,
+                    class,
+                    ..
+                }) = self.state.evidence.get_mut(&reference.id)
+                && *speech_id == act.id
+                && *speech_epoch == act.speech_epoch
+                && *text == act.text
+                && *class == act.class
+            {
+                *speech_epoch = epoch;
+            }
+            act.speech_epoch = epoch;
+        }
+    }
+
+    fn retire_question_metadata(&mut self) {
+        self.speech_questions.retain(|id, _| {
+            self.speech_records.contains_key(id)
+                || self.pending_speech.iter().any(|act| act.id == *id)
+        });
+    }
+
     async fn start_next_speech_if_possible(&mut self) -> Result<()> {
         if self
             .speech_records
@@ -2101,6 +2308,16 @@ impl VoiceSession {
         }
 
         while let Some(act) = self.pending_speech.pop_front() {
+            if self
+                .claim_gate
+                .authorize(&act, &self.state, self.monotonic_us())
+                .is_err()
+            {
+                self.act_owner.remove(&act.id);
+                self.speech_questions.remove(&act.id);
+                self.metrics.inc("voice_claim_rejected_total");
+                continue;
+            }
             if act.speech_epoch != self.state.epochs.speech {
                 self.metrics.inc("voice_stale_speech_dropped_total");
                 continue;
@@ -2289,9 +2506,7 @@ impl VoiceSession {
             // Independent replies survive re-stamped; the failed reply's
             // remaining clauses do not.
             self.discard_reply_clauses(owner);
-            for act in &mut self.pending_speech {
-                act.speech_epoch = new_epoch;
-            }
+            self.retag_pending_speech(new_epoch);
 
             if self.state.active_speech_id == Some(speech_id) {
                 self.state.active_speech_id = None;
@@ -2335,7 +2550,7 @@ impl VoiceSession {
 
     async fn enqueue_backchannel(&mut self) -> Result<()> {
         let config = &self.config.turn_control.backchannel;
-        if !config.enabled {
+        if !config.enabled || self.config.speech.backchannel_text.trim().is_empty() {
             return Ok(());
         }
 
@@ -2355,7 +2570,7 @@ impl VoiceSession {
         self.last_backchannel_at_us = Some(now_us);
 
         let act = SpeechAct::phatic(
-            "네",
+            self.config.speech.backchannel_text.clone(),
             self.state.epochs.speech,
             crate::speech::act::PRIORITY_BACKCHANNEL,
         );
@@ -2417,6 +2632,7 @@ impl VoiceSession {
         self.settle_expired_stops(now_us);
         self.start_next_speech_if_possible().await?;
         self.resolve_settled_turns();
+        self.retire_question_metadata();
         self.maybe_release_deferred().await?;
 
         Ok(())
@@ -2493,9 +2709,7 @@ impl VoiceSession {
 
         // Anything queued was authored for the dead epoch; re-stamp it so the
         // timeout drops the stuck utterance without discarding pending speech.
-        for act in &mut self.pending_speech {
-            act.speech_epoch = new_epoch;
-        }
+        self.retag_pending_speech(new_epoch);
 
         self.last_playback_signal_us = None;
         self.state.active_speech_id = None;
@@ -2575,7 +2789,10 @@ impl VoiceSession {
     // generated. These methods report what actually happened to it, so the
     // agent can replace the reply with what was heard, or drop the turn.
 
-    fn resolve_turn(&self, task_id: TaskId, resolution: TurnResolution) {
+    fn resolve_turn(&mut self, task_id: TaskId, resolution: TurnResolution) {
+        self.invocation_proofs.remove(&task_id);
+        self.proof_conflicts.remove(&task_id);
+        self.state.evidence.retain(|_, evidence| !matches!(evidence, crate::session::view::SessionEvidence::AuthorizedSpeech { task_id: owner, .. } if *owner == task_id));
         match &resolution {
             TurnResolution::Discard => self.metrics.inc("voice_turn_discarded_total"),
             TurnResolution::Audible { final_text, heard } => {
@@ -2926,44 +3143,6 @@ impl VoiceSession {
     }
 }
 
-/// Classifies the answer an assistant question invites.
-///
-/// The interaction brain uses this to disambiguate short replies: "네" after a
-/// yes/no question is an answer, not a backchannel.
-fn expected_answer_type(text: &str) -> Option<crate::interaction::ExpectedAnswerType> {
-    use crate::interaction::ExpectedAnswerType;
-
-    let asks_question = text.contains('?')
-        || text.contains("할까요")
-        || text.contains("맞나요")
-        || text.contains("드릴까요")
-        || text.contains("하시겠어요")
-        || text.contains("어떠세요")
-        || text.contains("인가요");
-
-    if !asks_question {
-        return None;
-    }
-
-    if text.contains("몇 명") || text.contains("몇명") || text.contains("몇 시") {
-        return Some(ExpectedAnswerType::Number);
-    }
-
-    if text.contains("어느") || text.contains("어떤") || text.contains("중에") {
-        return Some(ExpectedAnswerType::Choice);
-    }
-
-    if text.contains("맞나요")
-        || text.contains("할까요")
-        || text.contains("드릴까요")
-        || text.contains("하시겠어요")
-    {
-        return Some(ExpectedAnswerType::YesNo);
-    }
-
-    Some(ExpectedAnswerType::FreeText)
-}
-
 fn is_transactional_claim(text: &str) -> bool {
     let patterns = [
         "예약이 완료",
@@ -3061,6 +3240,122 @@ fn render_turn_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn strict_survivors_keep_authorization_and_questions_require_playback() {
+        let (mut session, _, _) = harness();
+        let resources =
+            serde_yaml::from_str("ask: {kind: prompt, text: 'First. Continue?', question: yes_no}")
+                .unwrap();
+        session.speech_renderer =
+            Arc::new(crate::speech::render::ConfiguredRenderer::new(&resources).unwrap());
+        let (tx, mut rx) = mpsc::channel(8);
+        session.speech_tx = tx;
+        let owner = TaskId::new();
+        session
+            .on_strict_final(owner, r#"{"response":"ask"}"#.into())
+            .await
+            .unwrap();
+        let _first = rx.try_recv().unwrap();
+        assert!(!session.state.assistant_asked_question);
+        assert_eq!(session.pending_speech.len(), 1);
+        session.state.epochs.speech += 1;
+        session.retag_pending_speech(session.state.epochs.speech);
+        session.state.speech = SpeechState::Silent;
+        session.start_next_speech_if_possible().await.unwrap();
+        let (last, _) = rx.try_recv().unwrap();
+        assert_eq!(last.text, "Continue?");
+        session
+            .on_tts_audio(
+                last.id,
+                last.speech_epoch,
+                1,
+                24000,
+                bytes::Bytes::from_static(&[0, 0, 0, 0]),
+            )
+            .await
+            .unwrap();
+        session
+            .on_tts_audio_done(last.id, last.speech_epoch)
+            .await
+            .unwrap();
+        assert!(!session.state.assistant_asked_question);
+        session
+            .handle_event(VoiceEvent::PlaybackCompleted {
+                meta: session.new_meta(),
+                speech_id: last.id,
+            })
+            .await
+            .unwrap();
+        assert!(session.state.assistant_asked_question);
+        assert!(session.speech_questions.is_empty());
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_progress_is_retired_on_completion_and_rechecked_after_expiry() {
+        let (mut session, _, _) = harness();
+        Arc::make_mut(&mut session.config)
+            .speech
+            .progress_templates
+            .insert(
+                "lookup".into(),
+                crate::config::ProgressTemplate {
+                    text: "Working.".into(),
+                    minimum_expected_latency_ms: 1,
+                    expire_after_ms: 1,
+                },
+            );
+        session
+            .start_main_task(TurnId::new(), "request".into(), Revision(1))
+            .await
+            .unwrap();
+        let task = session.state.active_task_id.unwrap();
+        let epoch = session.state.epochs.thought;
+        let (tx, mut rx) = mpsc::channel(8);
+        session.speech_tx = tx;
+        session.state.speech = SpeechState::Playing;
+        session
+            .handle_event(VoiceEvent::ToolStarted {
+                meta: session.new_meta(),
+                task_id: task,
+                thought_epoch: epoch,
+                tool: "lookup".into(),
+                args: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.pending_speech.len(), 1);
+        session
+            .handle_event(VoiceEvent::ToolCompleted {
+                meta: session.new_meta(),
+                task_id: task,
+                thought_epoch: epoch,
+                tool: "lookup".into(),
+                success: true,
+                output: String::new(),
+            })
+            .await
+            .unwrap();
+        assert!(session.pending_speech.is_empty());
+        session.state.speech = SpeechState::Playing;
+        session
+            .handle_event(VoiceEvent::ToolStarted {
+                meta: session.new_meta(),
+                task_id: task,
+                thought_epoch: epoch,
+                tool: "lookup".into(),
+                args: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(2)).await;
+        session.state.speech = SpeechState::Silent;
+        session.start_next_speech_if_possible().await.unwrap();
+        assert!(session.pending_speech.is_empty());
+        assert!(rx.try_recv().is_err());
+        session.shutdown_active_work().await;
+    }
 
     #[tokio::test(start_paused = true)]
     async fn partial_commit_rejects_late_audio_before_projection() {
@@ -3216,6 +3511,11 @@ mod tests {
 
     #[test]
     fn expected_answer_type_classifies_assistant_questions() {
+        let analyzer = crate::semantics::text::ConfiguredTextAnalyzer::shared(
+            &crate::config::TurnControlConfig::korean_example(),
+        )
+        .unwrap();
+        let expected_answer_type = |text: &str| analyzer.question(text);
         use crate::interaction::ExpectedAnswerType;
 
         assert_eq!(
@@ -3270,9 +3570,12 @@ mod tests {
         let tts = crate::tts::buffered::BufferedTtsAdapter::new(Arc::new(
             crate::tts::fake::FakeTts::new(24_000, 60, 2),
         ));
-        let config = Arc::new(
-            VoiceRuntimeConfig::from_yaml_str("observability:\n  event_log: false").unwrap(),
-        );
+        let mut config =
+            VoiceRuntimeConfig::from_yaml_str("observability:\n  event_log: false").unwrap();
+        config.turn_control = crate::config::TurnControlConfig::korean_example();
+        config.speech.mode = crate::speech::render::SpeechMode::Legacy;
+        config.speech.hard_stop_ack_text = "네, 멈췄어요.".into();
+        let config = Arc::new(config);
         let (session, _) =
             VoiceSessionBuilder::new(config, sink.clone(), tts, Arc::new(agent)).build();
         session.clock.now_us();

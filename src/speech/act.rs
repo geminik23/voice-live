@@ -33,6 +33,7 @@ pub enum EvidenceKind {
     ToolExecuted,
     AgentFinal,
     ActionCommit,
+    AuthorizedSpeech,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

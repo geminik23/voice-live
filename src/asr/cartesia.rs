@@ -120,12 +120,8 @@ fn validate_config(config: &AsrConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn language(locale: &str) -> anyhow::Result<&'static str> {
-    match locale.trim().to_ascii_lowercase().as_str() {
-        "ko" | "ko-kr" => Ok("ko"),
-        "en" | "en-us" | "en-gb" => Ok("en"),
-        _ => anyhow::bail!("Cartesia ASR supports English and Korean locales"),
-    }
+fn language(locale: &str) -> anyhow::Result<String> {
+    crate::provider::cartesia_selector(locale, true)
 }
 
 #[async_trait]

@@ -156,8 +156,8 @@ enum FinalClone {
     None,
 }
 
-/// Agent used by the demo mock mode: short canned Korean responses that keep
-/// the pipeline observable without any LLM.
+/// Explicit compatibility mock for Korean reservation examples, without an LLM.
+/// Neutral runtime construction does not select this agent implicitly.
 pub struct MockReservationAgent;
 
 #[async_trait]

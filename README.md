@@ -83,6 +83,12 @@ This setup sends microphone audio and conversation text externally and may incur
 
 Hosts can pass `SpeechProviders { asr, tts }` to `VoiceRuntime::build_with_providers` without changing provider-name branches or adding transport dependencies. STT has independent PCM input and transcript output; TTS exposes buffered or native incremental text input with independent audio output. Legacy whole-text TTS can use the bounded buffered bridge. General agent replies still wait for authoritative Final and pass the Claim Gate; this API is not provisional-token speech. See [provider settings and migration](docs/configuration.md#injected-provider-settings-and-migration), [host integration](docs/deployment.md#host-supplied-speech-providers), and [deterministic provider tests](docs/testing.md#duplex-provider-regressions).
 
+## Language-neutral policy and speech authorization
+
+The library does not implicitly install Korean grammar, slot extraction, backchannel text, or failure prompts. Configure application rules/resources or inject a pure `TextAnalyzer`, per-session slot-extractor factory, and trusted `SpeechRenderer` through `RuntimePolicies`. The shipped Korean samples select their resources explicitly; provider selectors do not choose linguistic policy or LLM response language. Cartesia ASR accepts syntax-valid primary language codes and TTS preserves full regional/script selectors, without claiming every model/voice supports them.
+
+The default `speech.mode: strict` accepts bounded proposals and renders only trusted application wording backed by matching domain receipts where required. Existing free-text integrations must explicitly select `legacy`, which retains the older heuristic limitations. This is not a guarantee of arbitrary natural-language truth. See [policy, resources, and migration](docs/configuration.md#text-policy-and-spoken-resources) and [authorization boundaries](docs/architecture.md#claim-gate). The keyless sample still exercises the complete pipeline using an explicit prompt resource and silent mock audio.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) - runtime design and invariants

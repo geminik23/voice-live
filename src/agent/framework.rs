@@ -8,13 +8,11 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, mpsc, watch};
 
-use ai_agents::agent::{
-    Agent, AgentBuilder, AgentResponse, AgentStreamEvent, RuntimeAgent, StreamChunk,
-};
+use ai_agents::agent::{Agent, AgentBuilder, AgentStreamEvent, RuntimeAgent, StreamChunk};
 use ai_agents::hooks::AgentHooks;
 use ai_agents::llm::Role;
 use ai_agents::memory::{InMemoryStore, Memory, MemoryConfig, MemorySnapshot};
-use ai_agents::tools::{Tool, ToolExecutionRecord, ToolResult};
+use ai_agents::tools::Tool;
 
 use crate::agent::{
     AgentTurnRequest, AgentTurnStream, ChannelAgentTurnStream, CognitiveAgent, CognitiveEvent,
@@ -30,86 +28,7 @@ use crate::interaction::{
 use crate::semantics::frame::SemanticFrame;
 use crate::semantics::{SlotOperation, SlotUpdate};
 
-/// Hooks bridge that forwards authoritative tool execution evidence into the
-/// active turn's event channel. A runtime serializes root turns, so a single
-/// bridge slot per agent instance is safe.
-pub struct VoiceAgentHooks {
-    bridge: Mutex<HooksBridge>,
-}
-
-#[derive(Default)]
-struct HooksBridge {
-    tx: Option<mpsc::Sender<CognitiveEvent>>,
-    task_id: Option<TaskId>,
-    thought_epoch: u64,
-}
-
-impl VoiceAgentHooks {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            bridge: Mutex::new(HooksBridge::default()),
-        })
-    }
-
-    fn snapshot(&self) -> (Option<mpsc::Sender<CognitiveEvent>>, Option<TaskId>, u64) {
-        let bridge = self.bridge.lock();
-        (bridge.tx.clone(), bridge.task_id, bridge.thought_epoch)
-    }
-
-    /// Clears the bridge only if it still belongs to `task_id`.
-    ///
-    /// A cancelled turn's spawned task can finish *after* the next turn has
-    /// already installed its own sender. An unconditional reset would then
-    /// silence the live turn's `ToolExecuted` evidence, and a transactional
-    /// claim with no execution record is rejected by the claim gate: a
-    /// reservation that really happened would never be spoken.
-    fn release(&self, task_id: TaskId) {
-        let mut bridge = self.bridge.lock();
-        if bridge.task_id == Some(task_id) {
-            *bridge = HooksBridge::default();
-        }
-    }
-}
-
-impl Default for VoiceAgentHooks {
-    fn default() -> Self {
-        Self {
-            bridge: Mutex::new(HooksBridge::default()),
-        }
-    }
-}
-
-#[async_trait]
-impl AgentHooks for VoiceAgentHooks {
-    async fn on_tool_start(&self, tool: &str, args: &Value) {
-        let (tx, _, _) = self.snapshot();
-        if let Some(tx) = tx {
-            let _ = tx
-                .send(CognitiveEvent::ToolStarted {
-                    tool: tool.to_string(),
-                    args: args.clone(),
-                })
-                .await;
-        }
-    }
-
-    async fn on_tool_complete(&self, _tool: &str, _result: &ToolResult, _duration_ms: u64) {}
-
-    async fn on_tool_execution_record(&self, record: &ToolExecutionRecord) {
-        let (tx, _, _) = self.snapshot();
-        if let Some(tx) = tx {
-            let _ = tx
-                .send(CognitiveEvent::ToolExecuted {
-                    tool: record.canonical_id.clone(),
-                    call_id: record.call_id.clone(),
-                    executed: record.executed,
-                })
-                .await;
-        }
-    }
-
-    async fn on_response(&self, _response: &AgentResponse) {}
-}
+pub use super::proof::VoiceAgentHooks;
 
 /// Runtime context key the adapter sets before every turn. Agent specs render
 /// it as `{{ context.voice.brief }}` and `{{ context.voice.idempotency_key }}`.
@@ -296,13 +215,18 @@ pub struct AiAgentsCognitiveAgent {
     runtime: Arc<RuntimeAgent>,
     hooks: Arc<VoiceAgentHooks>,
     turn_memory: Option<Arc<TurnMemory>>,
+    actor_id: String,
 }
 
 impl AiAgentsCognitiveAgent {
     /// Memory is left entirely to the framework. For side agents whose output
     /// never reaches the user, such as speculative reads.
     pub fn new(runtime: Arc<RuntimeAgent>, hooks: Arc<VoiceAgentHooks>) -> Self {
+        let actor_id = runtime
+            .actor_id()
+            .unwrap_or_else(|| format!("voice-session-{}", uuid::Uuid::new_v4()));
         Self {
+            actor_id,
             runtime,
             hooks,
             turn_memory: None,
@@ -317,7 +241,11 @@ impl AiAgentsCognitiveAgent {
         hooks: Arc<VoiceAgentHooks>,
         memory: Arc<dyn Memory>,
     ) -> Self {
+        let actor_id = runtime
+            .actor_id()
+            .unwrap_or_else(|| format!("voice-session-{}", uuid::Uuid::new_v4()));
         Self {
+            actor_id,
             runtime,
             hooks,
             turn_memory: Some(Arc::new(TurnMemory {
@@ -388,10 +316,10 @@ pub async fn build_runtime_agent_with_memory(
         .await?
         .auto_configure_spawner()
         .await?
-        .hooks(hooks as Arc<dyn AgentHooks>);
+        .hooks(Arc::clone(&hooks) as Arc<dyn AgentHooks>);
 
     for tool in tools {
-        builder = builder.tool(tool);
+        builder = builder.tool(hooks.bind_tool(tool));
     }
 
     if let Some(memory) = memory {
@@ -422,12 +350,12 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
         let (tx, rx) = mpsc::channel::<CognitiveEvent>(256);
         let (finished_tx, finished_rx) = watch::channel(false);
 
-        {
-            let mut bridge = self.hooks.bridge.lock();
-            bridge.tx = Some(tx.clone());
-            bridge.task_id = Some(request.task_id);
-            bridge.thought_epoch = request.thought_epoch;
-        }
+        let origin_token = self
+            .hooks
+            .admit(request.task_id, request.thought_epoch, tx.clone())?;
+        let actor_context = ai_agents::TurnActorContext::new()
+            .with_origin_actor(self.actor_id.clone())
+            .with_sender_agent(origin_token);
 
         let task_id = request.task_id;
 
@@ -447,7 +375,9 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
         let input = request.input;
 
         tokio::spawn(async move {
-            let stream = runtime.chat_stream_events(&input).await;
+            let stream = runtime
+                .chat_stream_events_with_actor_context(&input, actor_context)
+                .await;
 
             let mut stream = match stream {
                 Ok(stream) => stream,
@@ -603,7 +533,7 @@ impl RuntimeInteractionBrain {
 impl InteractionBrain for RuntimeInteractionBrain {
     async fn decide(&self, snapshot: InteractionSnapshot) -> Option<InteractionDecisionEnvelope> {
         let prompt = format!(
-            "Classify the current Korean user speech state and choose one action.\n\
+            "Classify the current user speech state and choose one action.\n\
              Return JSON only: {{\"user_state\": \"...\", \"action\": \"...\", \"confidence\": 0.0}}\n\
              user_state: incomplete, complete, backchannel, interruption, correction, answer, side_speech, noise_or_echo, uncertain\n\
              action: keep_listening, hold_floor, duck, resume, emit_backchannel, take_floor, abort_speech, commit_turn\n\n\
@@ -681,7 +611,7 @@ impl crate::semantics::SlotExtractor for RuntimeSlotExtractor {
         source_revision: Revision,
     ) -> Vec<SlotUpdate> {
         let prompt = format!(
-            "Extract slot updates from Korean speech. Return JSON only:\n\
+            "Extract slot updates from the supplied speech without assuming its language. Return JSON only:\n\
              {{\"updates\": [{{\"slot\": \"date|time|party_size|...\", \"operation\": \"set|replace|clear\", \
              \"old_value\": <optional>, \"new_value\": <value>, \"confidence\": 0.0}}]}}\n\n\
              Previous frame:\n{}\n\nStable transcript:\n{}",

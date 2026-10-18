@@ -83,7 +83,15 @@ async fn injected_runtime(
     asr: Arc<dyn StreamingAsr>,
     tts: Arc<dyn StreamingTts>,
 ) -> anyhow::Result<Arc<VoiceRuntime>> {
-    let config = VoiceRuntimeConfig::from_yaml_str(config)?;
+    let mut config = VoiceRuntimeConfig::from_yaml_str(config)?;
+    config.speech.mock_response = Some("ready".into());
+    config.speech.responses.insert(
+        "ready".into(),
+        voice_live::speech::render::ResponseResource::Prompt {
+            text: "Ready.".into(),
+            question: None,
+        },
+    );
     VoiceRuntime::build_with_providers(config, SpeechProviders { asr, tts }).await
 }
 
@@ -1685,7 +1693,10 @@ tts:
   premade:
     enabled: true
     phrases: ["네"]
+speech:
+  backchannel_text: "네"
 turn_control:
+  incomplete_endings: [그게]
   soft_silence_ms: 100
   hard_silence_ms: 5000
   backchannel:
@@ -1864,12 +1875,11 @@ async fn provisional_chunks_are_never_submitted_as_speech() {
                 text: "provisional text".into(),
             },
         }],
-        "authoritative reply",
+        r#"{"response":"ready"}"#,
     ));
     let (raw_tts, _, texts) = CountingTts::new(1);
     let tts = BufferedTtsAdapter::new(raw_tts);
-    let config =
-        Arc::new(VoiceRuntimeConfig::from_yaml_str("observability:\n  event_log: false").unwrap());
+    let config = Arc::new(VoiceRuntimeConfig::from_yaml_str("observability:\n  event_log: false\nspeech:\n  responses:\n    ready: {kind: prompt, text: authoritative reply}").unwrap());
     let shutdown = CancellationToken::new();
     let (session, handle) = voice_live::VoiceSessionBuilder::new(
         config,

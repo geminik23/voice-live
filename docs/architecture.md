@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the runtime's actual architecture. It stands alone: the original design discussions are private, uncommitted documents, so all necessary information is here.
+This document describes the runtime's actual architecture and current contracts.
 
 ## Overall structure
 
@@ -101,7 +101,7 @@ Logical invalidation ensures correctness even when physical HTTP cancellation is
    Task Agent input begins here. Raw partials never enter durable memory.
 
 2. **Action Commit** (`on_tool_completed`)
-   `action_commit` evidence is created only when a `ToolEffect::TransactionalWrite` tool has both `ToolExecutionRecord.executed = true` and a successful result. Transactional speech cannot pass the Claim Gate without this evidence.
+   Strict speech uses invocation-scoped executor observations plus application validation of the exact business receipt and target. `executed && success` is insufficient. The explicit legacy path retains its older `action_commit` projection from executed/successful tool events, with weaker language-dependent claim classification.
 
 3. **Audible Commit** (`speech/ledger.rs` + agent memory)
    Playback ACKs establish whether each clause was heard (`Heard::Full / Partial / None`). Once all clauses in a reply have settled, the assistant message in that turn's agent memory is replaced with **what was actually heard**. The agent must not assume it delivered words the user did not hear. See “Conversation memory = what was heard” below.
@@ -144,7 +144,7 @@ stale / failure / superseded by the next turn
 
 | Outcome | Assistant text retained in memory |
 |---|---|
-| Fully played | Original generated text unchanged |
+| Fully played | Actual rendered speech; unchanged only when it equals the original Final |
 | Interrupted mid-clause | Heard prefix + `… [중단됨]` |
 | Later clauses not played | Earlier clauses + `[중단됨: 이후 내용은 전달되지 않음]` |
 | Not delivered at all (TTS failure, claim rejection, etc.) | `[응답이 전달되지 않음]` |
@@ -178,7 +178,11 @@ When a state transition regenerates a reply, ai-agents (as tested with 1.0.11) *
 
 ## Claim Gate
 
-Speech is classified into four classes and checked before TTS.
+The default strict path is proposal → trusted host validation/rendering → exact authorized clause → Claim Gate → TTS. A model-provided class, template ID, call ID, or evidence reference is never sufficient. `speech.responses` provides a bounded static renderer; a custom host `SpeechRenderer` can validate domain-specific receipts without adding domain meanings to the core. The original model Final remains the exact memory lookup identity even when only rendered text is heard.
+
+Each rendered clause receives an immutable text/class/speech-ID binding in session evidence. Queue admission and TTS admission both check the binding and expiry. Deliberately surviving queued acts migrate their speech epoch together with that authorization during recovery; changing their meaning or reusing a different act ID cannot reuse the binding. Question hints become interaction state only after confirmed full playback of the associated clause, not after generation or authorization. Interrupted or rejected questions do not publish hints; a committed user turn clears prior question state.
+
+The following class table describes legacy evidence checks and trusted runtime-owned phatic/process acts. Strict factual/transactional clauses instead require the validated renderer binding.
 
 | Class | Required evidence | Example |
 |---|---|---|
@@ -187,7 +191,7 @@ Speech is classified into four classes and checked before TTS.
 | Factual | AgentFinal or ToolCompleted(success) | "토요일 7시엔 두 곳이 가능합니다" |
 | Transactional | ActionCommit(success) | "예약이 완료되었습니다" |
 
-Rejected speech is recorded in the `voice_claim_rejected_total` metric and silently discarded.
+Rejected speech is recorded in the `voice_claim_rejected_total` metric and settled as undelivered. Application-owned phatic resources need no executor proof, but untrusted model prose cannot enter that path. Missing automatic text suppresses only the act, not hard-stop Abort, failure resolution, or queue recovery. A queued process act is retired on tool completion and rechecks start evidence and expiry before TTS.
 
 ## Barge-in: two-stage reversible duck
 
@@ -199,7 +203,7 @@ VAD onset → immediate Duck (gain 0.15, fade 60ms, preserve buffer)
               empty/echo       → ResumeAgent
               correction       → Abort + slot invalidation
               other            → Abort (SemanticInterruption)
-hard stop phrase (e.g. "잠깐") → immediate Abort without classification + spoken "네, 멈췄어요." ACK
+explicit hard stop → immediate Abort; speak an ACK only when configured
 ```
 
 If the user finishes speaking during Duck, playback resumes; for a genuine interruption, the current clause is discarded. On abort, the hard stop ACK (`PRIORITY_HARD_STOP_ACK`) survives in the queue and plays after the user stops. Surviving acts are **retagged with the new speech epoch**; otherwise, the epoch filter discards them after they pass through the queue.
@@ -214,11 +218,11 @@ If the user finishes speaking during Duck, playback resumes; for a genuine inter
 
 However, **a hard stop takes precedence over `Never`**. Continuing to speak after the user explicitly says “그만” is a trap, not a feature.
 
-Note: `"아니"` is deliberately excluded from the hard stop list. It is too common as a discourse marker and is classified as a correction cue; config validation (`VoiceRuntimeConfig::validate`) rejects its inclusion.
+The Korean sample deliberately excludes `"아니"` from its hard-stop list and treats it as a correction cue. Core validation does not prohibit a particular language's word; applications own their vocabulary.
 
-## Korean turn-taking
+## Neutral control and the explicit Korean example
 
-The deterministic reflex policy is primarily responsible for all decisions.
+The deterministic reflex policy owns time/state decisions. A synchronous, pure `TextAnalyzer` supplies advisory user cues and assistant question hints; it owns no I/O, clock, memory, or authorization. With no configured or host-supplied language rules, analysis is unknown/empty, hard silence still commits, and unknown overlap still aborts conservatively. No Korean heuristic or LLM is an implicit fallback. The following behavior belongs to explicitly selected Korean sample resources, not library defaults.
 
 - **Incomplete ending** (ends as-is): `-는데/-고/-면/-다가/그게/...` → KeepListening even past soft silence (prevents premature commit)
 - **Complete ending**: `-해 주세요/-할게요/-인가요?/-됩니다/-해줘`, etc. → commit at soft silence (500ms)
@@ -227,6 +231,18 @@ The deterministic reflex policy is primarily responsible for all decisions.
 - Hard silence (1100ms) always commits as a safety net
 
 `ReflexPolicy::classify_overlap` alone classifies overlap (backchannel / hard stop / correction / self-echo / unknown). `decide_on_tick` only turns that result into an action; it does not reclassify it.
+
+### Invocation proof ownership
+
+The framework adapter supplies a fresh turn-scoped sender token using the published SDK actor-context API, while retaining a stable effective actor identity per adapter/session. `VoiceAgentHooks::bind_tool` reads the immutable sender from the executor context; it never infers turn ownership from arguments or the currently active turn when a record arrives. Built-in registered tools are wrapped automatically. Hosts constructing their own framework agent must bind their tools explicitly; unbound/MCP or otherwise uncorrelated outcomes remain unproven.
+
+Retries and approval-modified arguments retain the admitting turn token. The terminal record supplies canonical operation, logical call ID, source/fallback provenance, actual executed arguments, and outcome flags. Each observation receives its own record ID, so fallback records do not overwrite an original record with the same call ID. Late records for a released origin are dropped rather than reassigned. Tokens and execution keys are retired when the stream finishes/drops, including failure paths. Keys remain until that boundary so repeated terminal observations retain their origin and can be rejected as ambiguous instead of overwriting an earlier result. Model-facing Skip recovery without a matching complete proof cannot authorize a success claim.
+
+The wrapper registers a bounded logical execution key (call ID, canonical operation, source, and executor start identity) under that token before invoking the backend. Retries reuse the request scope; terminal records, including timeout and Skip recovery, resolve that key rather than inferring origin from arguments or optional stream chunks. Canonical terminal events retire queued process speech even when SDK tool-event streaming is disabled or the requested name is an alias.
+
+At most 128 origins and 128 total execution keys are retained per adapter, and 128 records per main turn; speculative records are not admitted to the speech-proof store. Argument and output projections are limited to 16384 bytes each. Identity fields are bounded before event emission or storage (record ID 128 bytes, call/operation IDs 256 bytes, serialized source 1024 bytes). Oversized identity observations produce a bounded invalid marker that invalidates the turn's proof set rather than retaining raw payloads or silently losing conflicts. Oversized/truncated result projections remain unproven. Proof payloads are not included in event logs. The session validates origin/task/epoch before storage and retires snapshots with the owning main turn. The configured renderer requires an unambiguous matching operation/call record, matching executed arguments, explicit business receipt checks, and target bindings. Host renderer code is trusted and must enforce equivalent domain semantics.
+
+Cancellation, timeout, or stream Drop may happen after an external effect but before its receipt is observed. Missing proof means unknown/unproven, not nonexecution or backend rollback. Conversation savepoint rollback does not undo an external effect and is not evidence that retry is safe. No automatic recovery/re-execution is added.
 
 ### Proactive backchannel
 

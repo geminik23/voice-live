@@ -352,6 +352,10 @@ pub struct PremadeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnControlConfig {
+    #[serde(default)]
+    pub text_rules: crate::semantics::text::TextRules,
+    #[serde(default)]
+    pub slot_fallback: SlotFallback,
     #[serde(default = "default_soft_silence_ms")]
     pub soft_silence_ms: u64,
     #[serde(default = "default_hard_silence_ms")]
@@ -362,16 +366,72 @@ pub struct TurnControlConfig {
     pub barge_in: BargeInConfig,
     #[serde(default)]
     pub backchannel: BackchannelConfig,
-    #[serde(default = "default_hard_stop_phrases")]
+    #[serde(default)]
     pub hard_stop_phrases: Vec<String>,
-    #[serde(default = "default_incomplete_endings")]
+    #[serde(default)]
     pub incomplete_endings: Vec<String>,
-    #[serde(default = "default_complete_endings")]
+    #[serde(default)]
     pub complete_endings: Vec<String>,
-    #[serde(default = "default_backchannel_words")]
+    #[serde(default)]
     pub backchannel_words: Vec<String>,
     #[serde(default = "default_answer_min_silence_ms")]
     pub answer_min_silence_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotFallback {
+    #[default]
+    Neutral,
+    KoreanExample,
+}
+
+impl TurnControlConfig {
+    /// Explicit compatibility resources for the Korean reservation example.
+    pub fn korean_example() -> Self {
+        use crate::interaction::ExpectedAnswerType;
+        Self {
+            hard_stop_phrases: default_hard_stop_phrases(),
+            incomplete_endings: default_incomplete_endings(),
+            complete_endings: default_complete_endings(),
+            backchannel_words: default_backchannel_words(),
+            slot_fallback: SlotFallback::KoreanExample,
+            text_rules: crate::semantics::text::TextRules {
+                correction: vec!["말고|아니|바꿔|변경|다시|정정".into()],
+                negation: vec![r"하지\s*마|싫어|필요\s*없|안\s*(돼|되|해)".into()],
+                intents: [
+                    ("reservation".into(), vec!["예약|booking".into()]),
+                    ("search".into(), vec!["찾아|검색".into()]),
+                    ("cancellation".into(), vec!["취소".into()]),
+                ]
+                .into(),
+                entities: [
+                    ("party_size".into(), r"\d{1,2}\s*(명|사람|인분)".into()),
+                    ("time".into(), r"\d{1,2}\s*시|\d{1,2}:\d{2}".into()),
+                    (
+                        "date".into(),
+                        "오늘|내일|모레|주말|[월화수목금토일]요일".into(),
+                    ),
+                ]
+                .into(),
+                questions: vec![
+                    crate::semantics::text::QuestionRule {
+                        pattern: "몇 명".into(),
+                        answer_type: ExpectedAnswerType::Number,
+                    },
+                    crate::semantics::text::QuestionRule {
+                        pattern: "어디|중에".into(),
+                        answer_type: ExpectedAnswerType::Choice,
+                    },
+                    crate::semantics::text::QuestionRule {
+                        pattern: r"\?|할까요|맞나요|드릴까요|하시겠어요|어떠세요|인가요".into(),
+                        answer_type: ExpectedAnswerType::YesNo,
+                    },
+                ],
+            },
+            ..Self::default()
+        }
+    }
 }
 
 fn default_soft_silence_ms() -> u64 {
@@ -628,8 +688,18 @@ impl Default for SpeculativeConfig {
 pub struct SpeechConfig {
     #[serde(default)]
     pub progress_templates: HashMap<String, ProgressTemplate>,
-    #[serde(default = "default_hard_stop_ack")]
+    #[serde(default)]
     pub hard_stop_ack_text: String,
+    #[serde(default)]
+    pub backchannel_text: String,
+    #[serde(default)]
+    pub failure_text: String,
+    #[serde(default)]
+    pub mode: crate::speech::render::SpeechMode,
+    #[serde(default)]
+    pub responses: std::collections::BTreeMap<String, crate::speech::render::ResponseResource>,
+    #[serde(default)]
+    pub mock_response: Option<String>,
     /// How long to wait for a playback acknowledgement before releasing the
     /// speech queue. Speech state only advances on a client ACK, so a
     /// disconnected client would otherwise pin the queue forever. `0` disables.
@@ -643,10 +713,6 @@ pub struct SpeechConfig {
     /// the session summary. Durable history lives in the agent's memory.
     #[serde(default = "default_audible_history_max_clauses")]
     pub audible_history_max_clauses: usize,
-}
-
-fn default_hard_stop_ack() -> String {
-    "네, 멈췄어요.".into()
 }
 
 fn default_playback_ack_timeout_ms() -> u64 {
@@ -865,15 +931,38 @@ impl VoiceRuntimeConfig {
             anyhow::bail!("turn_control.soft_silence_ms must be below hard_silence_ms");
         }
 
-        if self
-            .turn_control
-            .hard_stop_phrases
-            .iter()
-            .any(|p| p.trim() == "아니")
-        {
-            anyhow::bail!(
-                "turn_control.hard_stop_phrases must not contain '아니'; it is a common \
-                 discourse marker and is handled as a correction cue instead"
+        crate::semantics::text::validate_rules(&self.turn_control)?;
+        crate::speech::render::ConfiguredRenderer::new(&self.speech.responses)?;
+        if let Some(name) = &self.speech.mock_response {
+            anyhow::ensure!(
+                matches!(
+                    self.speech.responses.get(name),
+                    Some(crate::speech::render::ResponseResource::Prompt { .. })
+                ),
+                "speech.mock_response must name a configured prompt resource"
+            );
+        }
+        for text in [
+            &self.speech.hard_stop_ack_text,
+            &self.speech.backchannel_text,
+            &self.speech.failure_text,
+        ] {
+            anyhow::ensure!(
+                text.len() <= 4096,
+                "automatic speech resource exceeds 4096 bytes"
+            );
+        }
+        anyhow::ensure!(
+            self.speech.progress_templates.len() <= 128,
+            "too many progress templates"
+        );
+        for template in self.speech.progress_templates.values() {
+            anyhow::ensure!(
+                !template.text.trim().is_empty()
+                    && template.text.len() <= 4096
+                    && template.expire_after_ms > 0
+                    && template.expire_after_ms <= u64::MAX / 1000,
+                "invalid progress resource or expiry"
             );
         }
 
@@ -958,17 +1047,23 @@ agents:
     }
 
     #[test]
-    fn rejects_common_discourse_marker_as_hard_stop() {
-        let error = VoiceRuntimeConfig::from_yaml_str(
+    fn core_accepts_host_owned_stop_vocabulary() {
+        let config = VoiceRuntimeConfig::from_yaml_str(
             r#"
 version: 1
 turn_control:
   hard_stop_phrases: ["아니"]
 "#,
         )
-        .expect_err("아니 must not be an immediate abort phrase");
+        .expect("the host owns stop vocabulary");
 
-        assert!(error.to_string().contains("아니"));
+        assert_eq!(config.turn_control.hard_stop_phrases, ["아니"]);
+        assert!(
+            !TurnControlConfig::korean_example()
+                .hard_stop_phrases
+                .iter()
+                .any(|p| p == "아니")
+        );
     }
 
     #[test]

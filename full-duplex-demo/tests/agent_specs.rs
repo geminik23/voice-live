@@ -23,14 +23,20 @@ fn sample_config() -> VoiceRuntimeConfig {
         .expect("sample config parses")
 }
 
-fn runtime_with_mock(spec: &std::path::Path, reply: &str) -> (RuntimeAgent, MockLLMProvider) {
+fn runtime_with_mock(
+    spec: &std::path::Path,
+    reply: &str,
+    tools: Vec<Arc<dyn ai_agents::tools::Tool>>,
+) -> (RuntimeAgent, MockLLMProvider) {
     let mut mock = MockLLMProvider::new("mock");
     mock.set_responses(vec![reply.to_string()], true);
-    let runtime = AgentBuilder::from_yaml_file(spec)
+    let mut builder = AgentBuilder::from_yaml_file(spec)
         .expect("spec parses")
-        .llm(Arc::new(mock.clone()))
-        .build()
-        .expect("spec builds with a mock LLM");
+        .llm(Arc::new(mock.clone()));
+    for tool in tools {
+        builder = builder.tool(tool);
+    }
+    let runtime = builder.build().expect("spec builds with a mock LLM");
     (runtime, mock)
 }
 
@@ -40,7 +46,7 @@ fn runtime_with_mock(spec: &std::path::Path, reply: &str) -> (RuntimeAgent, Mock
 #[tokio::test]
 async fn deep_worker_spec_runs_without_voice_context() {
     let spec = sample_config().agents.deep.spec.expect("deep worker spec");
-    let (runtime, mock) = runtime_with_mock(&spec, "강남 주차 가능 매장 2곳 확인");
+    let (runtime, mock) = runtime_with_mock(&spec, "강남 주차 가능 매장 2곳 확인", Vec::new());
 
     let worker = RuntimeDeepWorker::new(Arc::new(runtime));
     let result = worker
@@ -63,7 +69,13 @@ async fn deep_worker_spec_runs_without_voice_context() {
 #[tokio::test]
 async fn task_agent_spec_rejects_a_turn_without_voice_context() {
     let spec = sample_config().agents.task.spec.expect("task agent spec");
-    let (runtime, mock) = runtime_with_mock(&spec, "unused");
+    let (runtime, mock) = runtime_with_mock(
+        &spec,
+        "unused",
+        voice_live::tools::reservation::task_tools(
+            voice_live::tools::reservation::ReservationStore::demo(),
+        ),
+    );
 
     let error = runtime
         .chat("토요일 저녁 7시로 예약해줘")

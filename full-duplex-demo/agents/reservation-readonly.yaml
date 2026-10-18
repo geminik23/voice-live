@@ -1,6 +1,7 @@
 name: KoreanReservationReadOnlyAgent
 version: "0.1.0"
 description: Read-only speculative reservation availability agent.
+tools: [search_availability]
 
 system_prompt: |
   You are a read-only Korean reservation availability worker.

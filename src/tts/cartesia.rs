@@ -116,12 +116,8 @@ fn validate_rate(rate: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn language(value: &str) -> anyhow::Result<&'static str> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "ko" | "ko-kr" | "korean" => Ok("ko"),
-        "en" | "en-us" | "en-gb" | "english" => Ok("en"),
-        _ => anyhow::bail!("Cartesia TTS supports English and Korean session languages"),
-    }
+fn language(value: &str) -> anyhow::Result<String> {
+    crate::provider::cartesia_selector(value, false)
 }
 
 #[async_trait]

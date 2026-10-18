@@ -101,6 +101,7 @@ fn event_clock(event: &VoiceEvent) -> (u64, String) {
         VoiceEvent::ToolStarted { meta, .. } => meta,
         VoiceEvent::ToolCompleted { meta, .. } => meta,
         VoiceEvent::ToolExecuted { meta, .. } => meta,
+        VoiceEvent::InvocationProof { meta, .. } => meta,
         VoiceEvent::TtsAudioChunk { meta, .. } => meta,
         VoiceEvent::TtsAudioDone { meta, .. } => meta,
         VoiceEvent::TtsFailed { meta, .. } => meta,

@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::CognitiveAgent;
-use crate::agent::mock::MockReservationAgent;
+use crate::agent::mock::FakeAgent;
 use crate::asr::cartesia::CartesiaStreamingAsr;
 use crate::asr::fake::MockAsr;
 use crate::asr::inject::InjectionQueue;
@@ -85,22 +85,43 @@ pub struct VoiceRuntime {
     asr: Arc<dyn StreamingAsr>,
     tts: Arc<dyn StreamingTts>,
     brains: BrainProvider,
+    policies: RuntimePolicies,
     metrics: Arc<crate::metrics::Metrics>,
     sessions: Mutex<HashMap<crate::ids::SessionId, SessionEntry>>,
 }
 
-/// Externally supplied speech factories for
-/// [`VoiceRuntime::build_with_providers`].
-///
-/// This carries only speech providers; agents, transport, and tool backends
-/// keep their own wiring, so it never grows into a general dependency
-/// container.
+/// Host overrides are independent of provider names and applied before configured fallbacks.
+#[derive(Default)]
+pub struct RuntimePolicies {
+    pub text_analyzer: Option<Arc<dyn crate::semantics::text::TextAnalyzer>>,
+    pub slot_extractor: Option<Arc<dyn Fn() -> Arc<dyn SlotExtractor> + Send + Sync>>,
+    pub speech_renderer: Option<Arc<dyn crate::speech::render::SpeechRenderer>>,
+}
+
+/// Externally supplied speech factories for [`VoiceRuntime::build_with_providers`].
+/// Agents, linguistic policies, transport, and tool backends keep their own wiring.
 pub struct SpeechProviders {
     pub asr: Arc<dyn StreamingAsr>,
     pub tts: Arc<dyn StreamingTts>,
 }
 
 impl VoiceRuntime {
+    /// Applies explicit host policies before any session is created, with built-in or injected speech factories.
+    pub async fn build_with_policies(
+        config: VoiceRuntimeConfig,
+        providers: Option<SpeechProviders>,
+        policies: RuntimePolicies,
+    ) -> anyhow::Result<Arc<Self>> {
+        let mut runtime = match providers {
+            Some(providers) => Self::build_with_providers(config, providers).await?,
+            None => Self::build(config).await?,
+        };
+        Arc::get_mut(&mut runtime)
+            .expect("unpublished runtime")
+            .policies = policies;
+        Ok(runtime)
+    }
+
     pub async fn build(config: VoiceRuntimeConfig) -> anyhow::Result<Arc<Self>> {
         Self::build_from_arc(Arc::new(config)).await
     }
@@ -223,6 +244,7 @@ impl VoiceRuntime {
             asr,
             tts,
             brains,
+            policies: RuntimePolicies::default(),
             metrics: Metrics::new(),
             sessions: Mutex::new(HashMap::new()),
             config,
@@ -312,6 +334,16 @@ impl VoiceRuntime {
         .with_trace(trace_tx)
         .with_shutdown(shutdown.clone());
 
+        if let Some(analyzer) = &self.policies.text_analyzer {
+            builder = builder.with_text_analyzer(Arc::clone(analyzer));
+        }
+        if let Some(factory) = &self.policies.slot_extractor {
+            builder = builder.with_slot_extractor(factory());
+        }
+        if let Some(renderer) = &self.policies.speech_renderer {
+            builder = builder.with_speech_renderer(Arc::clone(renderer));
+        }
+
         if let Some(speculative_agent) = brains.speculative_agent {
             builder = builder.with_speculative_agent(speculative_agent);
         }
@@ -320,7 +352,7 @@ impl VoiceRuntime {
             builder = builder.with_deep_worker(deep_worker);
         }
 
-        let (session, session_handle_internal) = builder.build();
+        let (session, session_handle_internal) = builder.try_build()?;
 
         let event_tx_for_media = session_handle_internal.event_tx.clone();
 
@@ -568,10 +600,19 @@ impl BrainProvider {
     async fn create(&self) -> anyhow::Result<SessionBrains> {
         match &self.mode {
             BrainMode::Mock => Ok(SessionBrains {
-                task_agent: Arc::new(MockReservationAgent),
+                task_agent: Arc::new(FakeAgent::finalizing(
+                    self.config
+                        .speech
+                        .mock_response
+                        .as_ref()
+                        .map(|response| serde_json::json!({"response": response}).to_string())
+                        .unwrap_or_default(),
+                )),
                 speculative_agent: None,
                 interaction_brain: Arc::new(NoopInteractionBrain),
-                slot_extractor: Arc::new(crate::semantics::extractor::HeuristicKoreanSlotExtractor),
+                slot_extractor: crate::semantics::extractor::configured_fallback(
+                    &self.config.turn_control,
+                ),
                 deep_worker: None,
             }),
 
@@ -673,8 +714,8 @@ async fn build_framework_brains(
                 let extractor: Arc<dyn SlotExtractor> = match extractor_runtime {
                     Ok(runtime) => Arc::new(RuntimeSlotExtractor::new(runtime)),
                     Err(error) => {
-                        tracing::warn!(%error, "slot extractor unavailable; using heuristics");
-                        Arc::new(crate::semantics::extractor::HeuristicKoreanSlotExtractor)
+                        tracing::warn!(%error, "slot extractor unavailable; using configured fallback");
+                        crate::semantics::extractor::configured_fallback(&config.turn_control)
                     }
                 };
 
@@ -682,7 +723,7 @@ async fn build_framework_brains(
             }
             _ => (
                 Arc::new(NoopInteractionBrain),
-                Arc::new(crate::semantics::extractor::HeuristicKoreanSlotExtractor),
+                crate::semantics::extractor::configured_fallback(&config.turn_control),
             ),
         };
 

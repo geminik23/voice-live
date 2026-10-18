@@ -13,6 +13,26 @@ pub trait SlotExtractor: Send + Sync {
     ) -> Vec<SlotUpdate>;
 }
 
+pub struct NoopSlotExtractor;
+
+#[async_trait]
+impl SlotExtractor for NoopSlotExtractor {
+    async fn extract(&self, _: &SemanticFrame, _: &str, _: Revision) -> Vec<SlotUpdate> {
+        Vec::new()
+    }
+}
+
+pub fn configured_fallback(
+    config: &crate::config::TurnControlConfig,
+) -> std::sync::Arc<dyn SlotExtractor> {
+    match config.slot_fallback {
+        crate::config::SlotFallback::Neutral => std::sync::Arc::new(NoopSlotExtractor),
+        crate::config::SlotFallback::KoreanExample => {
+            std::sync::Arc::new(HeuristicKoreanSlotExtractor)
+        }
+    }
+}
+
 /// Deterministic Korean slot extractor for dates, times, party size, and
 /// replacement corrections, all without any model call.
 pub struct HeuristicKoreanSlotExtractor;

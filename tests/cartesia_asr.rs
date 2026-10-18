@@ -1024,7 +1024,7 @@ fn factory_validation_rejects_unsupported_or_unsafe_settings_without_secrets() {
             ..base.clone()
         },
         AsrConfig {
-            locale: "fr".into(),
+            locale: "fr&language=en".into(),
             ..base.clone()
         },
         AsrConfig {
@@ -1057,7 +1057,7 @@ async fn open_rejects_incompatible_session_options_before_network_io() {
             ..session_config()
         },
         AsrSessionConfig {
-            locale: "fr".into(),
+            locale: "fr--CA".into(),
             ..session_config()
         },
     ] {

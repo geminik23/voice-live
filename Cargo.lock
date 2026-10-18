@@ -2885,6 +2885,7 @@ dependencies = [
  "hound",
  "parking_lot",
  "regex",
+ "regex-syntax",
  "rubato",
  "rustls",
  "serde",

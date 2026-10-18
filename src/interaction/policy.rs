@@ -5,8 +5,15 @@ use crate::session::view::SessionView;
 /// Deterministic reflex controller. It answers every case it can prove from
 /// text and timing alone; uncertain cases return None and escalate to the
 /// interaction brain.
-#[derive(Debug, Default)]
-pub struct ReflexPolicy;
+pub struct ReflexPolicy {
+    analyzer: std::sync::Arc<dyn crate::semantics::text::TextAnalyzer>,
+}
+
+impl Default for ReflexPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlapOutcome {
@@ -20,65 +27,47 @@ pub enum OverlapOutcome {
 
 impl ReflexPolicy {
     pub fn new() -> Self {
-        Self
+        Self::with_analyzer(
+            crate::semantics::text::ConfiguredTextAnalyzer::shared(&TurnControlConfig::default())
+                .expect("neutral rules"),
+        )
     }
 
-    pub fn is_backchannel_word(&self, text: &str, config: &TurnControlConfig) -> bool {
-        let normalized = normalize_words(text);
-        if normalized.chars().count() > 6 {
-            return false;
-        }
+    pub fn with_analyzer(
+        analyzer: std::sync::Arc<dyn crate::semantics::text::TextAnalyzer>,
+    ) -> Self {
+        Self { analyzer }
+    }
 
-        config
-            .backchannel_words
+    pub fn from_config(config: &TurnControlConfig) -> Self {
+        Self::with_analyzer(
+            crate::semantics::text::ConfiguredTextAnalyzer::shared(config)
+                .expect("validated text rules"),
+        )
+    }
+
+    pub fn is_backchannel_word(&self, text: &str, _: &TurnControlConfig) -> bool {
+        self.analyzer.user(text).backchannel
+    }
+    pub fn is_hard_stop(&self, text: &str, _: &TurnControlConfig) -> bool {
+        self.analyzer
+            .user(text)
+            .cues
             .iter()
-            .any(|word| normalize_words(word) == normalized)
+            .any(|cue| matches!(cue, crate::semantics::SemanticCue::HardStop { .. }))
     }
-
-    pub fn is_hard_stop(&self, text: &str, config: &TurnControlConfig) -> bool {
-        let normalized = normalize_words(text);
-        config
-            .hard_stop_phrases
-            .iter()
-            .any(|phrase| normalized.contains(&normalize_words(phrase)))
-    }
-
     pub fn is_correction(&self, text: &str) -> bool {
-        let normalized = normalize_words(text);
-        normalized.contains("말고")
-            || normalized.contains("아니")
-            || normalized.contains("바꿔")
-            || normalized.contains("정정")
-            || normalized.contains("다시")
+        self.analyzer
+            .user(text)
+            .cues
+            .iter()
+            .any(|cue| matches!(cue, crate::semantics::SemanticCue::Correction { .. }))
     }
-
-    pub fn ends_incomplete(&self, text: &str, config: &TurnControlConfig) -> bool {
-        let raw = text.trim_end();
-        let normalized = normalize_words(raw);
-        config.incomplete_endings.iter().any(|ending| {
-            let normalized_ending = normalize_words(ending);
-            if normalized_ending.is_empty() {
-                // Punctuation-only endings such as "..." match on the raw
-                // tail. Matching an empty pattern would classify every
-                // utterance as incomplete.
-                !ending.trim().is_empty() && raw.ends_with(ending.trim())
-            } else {
-                normalized.ends_with(&normalized_ending)
-            }
-        })
+    pub fn ends_incomplete(&self, text: &str, _: &TurnControlConfig) -> bool {
+        self.analyzer.user(text).incomplete
     }
-
-    pub fn ends_complete(&self, text: &str, config: &TurnControlConfig) -> bool {
-        let raw = text.trim_end();
-        let normalized = normalize_words(raw);
-        config.complete_endings.iter().any(|ending| {
-            let normalized_ending = normalize_words(ending);
-            if normalized_ending.is_empty() {
-                !ending.trim().is_empty() && raw.ends_with(ending.trim())
-            } else {
-                normalized.ends_with(&normalized_ending)
-            }
-        })
+    pub fn ends_complete(&self, text: &str, _: &TurnControlConfig) -> bool {
+        self.analyzer.user(text).complete
     }
 
     /// Classifies overlapping user speech while the assistant is speaking.
@@ -92,12 +81,12 @@ impl ReflexPolicy {
         config: &TurnControlConfig,
         echo: &crate::config::EchoConfig,
     ) -> OverlapOutcome {
-        if self.is_backchannel_word(hypothesis, config) {
-            return OverlapOutcome::Backchannel;
-        }
-
         if self.is_hard_stop(hypothesis, config) {
             return OverlapOutcome::Interruption;
+        }
+
+        if self.is_backchannel_word(hypothesis, config) {
+            return OverlapOutcome::Backchannel;
         }
 
         if self.is_correction(hypothesis) {
@@ -272,7 +261,7 @@ mod tests {
     use crate::interaction::{FloorState, InteractionAction, SpeechState, UserSpeechState};
 
     fn config() -> TurnControlConfig {
-        TurnControlConfig::default()
+        TurnControlConfig::korean_example()
     }
 
     fn echo() -> crate::config::EchoConfig {
@@ -287,7 +276,7 @@ mod tests {
 
     #[test]
     fn backchannel_word_after_explanation() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
 
         assert!(policy.is_backchannel_word("네", &cfg));
@@ -297,7 +286,7 @@ mod tests {
 
     #[test]
     fn hard_stop_is_detected() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
 
         assert!(policy.is_hard_stop("잠깐, 예약하지 마", &cfg));
@@ -307,7 +296,7 @@ mod tests {
 
     #[test]
     fn punctuation_only_endings_do_not_make_everything_incomplete() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
 
         // The "..." pattern must not reduce to an always-true suffix match.
@@ -318,7 +307,7 @@ mod tests {
 
     #[test]
     fn korean_endings_control_commit() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
 
         assert!(policy.ends_incomplete("저는 이번 주말에 가볼 만한 곳을 찾고 있는데", &cfg));
@@ -328,7 +317,7 @@ mod tests {
 
     #[test]
     fn question_short_answer_commits() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
         let now = 100_000_000;
 
@@ -346,7 +335,7 @@ mod tests {
 
     #[test]
     fn incomplete_ending_waits_past_soft_silence() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
         let now = 100_000_000;
 
@@ -361,7 +350,7 @@ mod tests {
 
     #[test]
     fn hard_silence_commits_anyway() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
         let now = 100_000_000;
 
@@ -377,7 +366,7 @@ mod tests {
 
     #[test]
     fn overlap_backchannel_resumes() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
         let now = 100_000_000;
 
@@ -395,7 +384,7 @@ mod tests {
 
     #[test]
     fn overlap_interruption_aborts() {
-        let policy = ReflexPolicy::new();
+        let policy = ReflexPolicy::from_config(&config());
         let cfg = config();
         let now = 100_000_000;
 

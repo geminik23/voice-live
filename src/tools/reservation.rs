@@ -23,6 +23,7 @@ pub struct RestaurantOption {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReservationRecord {
+    pub status: String,
     pub confirmation_id: String,
     pub restaurant_id: String,
     pub date: String,
@@ -150,6 +151,7 @@ impl Tool for SearchAvailabilityTool {
 
         ToolResult::ok(
             serde_json::to_string(&json!({
+                "status": "searched",
                 "date": args.get("date").cloned().unwrap_or(Value::Null),
                 "time": time,
                 "party_size": party_size,
@@ -268,6 +270,7 @@ impl Tool for ReserveRestaurantTool {
         }
 
         let record = ReservationRecord {
+            status: "committed".into(),
             confirmation_id: format!("DEMO-{}", uuid::Uuid::new_v4().simple()),
             restaurant_id,
             date,

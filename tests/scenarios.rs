@@ -8,7 +8,19 @@ macro_rules! scenario_test {
     ($name:ident, $yaml:expr) => {
         #[tokio::test(start_paused = true)]
         async fn $name() {
-            let scenario: Scenario = ScenarioRunner::load_yaml($yaml).expect("scenario parses");
+            let mut scenario: Scenario = ScenarioRunner::load_yaml($yaml).expect("scenario parses");
+            let mut config = scenario.config.take().unwrap_or_default();
+            let korean = voice_live::config::TurnControlConfig::korean_example();
+            config.turn_control.text_rules = korean.text_rules;
+            config.turn_control.slot_fallback = korean.slot_fallback;
+            config.turn_control.hard_stop_phrases = korean.hard_stop_phrases;
+            config.turn_control.complete_endings = korean.complete_endings;
+            config.turn_control.incomplete_endings = korean.incomplete_endings;
+            config.turn_control.backchannel_words = korean.backchannel_words;
+            config.speech.mode = voice_live::speech::render::SpeechMode::Legacy;
+            config.speech.hard_stop_ack_text = "네, 멈췄어요.".into();
+            config.speech.backchannel_text = "네".into();
+            scenario.config = Some(config);
             let report = ScenarioRunner::run(&scenario).await;
 
             if !report.passed {

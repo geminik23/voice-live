@@ -59,8 +59,59 @@ impl ProviderSessionControl for OwnedProviderTasks {
     }
 }
 
+pub(crate) fn cartesia_selector(value: &str, primary_only: bool) -> anyhow::Result<String> {
+    let value = value.trim();
+    anyhow::ensure!(
+        !value.is_empty() && value.len() <= 63,
+        "language selector must contain 1 to 63 bytes"
+    );
+    let normalized = match value.to_ascii_lowercase().as_str() {
+        "korean" => "ko".to_owned(),
+        "english" => "en".to_owned(),
+        _ => value.replace('_', "-"),
+    };
+    let mut parts = normalized.split('-');
+    let primary = parts.next().expect("nonempty selector");
+    anyhow::ensure!(
+        (2..=8).contains(&primary.len())
+            && primary.bytes().all(|b| b.is_ascii_alphabetic())
+            && !primary.eq_ignore_ascii_case("auto"),
+        "invalid primary language selector"
+    );
+    anyhow::ensure!(
+        parts
+            .all(|p| !p.is_empty() && p.len() <= 8 && p.bytes().all(|b| b.is_ascii_alphanumeric())),
+        "invalid language subtag"
+    );
+    Ok(if primary_only {
+        primary.to_ascii_lowercase()
+    } else {
+        normalized
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selectors_are_syntax_not_a_language_registry() {
+        for (input, primary, full) in [
+            ("fr-CA", "fr", "fr-CA"),
+            ("pt-BR", "pt", "pt-BR"),
+            ("zh-Hant-TW", "zh", "zh-Hant-TW"),
+            ("yue", "yue", "yue"),
+            ("haw", "haw", "haw"),
+            ("zz_ZZ", "zz", "zz-ZZ"),
+            ("English", "en", "en"),
+        ] {
+            assert_eq!(super::cartesia_selector(input, true).unwrap(), primary);
+            assert_eq!(super::cartesia_selector(input, false).unwrap(), full);
+        }
+        for input in [
+            "", " ", "auto", "-fr", "fr-", "fr--CA", "en&x=y", "en?x", "en\nUS", "a",
+        ] {
+            assert!(super::cartesia_selector(input, false).is_err(), "{input:?}");
+        }
+    }
     #[test]
     fn websocket_tls_can_select_a_crypto_provider() {
         let _builder = rustls::ClientConfig::builder();

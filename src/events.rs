@@ -26,6 +26,12 @@ pub struct SlotProvenance {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum VoiceEvent {
+    InvocationProof {
+        meta: EventMeta,
+        task_id: TaskId,
+        thought_epoch: u64,
+        proof: crate::speech::render::InvocationProof,
+    },
     LocalSpeechStarted {
         meta: EventMeta,
         vad_probability: f32,
@@ -240,6 +246,7 @@ pub struct SessionSummary {
 impl VoiceEvent {
     pub fn kind(&self) -> &'static str {
         match self {
+            VoiceEvent::InvocationProof { .. } => "invocation_proof",
             VoiceEvent::LocalSpeechStarted { .. } => "local_speech_started",
             VoiceEvent::LocalSpeechEnded { .. } => "local_speech_ended",
             VoiceEvent::AsrPartial { .. } => "asr_partial",

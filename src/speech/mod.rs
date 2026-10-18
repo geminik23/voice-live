@@ -1,6 +1,7 @@
 pub mod act;
 pub mod claim_gate;
 pub mod ledger;
+pub mod render;
 
 pub use act::{
     ClaimClass, EvidenceKind, EvidenceRef, Interruptibility, PRIORITY_BACKCHANNEL,

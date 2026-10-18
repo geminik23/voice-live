@@ -585,6 +585,7 @@ fn event_meta_us(event: &VoiceEvent) -> u64 {
         VoiceEvent::ToolStarted { meta, .. } => meta.monotonic_us,
         VoiceEvent::ToolCompleted { meta, .. } => meta.monotonic_us,
         VoiceEvent::ToolExecuted { meta, .. } => meta.monotonic_us,
+        VoiceEvent::InvocationProof { meta, .. } => meta.monotonic_us,
         VoiceEvent::TtsAudioChunk { meta, .. } => meta.monotonic_us,
         VoiceEvent::TtsAudioDone { meta, .. } => meta.monotonic_us,
         VoiceEvent::TtsFailed { meta, .. } => meta.monotonic_us,

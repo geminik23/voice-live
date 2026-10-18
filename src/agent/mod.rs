@@ -47,6 +47,11 @@ pub enum TurnResolution {
 
 #[derive(Debug, Clone)]
 pub enum CognitiveEvent {
+    InvocationProof {
+        task_id: TaskId,
+        thought_epoch: u64,
+        proof: crate::speech::render::InvocationProof,
+    },
     Started,
     Content {
         text: String,
@@ -124,3 +129,5 @@ pub mod mock;
 
 #[cfg(feature = "framework")]
 pub mod framework;
+#[cfg(feature = "framework")]
+mod proof;

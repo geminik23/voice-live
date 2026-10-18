@@ -1,6 +1,6 @@
 # Configuration reference (voice-runtime.yaml)
 
-All fields are optional and use defaults when omitted. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
+All fields are optional and use defaults when omitted. The YAML below illustrates the Korean demo, not the library's neutral linguistic defaults. In a minimal configuration, text rules and automatic speech resources are empty and `speech.mode` is `strict`; provide explicit resources or host policies to speak. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
 
 ```yaml
 version: 1
@@ -69,7 +69,7 @@ turn_control:
     minimum_interval_ms: 2500
     maximum_per_user_turn: 2
   hard_stop_phrases: [잠깐, 그만, 멈춰, 취소, ...]
-    # validate() rejects the config if it includes "아니"
+    # This example deliberately omits the common discourse marker "아니".
   incomplete_endings: [는데, 고, 면, 다가, 그게, ...]
   complete_endings: [해 주세요, 할게요, 인가요, 됩니다, 해줘, ...]
   backchannel_words: [네, 응, 어, 아, 음, 그렇군요, ...]
@@ -152,7 +152,7 @@ When `allow_text_injection` is enabled, the runtime owns a per-session injection
 | `inject` (ASR) | Development text injection: the browser text box acts as the user's utterance | `dev.allow_text_injection` |
 | `together` (ASR) | Live streaming recognition | `TOGETHER_API_KEY` |
 | `qwen` (TTS) | Live speech synthesis | `DASHSCOPE_API_KEY`, `QWEN_VOICE_ID` (or `tts.voice`) |
-| `cartesia` (ASR) | Ink Whisper manual streaming recognition | Explicit Cartesia endpoint/model/env; English or Korean, 16 kHz, `manual_commit: true`, `CARTESIA_API_KEY` |
+| `cartesia` (ASR) | Ink Whisper manual streaming recognition | Explicit Cartesia endpoint/model/env; provider-supported language selector, 16 kHz, `manual_commit: true`, `CARTESIA_API_KEY` |
 | `cartesia` (TTS) | Native incremental Sonic synthesis | Explicit Cartesia endpoint/model/env settings; `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID` (or `tts.voice`) |
 
 Unknown provider names fail the built-in runtime build; they do not silently fall back to `mock`. The injected builder uses the host's factories instead of resolving these names.
@@ -161,7 +161,7 @@ Validate each real provider with its individual ignored contract only after cred
 
 ## Cartesia STT
 
-Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together. Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, locale `ko-KR`, and `audio.input_sample_rate_hz: 16000`. Korean `ko`/`ko-KR` is normalized to `ko`; English `en`/`en-US`/`en-GB` is normalized to `en` and sent from the session locale. Other models, locales, rates, or automatic commit are rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
+Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together. Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, locale `ko-KR`, and `audio.input_sample_rate_hz: 16000`. The session selector is normalized to a primary language code, for example `fr-CA → fr`, `zh-Hant-TW → zh`, and `yue → yue`. There is no runtime language-membership allowlist. Unsupported model, rate, or automatic commit settings are still rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
 
 | Key | Default | Validation and use |
 |---|---:|---|
@@ -184,7 +184,7 @@ Confirmed transcript deltas append verbatim; mutable tails replace, never append
 
 The full Cartesia sample selects both providers. `full-duplex-demo/configs/voice-runtime.cartesia-tts.yaml` remains available for typed input plus Cartesia TTS diagnosis. The keyless default sample remains inject ASR plus mock TTS.
 
-Set all provider-specific common fields explicitly: `tts.provider: cartesia`, endpoint `wss://api.cartesia.ai/tts/websocket`, model `sonic-3.6`, `api_key_env: CARTESIA_API_KEY`, `voice_env: CARTESIA_VOICE_ID`, language `ko`, and rate `24000`. Changing just the provider name keeps the Qwen defaults and is not a supported migration. The factory accepts `sonic-3.6`, `sonic-3.5`, `sonic-3`, and `sonic-latest`; model aliases and account/voice availability still require paid validation. Session language accepts `ko`, `ko-KR`, and `Korean`, normalized to `ko`, or `en`, `en-US`, `en-GB`, and `English`, normalized to `en`. Other languages are rejected rather than silently falling back. This provider-level support does not adapt the demo agent prompts or turn-taking policy.
+Set all provider-specific common fields explicitly: `tts.provider: cartesia`, endpoint `wss://api.cartesia.ai/tts/websocket`, model `sonic-3.6`, `api_key_env: CARTESIA_API_KEY`, `voice_env: CARTESIA_VOICE_ID`, language `ko`, and rate `24000`. Changing just the provider name keeps the Qwen defaults and is not a supported migration. The factory accepts `sonic-3.6`, `sonic-3.5`, `sonic-3`, and `sonic-latest`; model aliases and account/voice availability still require paid validation. Session language preserves the full selector, including region/script subtags such as `en-GB`, `fr-CA`, and `zh-Hant-TW`. Only historical word aliases `Korean → ko` and `English → en` are rewritten. This changes earlier `en-GB → en` and `ko-KR → ko` wire behavior and can affect pronunciation or provider compatibility. Code admission does not establish model/voice support or adapt agent prompts and text policies.
 
 | Key | Default | Validation and use |
 |---|---|---|
@@ -199,7 +199,47 @@ The dedicated sample disables premade warmup and uses the reservation task spec.
 
 ## Language scope
 
-The project is a full-duplex voice runtime, not a single-language product. Its current defaults and demo are language-specific: the ASR locale is `ko-KR`, the agent prompts and deterministic speech cues use Korean, and runtime TTS requests use `tts.language` (default `Korean`). Changing only `asr.locale` does not adapt these other components. Using English or another language requires suitable provider models and voices, adapted prompts and policies, and verification of the TTS request language and transactional claim classification. These implementation defaults should not be confused with the project's purpose, and multilingual end-to-end behavior has not been validated.
+The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The shipped Korean reservation examples explicitly configure these resources. ASR locale (`ko-KR`) and TTS language (`Korean`) remain independent provider defaults, not supported-language restrictions or LLM response-language instructions. Agent/application instructions own the response language. Unknown text analysis yields no advisory signals; hard-silence and conservative overlap control still operate without an LLM. Multilingual end-to-end quality remains unverified.
+
+Cartesia selectors are trimmed, limited to 63 ASCII bytes, and accept a 2–8 letter primary subtag followed by nonempty 1–8 alphanumeric subtags separated by `-`. `_` is accepted as a separator alias. Empty values, `auto`, malformed separators, control characters, and query delimiters are rejected. ASR lowercases the primary code; TTS retains the selector's case and region/script content. Factory and session validation use the same resolver. Together retains its encoded full locale and Qwen its provider-native language string. No discovery, language detection, translation, or silent provider/model fallback is performed.
+
+## Text policy and spoken resources
+
+Library text-rule collections are empty by default. Configure `turn_control.hard_stop_phrases`, `backchannel_words`, `complete_endings`, and `incomplete_endings` explicitly; they are literals, not regexes. Hard-stop literals use case-insensitive substring matching without stripping punctuation. Backchannels use case folding and collapsed whitespace, ignoring trailing ASCII sentence punctuation, with no six-character cutoff. Endings use folded suffix matching with trailing sentence punctuation removed; punctuation-only endings match the raw tail. Incomplete endings take precedence over complete endings. Explicit hard stop takes precedence over backchannel and correction; unknown overlap still aborts conservatively.
+
+| Key | Library default | Contract |
+|---|---|---|
+| `turn_control.text_rules.correction` | `[]` | Regex list producing advisory Correction cues |
+| `turn_control.text_rules.negation` | `[]` | Regex list producing advisory Negation cues |
+| `turn_control.text_rules.intents` | `{}` | Intent name to regex list; first matching name in sorted order wins |
+| `turn_control.text_rules.entities` | `{}` | Slot name to regex; retains the first matched text verbatim, without domain normalization |
+| `turn_control.text_rules.questions` | `[]` | Ordered `{pattern, answer_type}` rules; first matching regex wins. Types: `yes_no`, `choice`, `free_text`, `number` |
+| `turn_control.slot_fallback` | `neutral` | `neutral` yields no slot updates; `korean_example` explicitly enables the reservation heuristic |
+| `speech.backchannel_text` | `""` | Trusted automatic backchannel text; empty disables the act, not floor control |
+| `speech.hard_stop_ack_text` | `""` | Empty suppresses only the spoken ACK; hard-stop Abort and epoch/queue recovery remain active |
+| `speech.failure_text` | `""` | Optional trusted failure/repeat prompt; empty does not skip failure resolution |
+| `speech.mode` | `strict` | Strict renderer path or explicit `legacy` raw-text compatibility |
+| `speech.responses` | `{}` | Trusted static prompt and tool-outcome resources described below |
+| `speech.mock_response` | absent | Prompt resource name emitted as a proposal by the keyless mock; must reference a configured `prompt` |
+
+At most 256 text rules are accepted, each 1–1024 bytes; regexes are checked against a 1 MiB compilation limit and syntax minimum-length analysis rejects zero-width paths, including assertion-only word boundaries that do not match the empty string. Rules compile at construction, not on the audio/control tick. Spoken automatic resources are at most 4096 bytes. Progress templates are limited to 128, require nonempty text of at most 4096 bytes, and a positive, overflow-safe `expire_after_ms`. Their existing latency setting controls eligibility, not a delayed scheduling guarantee.
+
+Host composition uses `VoiceRuntime::build_with_policies(config, optional_providers, RuntimePolicies)` or the direct builder's `with_text_analyzer`, `with_slot_extractor`, and `with_speech_renderer`. Explicit host overrides win over configured implementations; missing host overrides do not disable a configured framework extractor. The runtime slot-extractor override is a per-session factory. Framework initialization failures fall back only to the configured slot fallback. `VoiceSessionBuilder::try_build` reports invalid configuration; the compatible `build` convenience method panics on invalid configuration.
+
+## Strict proposals and migration
+
+A strict Final is a bounded JSON proposal, not spoken text. The original Final is preserved as the framework memory lookup identity. A prompt accepts only `{"response":"collect_details"}` with no model arguments. It selects trusted application text and optional question metadata. A tool outcome uses `{"response":"reserved","call_id":"the-call-id","arguments":{...}}`, where arguments must exactly match the observed executed arguments after approval.
+
+`responses.<name>` is a tagged resource:
+
+- `kind: prompt`: `text` and optional `question`. This is trusted application wording, not a model-provided phatic label.
+- `kind: tool_outcome`: `text`, canonical `operation`, `class` (`factual` or `transactional`), nonempty `receipt_fields` mapping, nonempty `bindings` list, and optional `argument_defaults` mapping. The receipt must be a complete JSON object with each required field equal to the configured value; each bound receipt field must equal the corresponding executed argument or its explicitly configured backend default. No model text is interpolated. The shipped reservation resource binds the restaurant, date, time, party size, customer name, and window-seat request; the omitted window-seat argument defaults to `false`, matching the backend. Its receipt status is `committed`; search receipts use `searched`.
+
+At most 128 response resources are accepted, names have at most 128 bytes, text has 1–4096 bytes, operation IDs at most 256 bytes, and receipt/default mappings and bindings at most 32 entries each. Configured receipt/default values have at most 1024 serialized bytes. Proposals have at most 16384 bytes. Unknown proposal fields, meanings, missing proof, mismatched targets, conflicting same-operation call records, failed/skipped/truncated/cancelled outcomes, and unavailable renderers fail closed before TTS. An executor success flag alone never establishes a business commit. A custom `SpeechRenderer` is trusted application code responsible for its domain validation and rendering, not an untrusted model classifier.
+
+Minimal YAML and direct builders no longer implicitly select Korean grammar or canned replies. The shipped examples provide explicit Korean rules/resources and structured task-agent instructions. Existing arbitrary `Final { text }` integrations can select `speech.mode: legacy`; that mode retains the old language-dependent transaction detector and does not provide the strict guarantee. Locale never selects legacy mode. Arbitrary natural-language factuality is not proven in either mode; strict guarantees cover only trusted resources and validated domain outcomes. Do not place arbitrary model prose in prompt resources or weaken proof requirements to preserve a free-text caller.
+
+`CognitiveEvent`/`VoiceEvent` add `InvocationProof`, and `EvidenceKind`/`SessionEvidence` add exact authorized-speech bindings. Exhaustive Rust matches and struct literals may require migration. Browser messages are unchanged. New automatic phrases and domain policies need actual callers, configuration, and tests; adding a locale string alone does not supply them.
 
 ## Duplex safety limits
 
@@ -230,7 +270,7 @@ Together now uses the documented realtime endpoint and JSON/base64 messages rath
 ## Validation rules
 
 - `soft_silence_ms` must be less than `hard_silence_ms`.
-- Including "아니" in `hard_stop_phrases` fails at load time (to prevent false aborts).
+- Text rules are bounded and validated before session construction; invalid regexes and patterns matching empty input fail rather than silently disabling analysis. Hard-stop vocabulary is application-owned; the Korean sample omits "아니" without a core language-specific prohibition.
 - Enabling `agents.speculative.enabled` requires a dedicated `spec`, a nonempty
   `allowed_tools` list, and `allow_pure_read: true`; every allowlisted tool must
   be `pure_read` in `tools.effects`.
@@ -248,7 +288,7 @@ them.
 
 ## Framework integration
 
-With `framework` enabled and `agents.task.spec` present, runtime startup probes the spec and credentials; actual `RuntimeAgent` construction through `AgentBuilder` occurs separately for each session. Built-in development setups (`mock`/`inject` ASR plus `mock` TTS) preserve the keyless `MockReservationAgent` fallback on probe failure. Live built-in providers and injected providers fail strictly. An injected task spec without the `framework` feature is rejected rather than silently selecting the mock agent; omit the spec for an intentionally keyless injected setup.
+With `framework` enabled and `agents.task.spec` present, runtime startup probes the spec and credentials; actual `RuntimeAgent` construction through `AgentBuilder` occurs separately for each session. Built-in development setups (`mock`/`inject` ASR plus `mock` TTS) use the explicit `speech.mock_response` prompt resource on probe failure. Without that resource the neutral fallback does not invent a canned answer. Live built-in providers and injected providers fail strictly. An injected task spec without the `framework` feature is rejected rather than silently selecting the mock agent; omit the spec for an intentionally keyless injected setup.
 
 A new brain is created **for each session**. `RuntimeAgent` holds conversation
 memory, so sharing one would mix transcripts between clients. Only the tool

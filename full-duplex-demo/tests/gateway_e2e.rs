@@ -24,6 +24,11 @@ turn_control:
   soft_silence_ms: 300
   hard_silence_ms: 700
 
+speech:
+  mock_response: ready
+  responses:
+    ready: {kind: prompt, text: "Ready."}
+
 observability:
   event_log: false
 

@@ -29,7 +29,7 @@ pub use config::VoiceRuntimeConfig;
 pub use events::VoiceEvent;
 pub use ids::{Revision, SessionId, SpeechId, TaskId, TurnId};
 pub use protocol::{ClientControlMessage, ServerMessage};
-pub use runtime::{ClientInput, GatewaySession, SpeechProviders, VoiceRuntime};
+pub use runtime::{ClientInput, GatewaySession, RuntimePolicies, SpeechProviders, VoiceRuntime};
 pub use scenario::{Scenario, ScenarioReport, ScenarioRunner};
 pub use session::{
     DeepWorkRequest, DeepWorkResult, DeepWorker, VoiceSession, VoiceSessionBuilder,

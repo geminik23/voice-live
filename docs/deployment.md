@@ -30,7 +30,7 @@ Paths are resolved as follows:
 
 Use portable relative paths such as `../agents/reservation.yaml` in shared YAML. `/` separators also work on Windows. Configure OS-specific absolute paths on each host instead of fixing them in the repository. Quote CLI paths containing spaces and match filename case exactly for case-sensitive filesystems such as those commonly used on Linux.
 
-The sample config uses `asr.provider: inject` and `dev.allow_text_injection: true`.
+The sample config uses `asr.provider: inject` and `dev.allow_text_injection: true`. It explicitly supplies Korean text rules, slot fallback, automatic phrases, strict response resources, and a keyless `mock_response` prompt. Minimal library configuration no longer invents these resources. The mock asks for reservation details rather than asserting invented availability.
 
 - Text typed in the input box at the bottom of the page becomes the user's utterance. It follows the same commit → agent → claim gate → TTS → playback path as speech.
 - With the microphone enabled, you can also check full-duplex behavior such as duck/resume/abort using mock TTS.
@@ -119,6 +119,12 @@ A host can inject `Arc<dyn StreamingAsr>` and `Arc<dyn StreamingTts>` through `S
 Legacy serial ASR implementations still compile for standalone `open`, but runtime injection requires a real independent duplex boundary. Legacy whole-text TTS factories are bridged once as `Buffered`; a native provider reports `Incremental` and implements append/finish with bounded input, owner-enforced absolute deadlines, cancellation-safe output, and Drop cleanup. `synthesize_via_text_stream` preserves a native provider's control owner for standalone whole-text calls. Standalone provider audio is not an evidence-authorized runtime speech path: runtime acts must still pass the Claim Gate.
 
 Together uses its documented `session.created` readiness and JSON/base64 PCM protocol at `wss://api.together.ai/v1/realtime`. The previous explicit endpoint string in older config files must be updated. Documentation conformance and local socket tests are not paid-provider verification. Qwen keeps its whole-text/buffered behavior; no native text append support is asserted.
+
+## Host language and response policies
+
+Use `VoiceRuntime::build_with_policies(config, providers, RuntimePolicies)` to supply a pure shared `TextAnalyzer`, per-session slot-extractor factory, or trusted `SpeechRenderer`. Pass `None` for `providers` to retain built-in factories. Explicit host overrides take precedence; otherwise configured framework extraction and the declared fallback remain active. Direct sessions expose matching builder injection points and `try_build` validation. The library adds no locale negotiation or transport dependency.
+
+The shipped task spec returns structured speech proposals for a bounded reservation example. Configure application response resources and exact receipt bindings before using another spec, or explicitly opt into legacy free text with its documented safety limits. Do not change only the TTS language and assume that agent instructions, grammar, resources, or business receipts changed too. A custom framework agent using `VoiceAgentHooks` must register tools through `hooks.bind_tool`; unbound results cannot authorize strict business speech. The adapter uses a stable session actor and an immutable per-turn sender token for execution provenance, not as user authentication.
 
 ## Environment variables
 
