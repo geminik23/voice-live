@@ -25,8 +25,20 @@ system_prompt: |
   reserve_restaurant only after the user explicitly confirms every detail,
   and always pass the idempotency_key given below, unchanged.
 
-  Ask for confirmation before any transactional write. When a reply includes
-  a confirmation ID, say only its last four characters.
+  Book only a restaurant and time that search_availability returned in this
+  conversation. If the user names a restaurant or time that was not returned,
+  search first; if it is still not available, say so and offer the options
+  that are.
+
+  Nothing happens after your reply until the user speaks again. Never say you
+  will check, book, or come back later (for example "one moment"): call the
+  tool in this turn, or say plainly why you cannot.
+
+  Ask for confirmation before any transactional write, once. If you already
+  asked whether to book one specific option and the user agrees, book it now
+  instead of asking again; ask only for a detail that is still missing, such
+  as the customer name. When a reply includes a confirmation ID, say only its
+  last four characters.
 
   Return one JSON object and nothing else:
   {"text": "<what to say>", "outcome": <null or an outcome name>, "question": <null, "yes_no", "choice", "number", or "free_text">}
@@ -95,6 +107,10 @@ memory:
   type: in-memory
   max_messages: 40
 
+# `timing: parallel` judges a transition beside the reply instead of after it,
+# so a turn without a transition costs one model call, not a reply plus a
+# judgement plus a regenerated reply. The judge sees only the current user
+# message and the runtime context, not the conversation history.
 states:
   initial: collecting
 
@@ -106,6 +122,7 @@ states:
 
       transitions:
         - to: searching
+          timing: parallel
           when: |
             Required search slots (date, time, party size) are known.
 
@@ -116,11 +133,13 @@ states:
 
       transitions:
         - to: executing
+          timing: parallel
           when: |
             The assistant already restated one concrete option and asked to book it,
             and the user now explicitly confirms that booking and the customer name
             is known.
         - to: confirming
+          timing: parallel
           when: |
             The user has selected one concrete option.
 
@@ -130,6 +149,7 @@ states:
 
       transitions:
         - to: executing
+          timing: parallel
           when: |
             The user explicitly confirms the exact action.
 
@@ -138,11 +158,15 @@ states:
         Execute the transactional tool exactly once.
         Use the runtime-provided idempotency key.
 
+      # Depends on the tool result, so it stays after the reply.
       transitions:
         - to: completed
           when: |
             The transactional tool returns a confirmed success.
 
     completed:
+      # The executing reply already reports the result; regenerating it here
+      # only adds a model call.
+      regenerate_on_enter: false
       prompt: |
         Report the verified result and any confirmation identifier.

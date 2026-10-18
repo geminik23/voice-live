@@ -101,12 +101,24 @@ impl Tool for SearchAvailabilityTool {
     }
 
     fn input_schema(&self) -> Value {
+        // Without the list, models invent placeholder areas ("", "general")
+        // that match nothing and then report that nothing is available.
+        let mut areas: Vec<String> = Vec::new();
+        for restaurant in &self.store.lock().restaurants {
+            if !areas.contains(&restaurant.area) {
+                areas.push(restaurant.area.clone());
+            }
+        }
         json!({
             "type": "object",
             "properties": {
-                "area": { "type": "string" },
+                "area": {
+                    "type": "string",
+                    "enum": areas,
+                    "description": "Only when the user named one of these areas; omit it to search every area."
+                },
                 "date": { "type": "string" },
-                "time": { "type": "string" },
+                "time": { "type": "string", "description": "24-hour HH:MM, for example 19:00." },
                 "party_size": { "type": "integer", "minimum": 1 },
                 "parking_required": { "type": "boolean", "default": false },
                 "window_seat_preferred": { "type": "boolean", "default": false }
@@ -116,7 +128,13 @@ impl Tool for SearchAvailabilityTool {
     }
 
     async fn execute(&self, args: Value, _ctx: ToolExecutionContext) -> ToolResult {
-        let area = args.get("area").and_then(Value::as_str);
+        // Models often send an empty area when the user named none; that
+        // means "any area", not an area called "".
+        let area = args
+            .get("area")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|area| !area.is_empty());
         let Some(time) = args.get("time").and_then(Value::as_str) else {
             return ToolResult::error("time is required");
         };
@@ -344,6 +362,31 @@ mod tests {
         assert!(result.output.contains("gangnam-table"));
         assert!(!result.output.contains("hongdae-kitchen"));
         assert!(tool.safety_metadata().read_only);
+    }
+
+    #[tokio::test]
+    async fn an_empty_area_searches_every_area() {
+        let tool = SearchAvailabilityTool::new(ReservationStore::demo());
+
+        let result = tool
+            .execute(
+                json!({ "area": "", "date": "2026-09-26", "time": "19:00", "party_size": 2 }),
+                context(),
+            )
+            .await;
+
+        assert!(result.success);
+        assert!(result.output.contains("gangnam-table"));
+        assert!(result.output.contains("hongdae-kitchen"));
+    }
+
+    #[test]
+    fn search_schema_lists_the_demo_areas() {
+        let tool = SearchAvailabilityTool::new(ReservationStore::demo());
+        assert_eq!(
+            tool.input_schema()["properties"]["area"]["enum"],
+            json!(["강남", "홍대", "성수"])
+        );
     }
 
     #[tokio::test]
