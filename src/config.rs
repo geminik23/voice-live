@@ -696,10 +696,13 @@ pub struct SpeechConfig {
     pub failure_text: String,
     #[serde(default)]
     pub mode: crate::speech::render::SpeechMode,
+    /// Business outcomes a strict reply may name, checked against the turn's
+    /// executed tool records. The spoken words come from the model.
     #[serde(default)]
-    pub responses: std::collections::BTreeMap<String, crate::speech::render::ResponseResource>,
+    pub outcomes: std::collections::BTreeMap<String, crate::speech::render::OutcomeRule>,
+    /// Reply text emitted by the keyless mock task agent.
     #[serde(default)]
-    pub mock_response: Option<String>,
+    pub mock_reply: Option<String>,
     /// How long to wait for a playback acknowledgement before releasing the
     /// speech queue. Speech state only advances on a client ACK, so a
     /// disconnected client would otherwise pin the queue forever. `0` disables.
@@ -932,14 +935,11 @@ impl VoiceRuntimeConfig {
         }
 
         crate::semantics::text::validate_rules(&self.turn_control)?;
-        crate::speech::render::ConfiguredRenderer::new(&self.speech.responses)?;
-        if let Some(name) = &self.speech.mock_response {
+        crate::speech::render::ConfiguredRenderer::new(&self.speech.outcomes)?;
+        if let Some(reply) = &self.speech.mock_reply {
             anyhow::ensure!(
-                matches!(
-                    self.speech.responses.get(name),
-                    Some(crate::speech::render::ResponseResource::Prompt { .. })
-                ),
-                "speech.mock_response must name a configured prompt resource"
+                !reply.trim().is_empty() && reply.len() <= 4096,
+                "speech.mock_reply must contain 1 to 4096 bytes"
             );
         }
         for text in [

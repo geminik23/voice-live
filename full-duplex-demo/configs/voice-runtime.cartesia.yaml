@@ -49,24 +49,22 @@ turn_control:
 
 speech:
   mode: strict
-  mock_response: collect_details
+  # Reply of the keyless mock task agent. This and the other spoken texts
+  # below are in the sample's session language (tts.language); the task agent
+  # writes its own replies in that language.
+  mock_reply: "예약할 날짜와 시간, 인원을 알려 주세요."
   hard_stop_ack_text: "네, 멈췄어요."
   backchannel_text: "네"
   failure_text: "죄송합니다. 응답을 준비하지 못했어요. 다시 말씀해 주세요."
-  responses:
-    collect_details: {kind: prompt, text: "예약할 날짜와 시간, 인원을 알려 주세요.", question: free_text}
-    choose_option: {kind: prompt, text: "원하는 식당을 알려 주세요.", question: free_text}
-    confirm_details: {kind: prompt, text: "말씀하신 조건으로 예약을 진행할까요?", question: yes_no}
+  # Outcomes a reply may name. The model writes the words; the runtime checks
+  # the named outcome against the tools executed in that turn.
+  outcomes:
     availability_checked:
-      kind: tool_outcome
-      text: "예약 가능 여부 조회를 마쳤습니다."
       operation: search_availability
       class: factual
       receipt_fields: {status: searched}
       bindings: [date, time, party_size]
     reserved:
-      kind: tool_outcome
-      text: "요청하신 예약이 완료되었습니다."
       operation: reserve_restaurant
       class: transactional
       receipt_fields: {status: committed}

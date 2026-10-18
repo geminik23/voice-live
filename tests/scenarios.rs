@@ -568,7 +568,7 @@ expect:
     exactly: 2
   - type: turn_resolved
     resolution: audible
-    heard_equals: "[응답이 전달되지 않음]"
+    heard_equals: "[voice-live:undelivered]"
   - type: never_event
     event: playback_completed
 settle_ms: 6000
@@ -766,10 +766,11 @@ expect:
   - type: turn_resolved
     resolution: audible
     heard_contains: "확인했습니다."
-  # The cut is recorded, and the unheard end of the second clause is gone.
+  # The cut is recorded (mid-clause or before the second clause, depending on
+  # how far playback got), and the unheard end of the second clause is gone.
   - type: turn_resolved
     resolution: audible
-    heard_contains: "[중단됨"
+    heard_contains: "[voice-live:"
     heard_excludes: "가능합니다"
 settle_ms: 2000
 "#
@@ -840,7 +841,7 @@ expect:
   # Keeps the user/assistant pairing, but says the reply never arrived.
   - type: turn_resolved
     resolution: audible
-    heard_equals: "[응답이 전달되지 않음]"
+    heard_equals: "[voice-live:undelivered]"
 settle_ms: 4000
 "#
 );
@@ -884,7 +885,7 @@ expect:
     value: 1
   - type: turn_resolved
     resolution: audible
-    heard_equals: "[응답이 전달되지 않음]"
+    heard_equals: "[voice-live:undelivered]"
     heard_excludes: "예약이 완료"
 settle_ms: 3500
 "#

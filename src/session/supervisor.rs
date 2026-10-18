@@ -437,8 +437,8 @@ impl VoiceSessionBuilder {
         let policy = ReflexPolicy::with_analyzer(Arc::clone(&text_analyzer));
         let speech_renderer = self.speech_renderer.unwrap_or_else(|| {
             Arc::new(
-                crate::speech::render::ConfiguredRenderer::new(&self.config.speech.responses)
-                    .expect("validated response resources"),
+                crate::speech::render::ConfiguredRenderer::new(&self.config.speech.outcomes)
+                    .expect("validated outcome rules"),
             )
         });
         let asr_partials = self.config.asr.partials.clone();
@@ -2875,6 +2875,7 @@ impl VoiceSession {
                 .map(|r| (r.fingerprint, r.summary.clone()))
                 .collect::<Vec<_>>(),
             &self.deep_results,
+            &self.config.tts.language,
         );
         let dependencies: Vec<String> = self.state.semantic_frame.slots.keys().cloned().collect();
         self.settle_previous_turns().await?;
@@ -3152,11 +3153,16 @@ impl VoiceSession {
         let conflict = self.proof_conflicts.remove(&task_id);
         let rendered = if conflict {
             Err(anyhow::anyhow!("conflicting invocation records"))
+        } else if self.write_unconfirmed(task_id, &proofs) {
+            // The reply may still say the write succeeded, in any language;
+            // nothing in the turn can check it, so none of it is spoken.
+            Err(anyhow::anyhow!("unconfirmed write in this turn"))
         } else {
             self.speech_renderer.render(&original, &proofs)
         };
         self.active_tasks.remove(&task_id);
         let mut spoken = Vec::new();
+        let mut rejected = false;
         if let Ok(RenderedReply {
             text,
             class,
@@ -3219,10 +3225,10 @@ impl VoiceSession {
                     }
                 }
             } else {
-                self.metrics.inc("voice_claim_rejected_total");
+                rejected = true;
             }
         } else {
-            self.metrics.inc("voice_claim_rejected_total");
+            rejected = true;
         }
         self.turn_speech.insert(
             task_id,
@@ -3232,6 +3238,54 @@ impl VoiceSession {
             },
         );
         self.state.task = crate::interaction::TaskState::Completed;
+        if rejected {
+            // The turn keeps its tool history and records the reply as
+            // undelivered; the user hears the configured failure text instead
+            // of silence.
+            self.metrics.inc("voice_claim_rejected_total");
+            self.speak_failure_text().await?;
+        }
+        Ok(())
+    }
+
+    /// A tool not declared `pure_read` may have written. If any such call in
+    /// this turn failed, was never completed, or left an unusable record, the
+    /// reply cannot be checked against what actually happened.
+    fn write_unconfirmed(
+        &self,
+        task_id: TaskId,
+        proofs: &[crate::speech::render::InvocationProof],
+    ) -> bool {
+        use crate::session::view::SessionEvidence;
+        let may_write =
+            |tool: &str| self.config.tools.effects.get(tool) != Some(&ToolEffect::PureRead);
+        proofs
+            .iter()
+            .any(|p| may_write(&p.operation) && !p.usable())
+            || self.state.evidence.values().any(|evidence| match evidence {
+                SessionEvidence::ToolStarted {
+                    task_id: t, tool, ..
+                } => *t == task_id && may_write(tool),
+                SessionEvidence::ToolCompleted {
+                    task_id: t,
+                    tool,
+                    success,
+                    ..
+                } => *t == task_id && !*success && may_write(tool),
+                _ => false,
+            })
+    }
+
+    async fn speak_failure_text(&mut self) -> Result<()> {
+        if self.config.speech.failure_text.trim().is_empty() {
+            return Ok(());
+        }
+        let act = SpeechAct::phatic(
+            self.config.speech.failure_text.clone(),
+            self.state.epochs.speech,
+            crate::speech::act::PRIORITY_CLARIFICATION,
+        );
+        self.authorize_and_enqueue(act, None).await?;
         Ok(())
     }
 
@@ -3401,17 +3455,7 @@ impl VoiceSession {
             self.resolve_turn(task_id, TurnResolution::Discard);
         }
 
-        if self.config.speech.failure_text.trim().is_empty() {
-            self.metrics.inc("voice_agent_failed_total");
-            return Ok(());
-        }
-        let act = SpeechAct::phatic(
-            self.config.speech.failure_text.clone(),
-            self.state.epochs.speech,
-            crate::speech::act::PRIORITY_CLARIFICATION,
-        );
-        self.authorize_and_enqueue(act, None).await?;
-
+        self.speak_failure_text().await?;
         self.metrics.inc("voice_agent_failed_total");
         tracing::warn!("agent turn failed: {message}");
         Ok(())
@@ -4658,6 +4702,7 @@ fn render_turn_context(
     semantic_frame: &SemanticFrame,
     speculative_hints: &[(u64, String)],
     deep_results: &[DeepWorkResult],
+    speech_language: &str,
 ) -> TurnContext {
     let idempotency_key = format!("voice-turn-{turn_id}");
     let frame_json = serde_json::to_string(semantic_frame).unwrap_or_default();
@@ -4665,9 +4710,12 @@ fn render_turn_context(
     let dependencies: Vec<String> = semantic_frame.slots.keys().cloned().collect();
     let fingerprint = semantic_frame.dependency_fingerprint(&dependencies);
 
+    // The synthesis language is configuration, and the reply must be in it to
+    // be pronounced correctly. The runtime does not detect languages.
     let mut brief = format!(
         "transcript_revision: {revision}\n\
          idempotency_key: {idempotency_key}\n\
+         speech_language: {speech_language}\n\
          semantic_frame: {frame_json}"
     );
 
@@ -7318,16 +7366,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn strict_survivors_keep_authorization_and_questions_require_playback() {
         let (mut session, _, _) = harness();
-        let resources =
-            serde_yaml::from_str("ask: {kind: prompt, text: 'First. Continue?', question: yes_no}")
-                .unwrap();
         session.speech_renderer =
-            Arc::new(crate::speech::render::ConfiguredRenderer::new(&resources).unwrap());
+            Arc::new(crate::speech::render::ConfiguredRenderer::new(&Default::default()).unwrap());
         let (tx, mut rx) = mpsc::channel(8);
         session.speech_tx = tx;
         let owner = TaskId::new();
         session
-            .on_strict_final(owner, r#"{"response":"ask"}"#.into())
+            .on_strict_final(
+                owner,
+                r#"{"text":"First. Continue?","question":"yes_no"}"#.into(),
+            )
             .await
             .unwrap();
         let _first = rx.try_recv().unwrap();
@@ -7903,7 +7951,7 @@ mod tests {
         session.shutdown_active_work().await;
         assert_eq!(recorder.resolutions().len(), 1);
         assert!(
-            matches!(&recorder.resolutions()[0].1, TurnResolution::Audible { heard, .. } if heard == "[응답이 전달되지 않음]")
+            matches!(&recorder.resolutions()[0].1, TurnResolution::Audible { heard, .. } if heard == crate::speech::ledger::MARKER_UNDELIVERED)
         );
     }
 

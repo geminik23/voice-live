@@ -46,7 +46,7 @@ impl Tool for Create {
 
 #[tokio::test]
 async fn published_framework_proof_origin_and_rendered_memory_keep_original_final_identity() {
-    let proposal = r#"{"response":"ask"}"#;
+    let proposal = r#"{"text":"Continue?"}"#;
     let mut mock = MockLLMProvider::new("offline");
     mock.set_responses(
         vec![
@@ -234,4 +234,97 @@ async fn semantic_host_factory_runs_with_mock_task_agent_per_session() {
     }
     runtime.close_session(first.session_id).await;
     runtime.close_session(second.session_id).await;
+}
+
+struct RecordingTts(Arc<parking_lot::Mutex<Vec<String>>>);
+#[async_trait]
+impl voice_live::tts::StreamingTts for RecordingTts {
+    async fn synthesize(
+        &self,
+        request: voice_live::tts::TtsRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<Box<dyn voice_live::tts::TtsStream>> {
+        self.0.lock().push(request.text.clone());
+        voice_live::tts::fake::FakeTts::new(24_000, 20, 1)
+            .synthesize(request, cancellation)
+            .await
+    }
+}
+
+/// One committed user turn through a real framework agent with a scripted
+/// model and the offline `create` tool; returns what reached synthesis.
+async fn spoken_through_framework(model_replies: Vec<String>) -> Vec<String> {
+    let config = voice_live::VoiceRuntimeConfig::from_yaml_str(
+        r#"
+observability: {event_log: false}
+tools: {effects: {create: transactional_write}}
+speech:
+  failure_text: "Please say that again."
+  outcomes:
+    committed:
+      operation: create
+      class: transactional
+      receipt_fields: {status: committed}
+      bindings: [target]
+"#,
+    )
+    .unwrap();
+    let mut mock = MockLLMProvider::new("offline");
+    mock.set_responses(model_replies, false);
+    let hooks = VoiceAgentHooks::new();
+    let memory: Arc<dyn Memory> = Arc::new(InMemoryStore::new(40));
+    let runtime = AgentBuilder::from_yaml(
+        "name: OfflineOutcome\nsystem_prompt: Offline outcome test\ntools: [create]\nstreaming: {enabled: true, include_tool_events: false}",
+    )
+    .unwrap()
+    .llm(Arc::new(mock))
+    .memory(memory.clone())
+    .hooks(hooks.clone() as Arc<dyn AgentHooks>)
+    .tool(hooks.bind_tool(Arc::new(Create)))
+    .build()
+    .unwrap();
+    let agent = AiAgentsCognitiveAgent::with_turn_memory(Arc::new(runtime), hooks, memory);
+    let texts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (session, handle) = voice_live::VoiceSessionBuilder::new(
+        Arc::new(config),
+        Arc::new(voice_live::playback::UnacknowledgedPlaybackSink),
+        Arc::new(RecordingTts(texts.clone())),
+        Arc::new(agent),
+    )
+    .with_shutdown(shutdown.clone())
+    .build();
+    let meta = session.meta_factory.new_meta();
+    let worker = tokio::spawn(session.run());
+    handle
+        .emit(voice_live::VoiceEvent::UserTurnCommitted {
+            meta,
+            turn_id: voice_live::TurnId::new(),
+            transcript_revision: voice_live::Revision(1),
+            transcript: "request".into(),
+        })
+        .await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    shutdown.cancel();
+    worker.await.unwrap().unwrap();
+    texts.lock().clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn framework_outcome_reply_is_checked_against_executed_tool_without_call_ids() {
+    // The model runs the tool, then writes its own reply naming the outcome.
+    // It never sees or repeats a call id; the runtime binds the executed record.
+    let spoken = spoken_through_framework(vec![
+        r#"{"tool":"create","arguments":{"target":"A"}}"#.into(),
+        r#"{"text":"Created A.","outcome":"committed"}"#.into(),
+    ])
+    .await;
+    assert_eq!(spoken, ["Created A."]);
+
+    // The same reply without the tool having run is not spoken.
+    let spoken = spoken_through_framework(vec![
+        r#"{"text":"Created A.","outcome":"committed"}"#.into(),
+    ])
+    .await;
+    assert_eq!(spoken, ["Please say that again."]);
 }

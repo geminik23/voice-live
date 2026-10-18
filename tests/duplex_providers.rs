@@ -84,14 +84,7 @@ async fn injected_runtime(
     tts: Arc<dyn StreamingTts>,
 ) -> anyhow::Result<Arc<VoiceRuntime>> {
     let mut config = VoiceRuntimeConfig::from_yaml_str(config)?;
-    config.speech.mock_response = Some("ready".into());
-    config.speech.responses.insert(
-        "ready".into(),
-        voice_live::speech::render::ResponseResource::Prompt {
-            text: "Ready.".into(),
-            question: None,
-        },
-    );
+    config.speech.mock_reply = Some("Ready.".into());
     VoiceRuntime::build_with_providers(config, SpeechProviders { asr, tts }).await
 }
 
@@ -1875,11 +1868,12 @@ async fn provisional_chunks_are_never_submitted_as_speech() {
                 text: "provisional text".into(),
             },
         }],
-        r#"{"response":"ready"}"#,
+        r#"{"text":"authoritative reply"}"#,
     ));
     let (raw_tts, _, texts) = CountingTts::new(1);
     let tts = BufferedTtsAdapter::new(raw_tts);
-    let config = Arc::new(VoiceRuntimeConfig::from_yaml_str("observability:\n  event_log: false\nspeech:\n  responses:\n    ready: {kind: prompt, text: authoritative reply}").unwrap());
+    let config =
+        Arc::new(VoiceRuntimeConfig::from_yaml_str("observability:\n  event_log: false").unwrap());
     let shutdown = CancellationToken::new();
     let (session, handle) = voice_live::VoiceSessionBuilder::new(
         config,

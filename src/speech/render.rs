@@ -52,34 +52,49 @@ impl InvocationProof {
     }
 }
 
-/// Trusted application resources never interpolate arbitrary model prose.
+/// How a named business outcome is checked against the turn's executed tool
+/// records. The words spoken come from the model; this rule decides whether the
+/// outcome it names actually happened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResponseResource {
-    Prompt {
-        text: String,
-        #[serde(default)]
-        question: Option<ExpectedAnswerType>,
-    },
-    ToolOutcome {
-        text: String,
-        operation: String,
-        class: ClaimClass,
-        receipt_fields: BTreeMap<String, Value>,
-        bindings: Vec<String>,
-        #[serde(default)]
-        argument_defaults: BTreeMap<String, Value>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct OutcomeRule {
+    pub operation: String,
+    pub class: ClaimClass,
+    pub receipt_fields: BTreeMap<String, Value>,
+    pub bindings: Vec<String>,
+    #[serde(default)]
+    pub argument_defaults: BTreeMap<String, Value>,
 }
 
+/// A strict task-agent Final: the reply text, an optional outcome name, and
+/// an optional answer-type hint for the last clause. A Final that is not a
+/// JSON object is read as reply text with no outcome.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Proposal {
-    response: String,
+    text: String,
     #[serde(default)]
-    call_id: Option<String>,
+    outcome: Option<String>,
     #[serde(default)]
-    arguments: Value,
+    question: Option<ExpectedAnswerType>,
+}
+
+impl Proposal {
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(raw.len() <= 16_384, "proposal too large");
+        let trimmed = raw.trim();
+        let proposal = if trimmed.starts_with('{') {
+            serde_json::from_str(trimmed)?
+        } else {
+            Self {
+                text: trimmed.to_string(),
+                outcome: None,
+                question: None,
+            }
+        };
+        anyhow::ensure!(!proposal.text.trim().is_empty(), "empty reply text");
+        Ok(proposal)
+    }
 }
 
 pub struct RenderedReply {
@@ -89,142 +104,119 @@ pub struct RenderedReply {
     pub records: Vec<String>,
 }
 
-/// Trusted host boundary: validates domain outcomes and renders bounded meaning without I/O.
-/// Implementations must not pass through unvalidated model text, labels, or template arguments.
+/// Trusted host boundary between a task-agent Final and speech, without I/O.
+/// Reply text is model-generated; an implementation must not let a reply claim
+/// a business outcome that the turn's executed tool records do not confirm.
 pub trait SpeechRenderer: Send + Sync {
     fn render(&self, proposal: &str, proofs: &[InvocationProof]) -> anyhow::Result<RenderedReply>;
 }
 
 pub struct ConfiguredRenderer {
-    resources: BTreeMap<String, ResponseResource>,
+    outcomes: BTreeMap<String, OutcomeRule>,
 }
 
 impl ConfiguredRenderer {
-    pub fn new(resources: &BTreeMap<String, ResponseResource>) -> anyhow::Result<Self> {
-        anyhow::ensure!(resources.len() <= 128, "too many response resources");
-        for (name, resource) in resources {
+    pub fn new(outcomes: &BTreeMap<String, OutcomeRule>) -> anyhow::Result<Self> {
+        anyhow::ensure!(outcomes.len() <= 128, "too many outcome rules");
+        for (name, rule) in outcomes {
             anyhow::ensure!(
                 !name.is_empty() && name.len() <= 128,
-                "invalid response resource name"
+                "invalid outcome name"
             );
-            let text = match resource {
-                ResponseResource::Prompt { text, .. } => text,
-                ResponseResource::ToolOutcome {
-                    text,
-                    operation,
-                    class,
-                    receipt_fields,
-                    bindings,
-                    argument_defaults,
-                } => {
-                    anyhow::ensure!(
-                        argument_defaults.len() <= 32
-                            && argument_defaults
-                                .values()
-                                .all(|v| v.to_string().len() <= 1024),
-                        "argument defaults exceed budget"
-                    );
-                    anyhow::ensure!(
-                        !operation.is_empty() && operation.len() <= 256,
-                        "invalid response operation"
-                    );
-                    anyhow::ensure!(
-                        matches!(class, ClaimClass::Factual | ClaimClass::Transactional),
-                        "tool outcome must be factual or transactional"
-                    );
-                    anyhow::ensure!(
-                        !receipt_fields.is_empty()
-                            && !bindings.is_empty()
-                            && bindings.len() <= 32
-                            && receipt_fields.len() <= 32,
-                        "tool outcome needs bounded receipt checks and target bindings"
-                    );
-                    anyhow::ensure!(
-                        receipt_fields.values().all(|v| v.to_string().len() <= 1024),
-                        "receipt check is too large"
-                    );
-                    text
-                }
-            };
             anyhow::ensure!(
-                !text.trim().is_empty() && text.len() <= 4096,
-                "response text must contain 1 to 4096 bytes"
+                rule.argument_defaults.len() <= 32
+                    && rule
+                        .argument_defaults
+                        .values()
+                        .all(|v| v.to_string().len() <= 1024),
+                "argument defaults exceed budget"
+            );
+            anyhow::ensure!(
+                !rule.operation.is_empty() && rule.operation.len() <= 256,
+                "invalid outcome operation"
+            );
+            anyhow::ensure!(
+                matches!(rule.class, ClaimClass::Factual | ClaimClass::Transactional),
+                "outcome class must be factual or transactional"
+            );
+            anyhow::ensure!(
+                !rule.receipt_fields.is_empty()
+                    && !rule.bindings.is_empty()
+                    && rule.bindings.len() <= 32
+                    && rule.receipt_fields.len() <= 32,
+                "outcome needs bounded receipt checks and target bindings"
+            );
+            anyhow::ensure!(
+                rule.receipt_fields
+                    .values()
+                    .all(|v| v.to_string().len() <= 1024),
+                "receipt check is too large"
             );
         }
         Ok(Self {
-            resources: resources.clone(),
+            outcomes: outcomes.clone(),
         })
+    }
+
+    /// Every record of the rule's operation in this turn must be usable and
+    /// confirm the receipt and its targets; one failed attempt rejects the claim.
+    fn confirm(
+        &self,
+        rule: &OutcomeRule,
+        proofs: &[InvocationProof],
+    ) -> anyhow::Result<Vec<String>> {
+        let matching: Vec<_> = proofs
+            .iter()
+            .filter(|p| p.operation == rule.operation)
+            .collect();
+        anyhow::ensure!(!matching.is_empty(), "no executed invocation for outcome");
+        for proof in &matching {
+            anyhow::ensure!(proof.usable(), "unproven invocation");
+            let receipt: Value = serde_json::from_str(&proof.output)?;
+            anyhow::ensure!(
+                receipt.is_object() && receipt.get("skipped").is_none(),
+                "invalid business receipt"
+            );
+            anyhow::ensure!(
+                rule.receipt_fields
+                    .iter()
+                    .all(|(k, v)| receipt.get(k) == Some(v)),
+                "business outcome not confirmed"
+            );
+            anyhow::ensure!(
+                rule.bindings.iter().all(|k| proof
+                    .arguments
+                    .get(k)
+                    .or_else(|| rule.argument_defaults.get(k))
+                    .is_some_and(|v| !v.is_null() && receipt.get(k) == Some(v))),
+                "receipt target differs from executed arguments"
+            );
+        }
+        Ok(matching.iter().map(|p| p.record_id.clone()).collect())
     }
 }
 
 impl SpeechRenderer for ConfiguredRenderer {
     fn render(&self, proposal: &str, proofs: &[InvocationProof]) -> anyhow::Result<RenderedReply> {
-        anyhow::ensure!(proposal.len() <= 16_384, "proposal too large");
-        let proposal: Proposal = serde_json::from_str(proposal)?;
-        let resource = self
-            .resources
-            .get(&proposal.response)
-            .ok_or_else(|| anyhow::anyhow!("unknown speech meaning"))?;
-        match resource {
-            ResponseResource::Prompt { text, question } => {
-                anyhow::ensure!(
-                    proposal.call_id.is_none() && proposal.arguments.is_null(),
-                    "prompt takes no model arguments"
-                );
-                Ok(RenderedReply {
-                    text: text.clone(),
-                    class: ClaimClass::Phatic,
-                    question: *question,
-                    records: vec![],
-                })
-            }
-            ResponseResource::ToolOutcome {
-                text,
-                operation,
-                class,
-                receipt_fields,
-                bindings,
-                argument_defaults,
-            } => {
-                let call_id = proposal
-                    .call_id
-                    .ok_or_else(|| anyhow::anyhow!("missing invocation"))?;
-                let matching: Vec<_> = proofs
-                    .iter()
-                    .filter(|p| p.call_id == call_id && p.operation == *operation)
-                    .collect();
-                anyhow::ensure!(matching.len() == 1, "ambiguous invocation outcome");
-                let proof = matching[0];
-                anyhow::ensure!(
-                    proof.usable() && proof.arguments == proposal.arguments,
-                    "unproven invocation or mismatched executed arguments"
-                );
-                let receipt: Value = serde_json::from_str(&proof.output)?;
-                anyhow::ensure!(
-                    receipt.is_object() && receipt.get("skipped").is_none(),
-                    "invalid business receipt"
-                );
-                anyhow::ensure!(
-                    receipt_fields
-                        .iter()
-                        .all(|(k, v)| receipt.get(k) == Some(v)),
-                    "business outcome not confirmed"
-                );
-                anyhow::ensure!(
-                    bindings.iter().all(|k| proof
-                        .arguments
-                        .get(k)
-                        .or_else(|| argument_defaults.get(k))
-                        .is_some_and(|v| !v.is_null() && receipt.get(k) == Some(v))),
-                    "receipt target differs from executed arguments"
-                );
-                Ok(RenderedReply {
-                    text: text.clone(),
-                    class: *class,
-                    question: None,
-                    records: vec![proof.record_id.clone()],
-                })
-            }
-        }
+        let proposal = Proposal::parse(proposal)?;
+        let Some(name) = proposal.outcome else {
+            return Ok(RenderedReply {
+                text: proposal.text,
+                class: ClaimClass::Phatic,
+                question: proposal.question,
+                records: vec![],
+            });
+        };
+        let rule = self
+            .outcomes
+            .get(&name)
+            .ok_or_else(|| anyhow::anyhow!("unknown outcome"))?;
+        let records = self.confirm(rule, proofs)?;
+        Ok(RenderedReply {
+            text: proposal.text,
+            class: rule.class,
+            question: proposal.question,
+            records,
+        })
     }
 }

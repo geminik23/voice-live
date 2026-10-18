@@ -612,12 +612,7 @@ impl BrainProvider {
         match &self.mode {
             BrainMode::Mock => Ok(SessionBrains {
                 task_agent: Arc::new(FakeAgent::finalizing(
-                    self.config
-                        .speech
-                        .mock_response
-                        .as_ref()
-                        .map(|response| serde_json::json!({"response": response}).to_string())
-                        .unwrap_or_default(),
+                    self.config.speech.mock_reply.clone().unwrap_or_default(),
                 )),
                 speculative_agent: None,
                 interaction_brain: configured_semantic_brain(&self.config),

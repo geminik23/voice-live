@@ -117,7 +117,7 @@ The ai-agents runtime stores a reply in memory **as soon as it generates it**, b
 | Data | Route | Stored in memory |
 |---|---|---|
 | Committed user utterance | User message (`AgentTurnRequest::input`) | Yes |
-| Turn environment (`idempotency_key`, `semantic_frame`, speculative/deep results) | `context_manager().set("voice", …)` → system prompt `{{ context.voice.brief }}` | **No** |
+| Turn environment (`idempotency_key`, `speech_language`, `semantic_frame`, speculative/deep results) | `context_manager().set("voice", …)` → system prompt `{{ context.voice.brief }}` | **No** |
 | Assistant reply | Stored by the framework → reconciled by voice-live with what was heard | Yes (after reconciliation) |
 
 The system prompt is rendered anew for each LLM call and is not stored as a message, so the turn environment cannot accumulate in memory. Previously, this environment and a JSON record of what was heard were placed in the user message; each retained user message repeated earlier snapshots, causing O(n²) token growth and leaving contradictory records.
@@ -147,11 +147,11 @@ stale / failure / superseded by the next turn
 | Outcome | Assistant text retained in memory |
 |---|---|
 | Fully played | Actual rendered speech; unchanged only when it equals the original Final |
-| Interrupted mid-clause | Heard prefix + `… [중단됨]` |
-| Later clauses not played | Earlier clauses + `[중단됨: 이후 내용은 전달되지 않음]` |
-| Not delivered at all (TTS failure, claim rejection, etc.) | `[응답이 전달되지 않음]` |
+| Interrupted mid-clause | Heard prefix + `… [voice-live:interrupted]` |
+| Later clauses not played | Earlier clauses + `[voice-live:rest-undelivered]` |
+| Not delivered at all (TTS failure, claim rejection, etc.) | `[voice-live:undelivered]` |
 
-Even if the claim gate rejects the entire reply, it is reconciled to `[응답이 전달되지 않음]`. An unverified “예약이 완료되었습니다” must not remain in memory as though it had been delivered to the user.
+The markers are fixed tokens for the model, not phrases in any conversation language, and are never spoken. Agent instructions explain them (the demo task spec does). Even if the claim gate rejects the entire reply, it is reconciled to `[voice-live:undelivered]`. An unverified success claim must not remain in memory as though it had been delivered to the user.
 
 Partial hearing is an estimate. For a clause whose synthesis has finished, it uses the played-to-synthesized sample ratio; for one still being synthesized, it uses a **conservative speaking time per character**. If playback catches up with streaming synthesis, a simple ratio would say “fully heard,” precisely the error this safeguard is meant to prevent: recording words the user did not hear as heard.
 
@@ -180,7 +180,17 @@ When a state transition regenerates a reply, ai-agents (as tested with 1.0.11) *
 
 ## Claim Gate
 
-The default strict path is proposal → trusted host validation/rendering → exact authorized clause → Claim Gate → TTS. A model-provided class, template ID, call ID, or evidence reference is never sufficient. `speech.responses` provides a bounded static renderer; a custom host `SpeechRenderer` can validate domain-specific receipts without adding domain meanings to the core. The original model Final remains the exact memory lookup identity even when only rendered text is heard.
+The default strict path is Final → write check → host renderer → exact authorized clause → Claim Gate → TTS. The model writes the reply text in the session's speech language; the runtime neither supplies wording nor detects language.
+
+A strict Final is `{"text": …, "outcome": …, "question": …}`, or plain text, which is read as `text` alone:
+
+- **No outcome.** The text is spoken as general (phatic) speech. It carries no business evidence, and the runtime does not check what it says.
+- **Named outcome.** `speech.outcomes.<name>` names an operation, a claim class, receipt fields, and target bindings. Every record of that operation executed in this turn must be usable, carry the receipt fields, and match its executed arguments; otherwise nothing of the reply is spoken. Records are found by operation from the executor's own observations. The model never supplies or repeats a call ID, arguments, or evidence reference.
+- **Unconfirmed write.** If a tool not declared `pure_read` in `tools.effects` was started and not completed, completed unsuccessfully, or left an unusable record in this turn, none of the reply is spoken, whatever it names. This check does not read the reply text, so it works in any language.
+- **Rejection.** A malformed or unconfirmed reply is not spoken. The user hears `speech.failure_text` instead (when configured), and memory records the reply as `[voice-live:undelivered]` while keeping the turn's tool history.
+- **Question.** The optional `question` value is only a turn-taking hint, never evidence. It reaches interaction state only after the clause has played in full.
+
+The residual risk is explicit: a reply that names no outcome can still claim, in words, something that never happened (for example a reservation that was never attempted). The runtime blocks such claims only in a turn where a write failed. Arbitrary natural-language truth is not proven. A custom host `SpeechRenderer` can apply stricter domain rules. The original model Final remains the exact memory lookup identity even when only part of the text is heard.
 
 Each rendered clause receives an immutable text/class/speech-ID binding in session evidence. Queue admission and TTS admission both check the binding and expiry. Deliberately surviving queued acts migrate their speech epoch together with that authorization during recovery; changing their meaning or reusing a different act ID cannot reuse the binding. Question hints become interaction state only after confirmed full playback of the associated clause, not after generation or authorization. Interrupted or rejected questions do not publish hints; a committed user turn clears prior question state.
 
@@ -193,7 +203,7 @@ The following class table describes legacy evidence checks and trusted runtime-o
 | Factual | AgentFinal or ToolCompleted(success) | "토요일 7시엔 두 곳이 가능합니다" |
 | Transactional | ActionCommit(success) | "예약이 완료되었습니다" |
 
-Rejected speech is recorded in the `voice_claim_rejected_total` metric and settled as undelivered. Application-owned phatic resources need no executor proof, but untrusted model prose cannot enter that path. Missing automatic text suppresses only the act, not hard-stop Abort, failure resolution, or queue recovery. A queued process act is retired on tool completion and rechecks start evidence and expiry before TTS.
+Rejected speech is recorded in the `voice_claim_rejected_total` metric and settled as undelivered. Strict reply text that names no outcome is admitted as phatic speech; it cannot carry a factual or transactional class without a confirmed outcome. The explicit legacy path classifies success claims by matching Korean phrases only, so a success claim in any other language is not recognized as transactional there. Missing automatic text suppresses only the act, not hard-stop Abort, failure resolution, or queue recovery. A queued process act is retired on tool completion and rechecks start evidence and expiry before TTS.
 
 ## Barge-in: two-stage reversible duck
 

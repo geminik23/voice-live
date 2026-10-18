@@ -791,7 +791,7 @@ async fn pcm_to_two_cartesia_providers_reaches_authorized_playback() {
     let tts =
         CartesiaStreamingTts::with_api_key(&config(&tts_server.endpoint), "test-secret".into())
             .unwrap();
-    let runtime_config = VoiceRuntimeConfig::from_yaml_str("speech:\n  mock_response: ready\n  responses:\n    ready: {kind: prompt, text: Ready. Continue?}\nasr:\n  manual_commit: true\ntts:\n  language: ko\n  voice: test-voice\nturn_control:\n  soft_silence_ms: 100\n  hard_silence_ms: 200\nobservability:\n  event_log: false").unwrap();
+    let runtime_config = VoiceRuntimeConfig::from_yaml_str("speech:\n  mock_reply: Ready. Continue?\nasr:\n  manual_commit: true\ntts:\n  language: ko\n  voice: test-voice\nturn_control:\n  soft_silence_ms: 100\n  hard_silence_ms: 200\nobservability:\n  event_log: false").unwrap();
     let runtime = VoiceRuntime::build_with_providers(
         runtime_config,
         SpeechProviders {
@@ -933,7 +933,7 @@ async fn injected_runtime_routes_authorized_reply_through_cartesia() {
     let server = server(Reply::Audio).await;
     let tts = CartesiaStreamingTts::with_api_key(&config(&server.endpoint), "test-secret".into())
         .unwrap();
-    let config = VoiceRuntimeConfig::from_yaml_str("speech:\n  mock_response: ready\n  responses:\n    ready: {kind: prompt, text: Ready}\nasr:\n  provider: inject\ntts:\n  language: ko\n  voice: test-voice\nturn_control:\n  soft_silence_ms: 100\n  hard_silence_ms: 200\nobservability:\n  event_log: false\ndev:\n  allow_text_injection: true").unwrap();
+    let config = VoiceRuntimeConfig::from_yaml_str("speech:\n  mock_reply: Ready\nasr:\n  provider: inject\ntts:\n  language: ko\n  voice: test-voice\nturn_control:\n  soft_silence_ms: 100\n  hard_silence_ms: 200\nobservability:\n  event_log: false\ndev:\n  allow_text_injection: true").unwrap();
     let runtime = VoiceRuntime::build_with_providers(
         config,
         SpeechProviders {

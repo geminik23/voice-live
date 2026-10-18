@@ -308,12 +308,15 @@ fn heard_prefix(text: &str, heard: Heard) -> String {
     }
 }
 
+// Memory annotations for the model, never spoken. They are fixed tokens rather
+// than phrases in any one language; agent instructions explain them.
+
 /// Marker appended where the user cut the assistant off mid-clause.
-pub const MARKER_INTERRUPTED: &str = "… [중단됨]";
+pub const MARKER_INTERRUPTED: &str = "… [voice-live:interrupted]";
 /// Marker appended when later clauses of a reply never played.
-pub const MARKER_REST_UNDELIVERED: &str = "[중단됨: 이후 내용은 전달되지 않음]";
+pub const MARKER_REST_UNDELIVERED: &str = "[voice-live:rest-undelivered]";
 /// Stored in place of a reply that never reached the user at all.
-pub const MARKER_UNDELIVERED: &str = "[응답이 전달되지 않음]";
+pub const MARKER_UNDELIVERED: &str = "[voice-live:undelivered]";
 
 /// Renders one reply, clause by clause, into what the user actually heard.
 ///
@@ -543,7 +546,10 @@ mod tests {
             ("홍대 키친도 가능합니다.", Heard::Full),
         ]);
 
-        assert_eq!(rendered, "확인했습니다. 토요일 7시… [중단됨]");
+        assert_eq!(
+            rendered,
+            format!("확인했습니다. 토요일 7시{MARKER_INTERRUPTED}")
+        );
         assert!(
             !rendered.contains("홍대"),
             "nothing after an interruption was heard"

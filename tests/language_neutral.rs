@@ -19,11 +19,8 @@ fn config() -> VoiceRuntimeConfig {
         r#"
 observability: {event_log: false}
 speech:
-  responses:
-    ask: {kind: prompt, text: "Continue?", question: yes_no}
+  outcomes:
     committed:
-      kind: tool_outcome
-      text: "The requested operation is confirmed."
       operation: create
       class: transactional
       receipt_fields: {status: committed}
@@ -31,6 +28,15 @@ speech:
 "#,
     )
     .unwrap()
+}
+
+fn config_with_failure_text() -> VoiceRuntimeConfig {
+    let mut cfg = config();
+    cfg.speech.failure_text = "Please say that again.".into();
+    cfg.tools
+        .effects
+        .insert("lookup".into(), voice_live::config::ToolEffect::PureRead);
+    cfg
 }
 
 fn proof() -> InvocationProof {
@@ -48,7 +54,7 @@ fn proof() -> InvocationProof {
         output_truncated: false,
     }
 }
-const PROPOSAL: &str = r#"{"response":"committed","call_id":"call-1","arguments":{"target":"A"}}"#;
+const PROPOSAL: &str = r#"{"text":"Created A.","outcome":"committed"}"#;
 
 #[test]
 fn neutral_rules_preserve_unknown_and_explicit_rules_are_not_language_modes() {
@@ -106,12 +112,17 @@ turn_control:
 }
 
 #[test]
-fn strict_renderer_checks_exact_operation_arguments_receipt_and_record_identity() {
-    let renderer = ConfiguredRenderer::new(&config().speech.responses).unwrap();
-    assert_eq!(
-        renderer.render(PROPOSAL, &[proof()]).unwrap().text,
-        "The requested operation is confirmed."
-    );
+fn strict_renderer_checks_outcome_against_executed_records_without_model_ids() {
+    let renderer = ConfiguredRenderer::new(&config().speech.outcomes).unwrap();
+    let reply = renderer.render(PROPOSAL, &[proof()]).unwrap();
+    assert_eq!(reply.text, "Created A.");
+    assert_eq!(reply.class, voice_live::speech::ClaimClass::Transactional);
+    assert_eq!(reply.records, ["record-1"]);
+    // The record is found by operation; the model never supplies a call id.
+    let mut other_call = proof();
+    other_call.call_id = "provider-generated".into();
+    assert!(renderer.render(PROPOSAL, &[other_call]).is_ok());
+    assert!(renderer.render(PROPOSAL, &[]).is_err());
     for mutate in [
         "operation",
         "target",
@@ -144,13 +155,34 @@ fn strict_renderer_checks_exact_operation_arguments_receipt_and_record_identity(
     failed.success = false;
     assert!(renderer.render(PROPOSAL, &[failed, fallback]).is_err());
     for raw in [
-        "Your reservation is confirmed.",
-        "예약을 확정했어요.",
+        "",
+        "   ",
         r#"{"class":"phatic","text":"Payment completed"}"#,
-        r#"{"response":"ask","arguments":{"text":"Payment completed"}}"#,
+        r#"{"response":"ask"}"#,
+        r#"{"text":"Done","outcome":"unknown"}"#,
+        r#"{"text":"","outcome":"committed"}"#,
     ] {
-        assert!(renderer.render(raw, &[proof()]).is_err());
+        assert!(renderer.render(raw, &[proof()]).is_err(), "{raw}");
     }
+    // Reply text in any language passes through as general speech: it names
+    // no outcome, so it carries no business evidence.
+    for raw in [
+        "Pick a date.",
+        "날짜를 알려 주세요.",
+        "日付を教えてください。",
+    ] {
+        let reply = renderer.render(raw, &[]).unwrap();
+        assert_eq!(reply.text, raw);
+        assert_eq!(reply.class, voice_live::speech::ClaimClass::Phatic);
+        assert!(reply.records.is_empty() && reply.question.is_none());
+    }
+    let hinted = renderer
+        .render(r#"{"text":"Continue?","question":"yes_no"}"#, &[])
+        .unwrap();
+    assert_eq!(
+        hinted.question,
+        Some(voice_live::interaction::ExpectedAnswerType::YesNo)
+    );
 }
 
 #[test]
@@ -160,7 +192,7 @@ fn reservation_receipt_binds_optional_backend_defaults_and_changed_requests() {
             .join("full-duplex-demo/configs/voice-runtime.yaml"),
     )
     .unwrap();
-    let renderer = ConfiguredRenderer::new(&sample.speech.responses).unwrap();
+    let renderer = ConfiguredRenderer::new(&sample.speech.outcomes).unwrap();
     let mut p = proof();
     p.operation = "reserve_restaurant".into();
     p.arguments = json!({"restaurant_id":"A","date":"2026-10-20","time":"19:00","party_size":2,"customer_name":"Test","confirmed":true,"idempotency_key":"offline"});
@@ -168,20 +200,10 @@ fn reservation_receipt_binds_optional_backend_defaults_and_changed_requests() {
     receipt["status"] = json!("committed");
     receipt["window_seat_requested"] = json!(false);
     p.output = receipt.to_string();
-    let proposal = |args: &serde_json::Value| {
-        json!({"response":"reserved","call_id":"call-1","arguments":args}).to_string()
-    };
-    assert!(
-        renderer
-            .render(&proposal(&p.arguments), &[p.clone()])
-            .is_ok()
-    );
+    let proposal = json!({"text":"Booked.","outcome":"reserved"}).to_string();
+    assert!(renderer.render(&proposal, &[p.clone()]).is_ok());
     p.arguments["window_seat_requested"] = json!(true);
-    assert!(
-        renderer
-            .render(&proposal(&p.arguments), &[p.clone()])
-            .is_err()
-    );
+    assert!(renderer.render(&proposal, &[p.clone()]).is_err());
 }
 
 struct RecordingTts(Arc<Mutex<Vec<String>>>);
@@ -230,7 +252,7 @@ async fn runtime_host_overrides_reach_real_sessions_and_factories_are_per_sessio
     let texts = Arc::new(Mutex::new(Vec::new()));
     let mut cfg = config();
     cfg.dev.allow_text_injection = true;
-    cfg.speech.mock_response = Some("ask".into());
+    cfg.speech.mock_reply = Some("ask".into());
     cfg.turn_control.slot_fallback = voice_live::config::SlotFallback::KoreanExample;
     let policies = voice_live::RuntimePolicies {
         interaction_brain: None,
@@ -316,6 +338,16 @@ async fn exercise(
     stale: bool,
     fail: bool,
 ) -> (Vec<String>, Vec<TurnResolution>) {
+    exercise_with(config(), final_text, record, stale, fail).await
+}
+
+async fn exercise_with(
+    cfg: VoiceRuntimeConfig,
+    final_text: &str,
+    record: Option<InvocationProof>,
+    stale: bool,
+    fail: bool,
+) -> (Vec<String>, Vec<TurnResolution>) {
     let texts = Arc::new(Mutex::new(Vec::new()));
     let agent = Arc::new(TestAgent {
         final_text: final_text.into(),
@@ -326,7 +358,7 @@ async fn exercise(
     });
     let shutdown = CancellationToken::new();
     let (session, handle) = VoiceSessionBuilder::new(
-        Arc::new(config()),
+        Arc::new(cfg),
         Arc::new(voice_live::playback::UnacknowledgedPlaybackSink),
         Arc::new(RecordingTts(texts.clone())),
         agent.clone(),
@@ -352,25 +384,78 @@ async fn exercise(
 #[tokio::test(start_paused = true)]
 async fn strict_rejection_blocks_tts_and_resolves_original_final_once() {
     for raw in [
-        "Your reservation is confirmed.",
-        "예약을 확정했어요.",
-        "예약 confirmed.",
+        "",
         r#"{"class":"factual","text":"Done"}"#,
+        r#"{"response":"ask"}"#,
+        r#"{"text":"Done","outcome":"unknown"}"#,
         PROPOSAL,
     ] {
         let (texts, resolutions) = exercise(raw, None, false, false).await;
         assert!(texts.is_empty(), "TTS received unproven content: {texts:?}");
         assert_eq!(resolutions.len(), 1);
         assert!(
-            matches!(&resolutions[0], TurnResolution::Audible { final_text, heard } if final_text == raw && heard.contains("응답이 전달되지 않음"))
+            matches!(&resolutions[0], TurnResolution::Audible { final_text, heard } if final_text == raw && heard == voice_live::speech::ledger::MARKER_UNDELIVERED)
+        );
+    }
+    // With failure text configured, a rejected reply is not silence.
+    let (texts, resolutions) =
+        exercise_with(config_with_failure_text(), PROPOSAL, None, false, false).await;
+    assert_eq!(texts, ["Please say that again."]);
+    assert_eq!(resolutions.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn generated_reply_text_is_spoken_and_keeps_original_final_identity() {
+    for raw in [
+        "Pick a date.",
+        r#"{"text":"Pick a date.","question":"free_text"}"#,
+    ] {
+        let (texts, resolutions) = exercise(raw, None, false, false).await;
+        assert_eq!(texts, ["Pick a date."]);
+        assert_eq!(resolutions.len(), 1);
+        assert!(
+            matches!(&resolutions[0], TurnResolution::Audible { final_text, .. } if final_text == raw)
         );
     }
 }
 
 #[tokio::test(start_paused = true)]
+async fn unconfirmed_write_replaces_any_reply_with_failure_text() {
+    let mut failed = proof();
+    failed.success = false;
+    // The reply claims success in plain words and names no outcome; the failed
+    // write in the same turn keeps it from being spoken.
+    let (texts, resolutions) = exercise_with(
+        config_with_failure_text(),
+        "Your booking is confirmed.",
+        Some(failed),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(texts, ["Please say that again."]);
+    assert!(
+        matches!(&resolutions[..], [TurnResolution::Audible { heard, .. }] if heard == voice_live::speech::ledger::MARKER_UNDELIVERED)
+    );
+    // A failed read declared pure_read does not block the model's own words.
+    let mut lookup = proof();
+    lookup.operation = "lookup".into();
+    lookup.success = false;
+    let (texts, _) = exercise_with(
+        config_with_failure_text(),
+        "Nothing was found for that date.",
+        Some(lookup),
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(texts, ["Nothing was found for that date."]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn only_current_proof_admits_rendered_speech_not_model_json() {
     let (texts, resolutions) = exercise(PROPOSAL, Some(proof()), false, false).await;
-    assert_eq!(texts, ["The requested operation is confirmed."]);
+    assert_eq!(texts, ["Created A."]);
     assert_eq!(resolutions.len(), 1);
     assert!(
         matches!(&resolutions[0], TurnResolution::Audible { final_text, .. } if final_text == PROPOSAL)

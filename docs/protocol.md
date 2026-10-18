@@ -18,7 +18,7 @@ transport-agnostic.
 
 Cartesia STT and TTS use this same browser protocol; provider finalize/close commands, connection/context IDs, continuations, and credentials stay server-side. There are no new client messages. Local server VAD controls manual STT finalization. General answers still follow authoritative AgentFinal, every SpeechAct passes the Claim Gate, and playback ACKs retain their existing heard-only meaning. Provider replacement does not establish real microphone or playback verification.
 
-Language-neutral text policies, structured agent proposals, invocation proofs, and strict renderer resources are server-side contracts. They add no browser messages or locale negotiation. Existing PCM framing and playback ACKs are unchanged; an unconfigured or rejected strict response produces no synthesized reply. Configure application resources or consult the explicit legacy migration rather than changing client wire fields.
+Language-neutral text policies, structured agent replies, invocation proofs, and strict outcome rules are server-side contracts. They add no browser messages or locale negotiation. Existing PCM framing and playback ACKs are unchanged; a rejected strict reply produces no synthesized reply text, only the configured failure text if any. Configure outcome rules or consult the explicit legacy migration rather than changing client wire fields.
 
 ## Client → server
 

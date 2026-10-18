@@ -46,15 +46,15 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 |---|---|
 | `act.rs` | `SpeechAct`, `ClaimClass`, `Interruptibility`, `EvidenceRef`, priority constants. The abort path respects `Interruptibility::Never`, but hard stop takes precedence; `AfterClause` is already satisfied because acts are split by clause |
 | `claim_gate.rs` | Exact strict clause authorization binding plus legacy class checks; Process checks start-evidence existence, and queue/TTS admission rechecks expiry |
-| `render.rs` | Strict/explicit legacy modes, bounded invocation observations, trusted `SpeechRenderer` host contract, and configured static prompt/tool-outcome resources with receipt and target checks |
-| `ledger.rs` | `AudibleLedger`. Records `Heard::{Full, Partial, None}` per clause. Interrupted clauses retain their original text, exposing only the heard portion through `heard_text()`. Keeps only the most recent `speech.audible_history_max_clauses` clauses (for self-echo detection and summaries; agent memory holds the long-term record). `render_heard_turn` renders a reply as text to retain in memory (`… [중단됨]`, etc.) |
+| `render.rs` | Strict/explicit legacy modes, bounded invocation observations, trusted `SpeechRenderer` host contract, and `ConfiguredRenderer`: parses the `{text, outcome, question}` reply (or plain text) and checks a named outcome against the turn's executed records by operation, receipt, and target bindings |
+| `ledger.rs` | `AudibleLedger`. Records `Heard::{Full, Partial, None}` per clause. Interrupted clauses retain their original text, exposing only the heard portion through `heard_text()`. Keeps only the most recent `speech.audible_history_max_clauses` clauses (for self-echo detection and summaries; agent memory holds the long-term record). `render_heard_turn` renders a reply as text to retain in memory (`… [voice-live:interrupted]`, etc.) |
 
 ## session/
 
 | Module | Description |
 |---|---|
 | `view.rs` | Pure `SessionView` projection + `SessionEvidence` storage |
-| `supervisor.rs` | Event orchestration with consumed-audio and speech admission, bounded semantic and compatibility extraction, candidate provenance/journal rollback, dependency-scoped work invalidation, deep-task admission, playback recovery, and worker-finished turn resolution |
+| `supervisor.rs` | Event orchestration with consumed-audio and speech admission, bounded semantic and compatibility extraction, candidate provenance/journal rollback, dependency-scoped work invalidation, deep-task admission, strict reply admission (unconfirmed-write check and failure text on rejection), `speech_language` in the turn brief, playback recovery, and worker-finished turn resolution |
 | `task_runner.rs` | Manages `ActiveTask` and consumes agent turns. Dropping the stream releases the framework root-turn gate |
 | `tts_worker.rs` | Complete authorized act → cache hook or duplex text admission/audio drain, request/open deadlines, response/format/sequence validation, pre-admission provider error preservation, and cancellation registry |
 | `deep_worker.rs` | `DeepWorker` trait, `DeepWorkRequest/Result`, `FakeDeepWorker` for scenarios. No automatic trigger; `VoiceSessionHandle::request_deep_work` sends `DeepWorkRequested`. Results must match a pending task and its original epoch, and use the request's dependencies |
@@ -64,7 +64,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | Module | Description |
 |---|---|
 | `mod.rs` | `CognitiveAgent`/`AgentTurnStream` traits - boundary separating the runtime from the framework. `AgentTurnRequest` separates `input` (only committed utterances) from `context: TurnContext` (turn environment for the system prompt). `resolve_turn(task_id, TurnResolution::{Audible, Discard})` reconciles turn memory |
-| `mock.rs` | `FakeAgent` (scripted; `AgentRecorder` records received requests and resolutions), `MockReservationAgent` (explicit Korean compatibility helper, no implicit selection) |
+| `mock.rs` | `FakeAgent` (scripted; `AgentRecorder` records received requests and resolutions) |
 | `proof.rs` | Framework-only `VoiceAgentHooks` and bound host tools; immutable SDK execution-scope origin, retry-safe turn tokens, bounded terminal proof projection, and no current-turn reassignment; canonical terminal retirement is independent of optional SDK stream chunks |
 | `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, `RuntimeInteractionBrain` (legacy), stateless `RuntimeSemanticBrain`, `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*`. The slot extractor rejects a whole malformed response or a response over 16384 bytes, limits updates to 32 and slot names to 128 bytes, accepts only `set`, `replace`, and `clear`, and checks confidence in 0–1. As before, `old_value: null` is represented as a present JSON null |
 

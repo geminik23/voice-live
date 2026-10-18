@@ -130,7 +130,7 @@ async fn audible_resolution_is_what_the_next_turn_sees() {
     let final_text = run_turn(&agent, request(first, "토요일 7시 예약해줘", "b")).await;
     assert_eq!(final_text, FIRST_REPLY);
 
-    let heard = "확인했습니다. 토요일 저녁… [중단됨]";
+    let heard = "확인했습니다. 토요일 저녁… [voice-live:interrupted]";
     agent.resolve_turn(
         first,
         TurnResolution::Audible {
@@ -257,7 +257,7 @@ async fn rewrite_targets_this_turns_reply_and_stops_at_its_user_message() {
         savepoint,
         &TurnResolution::Audible {
             final_text: "다른 문장".into(),
-            heard: "다른… [중단됨]".into(),
+            heard: "다른… [voice-live:interrupted]".into(),
         },
     )
     .await
@@ -266,7 +266,7 @@ async fn rewrite_targets_this_turns_reply_and_stops_at_its_user_message() {
 
     let stored = memory.get_messages(None).await.unwrap();
     assert_eq!(stored[1].content, "같은 문장", "earlier turn untouched");
-    assert_eq!(stored[3].content, "다른… [중단됨]");
+    assert_eq!(stored[3].content, "다른… [voice-live:interrupted]");
 }
 
 #[tokio::test]
@@ -308,7 +308,7 @@ async fn stale_pre_transition_text_is_left_in_place() {
         savepoint,
         &TurnResolution::Audible {
             final_text: "최종 답".into(),
-            heard: "최종… [중단됨]".into(),
+            heard: "최종… [voice-live:interrupted]".into(),
         },
     )
     .await
@@ -316,5 +316,5 @@ async fn stale_pre_transition_text_is_left_in_place() {
 
     let stored = memory.get_messages(None).await.unwrap();
     assert_eq!(stored[1].content, "이전 상태에서 만든 답");
-    assert_eq!(stored[2].content, "최종… [중단됨]");
+    assert_eq!(stored[2].content, "최종… [voice-live:interrupted]");
 }

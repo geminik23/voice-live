@@ -1,6 +1,6 @@
 # Configuration reference (voice-runtime.yaml)
 
-All fields are optional and use defaults when omitted. The YAML below illustrates the Korean demo, not the library's neutral linguistic defaults. In a minimal configuration, text rules and automatic speech resources are empty and `speech.mode` is `strict`; provide explicit resources or host policies to speak. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
+All fields are optional and use defaults when omitted. The YAML below illustrates the Korean demo, not the library's neutral linguistic defaults. In a minimal configuration, text rules and automatic speech resources are empty and `speech.mode` is `strict`. Task-agent replies are spoken as the model writes them; outcome rules only decide whether a named business outcome may be claimed. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
 
 ```yaml
 version: 1
@@ -195,7 +195,7 @@ The dedicated sample disables premade warmup and uses the reservation task spec.
 
 ## Language scope
 
-The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The reservation samples configure Korean spoken resources and enable semantic LLM interpretation without Korean rule collections. ASR locale (`ko-KR`) and TTS language (`Korean`) remain independent provider defaults, not supported-language restrictions or LLM response-language instructions. Agent/application instructions own the response language. If semantic inference is unavailable, neutral timing and conservative overlap control remain active. Multilingual end-to-end quality remains unverified.
+The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The reservation samples configure Korean automatic resources (backchannel, stop acknowledgement, failure, progress, and keyless mock reply) and enable semantic LLM interpretation without Korean rule collections. ASR locale (`ko-KR`) and TTS language (`Korean`) remain independent library defaults, not supported-language restrictions. The task agent receives `tts.language` as `speech_language` in its turn brief; the demo task spec tells the model to reply in it, because the voice synthesizes one configured language per session. The runtime does not detect or switch languages. If semantic inference is unavailable, neutral timing and conservative overlap control remain active. Multilingual end-to-end quality remains unverified.
 
 Cartesia selectors are trimmed, limited to 63 ASCII bytes, and accept a 2–8 letter primary subtag followed by nonempty 1–8 alphanumeric subtags separated by `-`. `_` is accepted as a separator alias. Empty values, `auto`, malformed separators, control characters, and query delimiters are rejected. ASR lowercases the primary code; TTS retains the selector's case and region/script content. Factory and session validation use the same resolver. Together retains its encoded full locale and Qwen its provider-native language string. No discovery, language detection, translation, or silent provider/model fallback is performed.
 
@@ -214,9 +214,9 @@ Library text-rule collections are empty by default. Configure `turn_control.hard
 | `speech.backchannel_text` | `""` | Trusted automatic backchannel text; empty disables the act, not floor control |
 | `speech.hard_stop_ack_text` | `""` | Empty suppresses only the spoken ACK; hard-stop Abort and epoch/queue recovery remain active |
 | `speech.failure_text` | `""` | Optional trusted failure/repeat prompt; empty does not skip failure resolution |
-| `speech.mode` | `strict` | Strict renderer path or explicit `legacy` raw-text compatibility |
-| `speech.responses` | `{}` | Trusted static prompt and tool-outcome resources described below |
-| `speech.mock_response` | absent | Prompt resource name emitted as a proposal by the keyless mock; must reference a configured `prompt` |
+| `speech.mode` | `strict` | Strict reply path or explicit `legacy` raw-text compatibility |
+| `speech.outcomes` | `{}` | Outcome rules a strict reply may name, described below |
+| `speech.mock_reply` | absent | Reply text of the keyless mock task agent; 1–4096 bytes |
 
 At most 256 text rules are accepted, each 1–1024 bytes; regexes are checked against a 1 MiB compilation limit and syntax minimum-length analysis rejects zero-width paths, including assertion-only word boundaries that do not match the empty string. Rules compile at construction, not on the audio/control tick. Spoken automatic resources are at most 4096 bytes. Progress templates are limited to 128, require nonempty text of at most 4096 bytes, and a positive, overflow-safe `expire_after_ms`. Their existing latency setting controls eligibility, not a delayed scheduling guarantee.
 
@@ -226,18 +226,41 @@ The interaction spec now describes semantic interpretation and must return `stat
 
 Host composition uses `VoiceRuntime::build_with_policies(config, optional_providers, RuntimePolicies)` or the direct builder. `RuntimePolicies::interaction_brain` and `slot_extractor` are per-session factories; existing exhaustive struct literals must add the new field or use `..Default::default()`. `InteractionSnapshot` now includes `heard_assistant` and `recent_user_turns`, and `SemanticFrame` includes `negated`; exhaustive struct literals require migration. `VoiceSessionBuilder::try_build` reports invalid configuration; the compatible `build` convenience method panics on invalid configuration.
 
-## Strict proposals and migration
+## Strict replies and outcomes
 
-A strict Final is a bounded JSON proposal, not spoken text. The original Final is preserved as the framework memory lookup identity. A prompt accepts only `{"response":"collect_details"}` with no model arguments. It selects trusted application text and optional question metadata. A tool outcome uses `{"response":"reserved","call_id":"the-call-id","arguments":{...}}`, where arguments must exactly match the observed executed arguments after approval.
+A strict Final is either plain reply text or one JSON object:
 
-`responses.<name>` is a tagged resource:
+```json
+{"text": "<spoken reply>", "outcome": null, "question": null}
+```
 
-- `kind: prompt`: `text` and optional `question`. This is trusted application wording, not a model-provided phatic label.
-- `kind: tool_outcome`: `text`, canonical `operation`, `class` (`factual` or `transactional`), nonempty `receipt_fields` mapping, nonempty `bindings` list, and optional `argument_defaults` mapping. The receipt must be a complete JSON object with each required field equal to the configured value; each bound receipt field must equal the corresponding executed argument or its explicitly configured backend default. No model text is interpolated. The shipped reservation resource binds the restaurant, date, time, party size, customer name, and window-seat request; the omitted window-seat argument defaults to `false`, matching the backend. Its receipt status is `committed`; search receipts use `searched`.
+- `text` (required, nonempty) is spoken as the model wrote it.
+- `outcome` (optional) names an entry of `speech.outcomes`. Leave it out or `null` for general replies.
+- `question` (optional) is a turn-taking hint for the last clause: `yes_no`, `choice`, `free_text`, or `number`. It is not evidence.
 
-At most 128 response resources are accepted, names have at most 128 bytes, text has 1–4096 bytes, operation IDs at most 256 bytes, and receipt/default mappings and bindings at most 32 entries each. Configured receipt/default values have at most 1024 serialized bytes. Proposals have at most 16384 bytes. Unknown proposal fields, meanings, missing proof, mismatched targets, conflicting same-operation call records, failed/skipped/truncated/cancelled outcomes, and unavailable renderers fail closed before TTS. An executor success flag alone never establishes a business commit. A custom `SpeechRenderer` is trusted application code responsible for its domain validation and rendering, not an untrusted model classifier.
+A Final that does not start with `{` is read as `text` with no outcome. A Final that starts with `{` must match the object above; unknown fields are rejected. The original Final is preserved as the framework memory lookup identity.
 
-Minimal YAML and direct builders no longer implicitly select Korean grammar or canned replies. The shipped examples provide Korean spoken resources, semantic LLM configuration, and structured task-agent instructions. Existing arbitrary `Final { text }` integrations can select `speech.mode: legacy`; that mode retains the old language-dependent transaction detector and does not provide the strict guarantee. Locale never selects legacy mode. Arbitrary natural-language factuality is not proven in either mode; strict guarantees cover only trusted resources and validated domain outcomes. Do not place arbitrary model prose in prompt resources or weaken proof requirements to preserve a free-text caller.
+`speech.outcomes.<name>` is an outcome rule:
+
+| Field | Contract |
+|---|---|
+| `operation` | Canonical tool operation whose executed records confirm the outcome |
+| `class` | `factual` or `transactional`; the claim class of the reply when the outcome is confirmed |
+| `receipt_fields` | Nonempty mapping; each field of the tool's JSON receipt must equal the configured value |
+| `bindings` | Nonempty list; each bound receipt field must equal the executed argument, or its `argument_defaults` value when the argument was omitted |
+| `argument_defaults` | Optional mapping of backend defaults for omitted arguments |
+
+Records are selected by operation from the executor's observations in the same turn. The model never supplies a call ID or arguments. Every record of the operation in that turn must be usable (executed, successful, not timed out, cancelled, or truncated) and pass the receipt and binding checks; one failed attempt rejects the outcome. The shipped `reserved` rule binds the restaurant, date, time, party size, customer name, and window-seat request; the omitted window-seat argument defaults to `false`, matching the backend. Its receipt status is `committed`; `availability_checked` uses `searched`.
+
+Independently of the reply, if a tool not declared `pure_read` in `tools.effects` was started and not completed, completed unsuccessfully, or left an unusable record in the turn, the reply is not spoken. Undeclared tools count as possible writes. A rejected reply is recorded as undelivered in memory, and the user hears `speech.failure_text` when it is configured.
+
+At most 128 outcome rules are accepted, names have at most 128 bytes, operation IDs at most 256 bytes, and receipt/default mappings and bindings at most 32 entries each. Configured receipt/default values have at most 1024 serialized bytes. Finals have at most 16384 bytes. A custom `SpeechRenderer` is trusted application code responsible for its own domain validation, not an untrusted model classifier.
+
+What strict mode does not do: a reply that names no outcome is spoken without any check of its content, so the model can still say in words that something happened when no tool ran. Strict mode blocks that only when a write failed in the same turn. Arbitrary natural-language truth is not proven in either mode.
+
+Migration from the earlier strict format on this branch: `speech.responses` and `speech.mock_response` are replaced by `speech.outcomes` and `speech.mock_reply`. `kind: prompt` resources are gone; the model writes those replies. `kind: tool_outcome` entries become outcome rules without `kind` and `text`. `{"response": …, "call_id": …, "arguments": …}` proposals are rejected; task specs must return the format above. Unknown keys under `speech` are ignored by the config loader, so remove the old keys rather than relying on an error.
+
+Minimal YAML and direct builders do not select Korean grammar or canned replies. Existing arbitrary `Final { text }` integrations that need the older behaviour can select `speech.mode: legacy`; that mode retains the old transaction detector, which only recognizes Korean success phrases, and does not provide the strict checks. Locale never selects legacy mode.
 
 `CognitiveEvent`/`VoiceEvent` add `InvocationProof`, and `EvidenceKind`/`SessionEvidence` add exact authorized-speech bindings. Exhaustive Rust matches and struct literals may require migration. Browser messages are unchanged. New automatic phrases and domain policies need actual callers, configuration, and tests; adding a locale string alone does not supply them.
 
@@ -288,7 +311,7 @@ them.
 
 ## Framework integration
 
-With `framework` enabled and `agents.task.spec` present, runtime startup probes the spec and credentials; actual `RuntimeAgent` construction through `AgentBuilder` occurs separately for each session. Built-in development setups (`mock`/`inject` ASR plus `mock` TTS) use the explicit `speech.mock_response` prompt resource on probe failure. Without that resource the neutral fallback does not invent a canned answer. Live built-in providers and injected providers fail strictly. An injected task spec without the `framework` feature is rejected rather than silently selecting the mock agent; omit the spec for an intentionally keyless injected setup.
+With `framework` enabled and `agents.task.spec` present, runtime startup probes the spec and credentials; actual `RuntimeAgent` construction through `AgentBuilder` occurs separately for each session. Built-in development setups (`mock`/`inject` ASR plus `mock` TTS) use the explicit `speech.mock_reply` text on probe failure. Without it the mock reply is empty, which is rejected like any other empty reply (the user hears `speech.failure_text` if configured). Live built-in providers and injected providers fail strictly. An injected task spec without the `framework` feature is rejected rather than silently selecting the mock agent; omit the spec for an intentionally keyless injected setup.
 
 A new brain is created **for each session**. `RuntimeAgent` holds conversation
 memory, so sharing one would mix transcripts between clients. Only the tool
@@ -318,8 +341,9 @@ system_prompt: |
   {{ context.voice.brief }}
 ```
 
-`brief` contains `transcript_revision`, `idempotency_key`, `semantic_frame`,
-and any speculative/deep results. You can also use
+`brief` contains `transcript_revision`, `idempotency_key`, `speech_language`
+(the configured `tts.language`), `semantic_frame`, and any speculative/deep
+results. You can also use
 `{{ context.voice.idempotency_key }}` separately.
 
 Who guarantees what:
