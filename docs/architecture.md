@@ -103,7 +103,7 @@ Logical invalidation ensures correctness even when physical HTTP cancellation is
    Task Agent input begins here. Raw partials never enter durable memory.
 
 2. **Action Commit** (`on_tool_completed`)
-   Strict speech uses invocation-scoped executor observations plus application validation of the exact business receipt and target. `executed && success` is insufficient. The explicit legacy path retains its older `action_commit` projection from executed/successful tool events, with weaker language-dependent claim classification.
+   Strict speech uses invocation-scoped executor observations plus application validation of the exact business receipt and target. `executed && success` is insufficient. The `action_commit` projection from executed/successful tool events remains as session evidence and the `voice_action_commit_total` metric; the runtime's own replies no longer use it as authorization.
 
 3. **Audible Commit** (`speech/ledger.rs` + agent memory)
    Playback ACKs establish whether each clause was heard (`Heard::Full / Partial / None`). Once all clauses in a reply have settled, the assistant message in that turn's agent memory is replaced with **what was actually heard**. The agent must not assume it delivered words the user did not hear. See “Conversation memory = what was heard” below.
@@ -180,7 +180,7 @@ When a state transition regenerates a reply, ai-agents (as tested with 1.0.11) *
 
 ## Claim Gate
 
-The default strict path is Final → write check → host renderer → exact authorized clause → Claim Gate → TTS. The model writes the reply text in the session's speech language; the runtime neither supplies wording nor detects language.
+The reply path is Final → write check → host renderer → exact authorized clause → Claim Gate → TTS. The model writes the reply text in the session's speech language; the runtime neither supplies wording nor detects language.
 
 A strict Final is `{"text": …, "outcome": …, "question": …}`, or plain text, which is read as `text` alone:
 
@@ -194,7 +194,7 @@ The residual risk is explicit: a reply that names no outcome can still claim, in
 
 Each rendered clause receives an immutable text/class/speech-ID binding in session evidence. Queue admission and TTS admission both check the binding and expiry. Deliberately surviving queued acts migrate their speech epoch together with that authorization during recovery; changing their meaning or reusing a different act ID cannot reuse the binding. Question hints become interaction state only after confirmed full playback of the associated clause, not after generation or authorization. Interrupted or rejected questions do not publish hints; a committed user turn clears prior question state.
 
-The following class table describes legacy evidence checks and trusted runtime-owned phatic/process acts. Strict factual/transactional clauses instead require the validated renderer binding.
+The following class table describes the gate's evidence checks for acts that carry no renderer binding: runtime-owned phatic/process acts and acts a host builds itself. Reply clauses with a factual or transactional class instead require the validated renderer binding.
 
 | Class | Required evidence | Example |
 |---|---|---|
@@ -203,7 +203,7 @@ The following class table describes legacy evidence checks and trusted runtime-o
 | Factual | AgentFinal or ToolCompleted(success) | "토요일 7시엔 두 곳이 가능합니다" |
 | Transactional | ActionCommit(success) | "예약이 완료되었습니다" |
 
-Rejected speech is recorded in the `voice_claim_rejected_total` metric and settled as undelivered. Strict reply text that names no outcome is admitted as phatic speech; it cannot carry a factual or transactional class without a confirmed outcome. The explicit legacy path classifies success claims by matching Korean phrases only, so a success claim in any other language is not recognized as transactional there. Missing automatic text suppresses only the act, not hard-stop Abort, failure resolution, or queue recovery. A queued process act is retired on tool completion and rechecks start evidence and expiry before TTS.
+Rejected speech is recorded in the `voice_claim_rejected_total` metric and settled as undelivered. Reply text that names no outcome is admitted as phatic speech; it cannot carry a factual or transactional class without a confirmed outcome. The runtime has no phrase-based success detector for any language. Missing automatic text suppresses only the act, not hard-stop Abort, failure resolution, or queue recovery. A queued process act is retired on tool completion and when its task ends (reply, failure, or cancellation), so a progress line never plays after the reply or failure text; it also rechecks start evidence and expiry before TTS.
 
 ## Barge-in: two-stage reversible duck
 
@@ -236,7 +236,7 @@ The sample does not install language-specific hard-stop words. An explicitly con
 
 With semantic interaction enabled, one asynchronous request interprets a bounded current candidate and confirmed-heard context. At most one request is in flight; changes are coalesced into the latest next request. The session retains immediate VAD duck, explicit stop, playback, and hard-silence control. A recognized stop is delivered independently of a slow host slot extractor. During overlap the session waits for a bounded semantic result, resumes for backchannels, and otherwise aborts conservatively after at most two configured interaction timeouts. Empty overlap resumes without waiting for a model. If the model is unavailable or its response is invalid, no language heuristic is silently installed.
 
-An explicit host `TextAnalyzer` or legacy decision brain selects the compatibility path. There, the synchronous analyzer supplies advisory cues and question hints while the deterministic reflex policy owns timing and state decisions. The following examples describe explicitly selected Korean compatibility resources, not the shipped semantic sample or library defaults.
+An explicit host `TextAnalyzer` or legacy decision brain selects the compatibility path. There, the synchronous analyzer supplies advisory cues while the deterministic reflex policy owns timing and state decisions. Question hints come only from a reply's `question` field. The following examples describe explicitly selected Korean compatibility resources, not the shipped semantic sample or library defaults.
 
 - **Incomplete ending** (ends as-is): `-는데/-고/-면/-다가/그게/...` → KeepListening even past soft silence (prevents premature commit)
 - **Complete ending**: `-해 주세요/-할게요/-인가요?/-됩니다/-해줘`, etc. → commit at soft silence (500ms)

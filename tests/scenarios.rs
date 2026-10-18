@@ -17,7 +17,6 @@ macro_rules! scenario_test {
             config.turn_control.complete_endings = korean.complete_endings;
             config.turn_control.incomplete_endings = korean.incomplete_endings;
             config.turn_control.backchannel_words = korean.backchannel_words;
-            config.speech.mode = voice_live::speech::render::SpeechMode::Legacy;
             config.speech.hard_stop_ack_text = "네, 멈췄어요.".into();
             config.speech.backchannel_text = "네".into();
             scenario.config = Some(config);
@@ -343,9 +342,9 @@ settle_ms: 1000
 );
 
 scenario_test!(
-    transactional_claim_requires_action_commit,
+    executed_write_records_an_action_commit,
     r#"
-name: transactional_claim_requires_action_commit
+name: executed_write_records_an_action_commit
 config:
   tools:
     effects:
@@ -442,6 +441,13 @@ config:
   tools:
     effects:
       reserve_restaurant: transactional_write
+  speech:
+    outcomes:
+      reserved:
+        operation: reserve_restaurant
+        class: transactional
+        receipt_fields: {status: committed}
+        bindings: [date]
 timeline:
   - at_ms: 0
     event:
@@ -464,7 +470,8 @@ agent_script:
     success: true
   - after_ms: 400
     type: final
-    text: "예약이 완료되었습니다."
+    # Names a business outcome, but no execution record backs it.
+    text: '{"text":"예약이 완료되었습니다.","outcome":"reserved"}'
 expect:
   - type: audible_excludes
     text: "예약이 완료되었습니다"
@@ -777,6 +784,37 @@ settle_ms: 2000
 );
 
 scenario_test!(
+    reply_longer_than_the_audible_history_resolves_as_heard,
+    r#"
+name: reply_longer_than_the_audible_history_resolves_as_heard
+config:
+  speech:
+    audible_history_max_clauses: 2
+agent_final: "One. Two. Three. Four. Five."
+timeline:
+  - at_ms: 0
+    event:
+      type: local_speech_started
+  - at_ms: 100
+    event:
+      type: asr_final
+      text: "read me the list"
+  - at_ms: 400
+    event:
+      type: local_speech_ended
+expect:
+  # Every clause played in full; the bounded history must not turn the early
+  # ones into undelivered markers.
+  - type: turn_resolved
+    resolution: audible
+    heard_equals_final: true
+  - type: turn_resolution_count
+    exactly: 1
+settle_ms: 4000
+"#
+);
+
+scenario_test!(
     stale_reply_is_discarded_from_memory,
     r#"
 name: stale_reply_is_discarded_from_memory
@@ -854,6 +892,13 @@ config:
   tools:
     effects:
       reserve_restaurant: transactional_write
+  speech:
+    outcomes:
+      reserved:
+        operation: reserve_restaurant
+        class: transactional
+        receipt_fields: {status: committed}
+        bindings: [date]
 timeline:
   - at_ms: 0
     event:
@@ -876,7 +921,8 @@ agent_script:
     success: true
   - after_ms: 400
     type: final
-    text: "예약이 완료되었습니다."
+    # Names a business outcome, but no execution record backs it.
+    text: '{"text":"예약이 완료되었습니다.","outcome":"reserved"}'
 expect:
   # The claim gate refused to speak an unverified reservation. Memory must not
   # keep it as though the user was told the booking succeeded.

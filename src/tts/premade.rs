@@ -48,8 +48,10 @@ struct CachedChunk {
 }
 
 impl PremadeTts {
+    /// No language or voice; use [`PremadeTts::with_settings`] to match a
+    /// configured session.
     pub fn new(inner: Arc<dyn StreamingTts>, phrases: Vec<String>) -> Self {
-        Self::with_settings(inner, phrases, "Korean".into(), String::new())
+        Self::with_settings(inner, phrases, String::new(), String::new())
     }
 
     pub fn with_settings(

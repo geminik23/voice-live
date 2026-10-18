@@ -2746,9 +2746,7 @@ impl VoiceSession {
                         self.state.active_task_id = None;
                         self.state.task = crate::interaction::TaskState::Cancelled;
                     }
-                    let started = format!("tool_started:{task_id}:");
-                    self.pending_speech
-                        .retain(|act| !act.evidence.iter().any(|e| e.id.starts_with(&started)));
+                    self.retire_task_progress(task_id);
                     self.resolve_turn(task_id, TurnResolution::Discard);
                 }
             }
@@ -3147,8 +3145,18 @@ impl VoiceSession {
         }
     }
 
+    /// Drops progress lines still queued for a task that has ended. Their
+    /// tool-started evidence can outlive the task, so the claim gate alone
+    /// would still admit them after the reply or failure text.
+    fn retire_task_progress(&mut self, task_id: TaskId) {
+        let started = format!("tool_started:{task_id}:");
+        self.pending_speech
+            .retain(|act| !act.evidence.iter().any(|e| e.id.starts_with(&started)));
+    }
+
     async fn on_strict_final(&mut self, task_id: TaskId, original: String) -> Result<()> {
         use crate::speech::render::RenderedReply;
+        self.retire_task_progress(task_id);
         let proofs = self.invocation_proofs.remove(&task_id).unwrap_or_default();
         let conflict = self.proof_conflicts.remove(&task_id);
         let rendered = if conflict {
@@ -3221,6 +3229,7 @@ impl VoiceSession {
                         self.speech_questions.insert(id, question);
                     }
                     if self.authorize_and_enqueue(act, Some(task_id)).await? {
+                        self.audible_ledger.hold(id);
                         spoken.push((id, clause));
                     }
                 }
@@ -3346,87 +3355,7 @@ impl VoiceSession {
             }
         }
 
-        if self.config.speech.mode == crate::speech::render::SpeechMode::Strict {
-            return self.on_strict_final(task_id, text).await;
-        }
-        self.active_tasks.remove(&task_id);
-        self.state.task = crate::interaction::TaskState::Finalizing;
-
-        let transactional = is_transactional_claim(&text);
-
-        let evidence: Vec<crate::speech::act::EvidenceRef> = if transactional {
-            let prefix = format!("action_commit:{task_id}:");
-            self.state
-                .evidence
-                .keys()
-                .filter(|id| id.starts_with(&prefix))
-                .map(|id| {
-                    crate::speech::act::EvidenceRef::new(
-                        id.clone(),
-                        crate::speech::act::EvidenceKind::ActionCommit,
-                    )
-                })
-                .collect()
-        } else {
-            vec![crate::speech::act::EvidenceRef::new(
-                format!("agent_final:{task_id}"),
-                crate::speech::act::EvidenceKind::AgentFinal,
-            )]
-        };
-
-        self.turn_speech.insert(
-            task_id,
-            TurnSpeech {
-                final_text: text.clone(),
-                clauses: Vec::new(),
-            },
-        );
-        let mut spoken = Vec::new();
-        for clause in split_clauses(&text) {
-            let class = if transactional {
-                ClaimClass::Transactional
-            } else {
-                ClaimClass::Factual
-            };
-
-            let act = SpeechAct {
-                id: SpeechId::new(),
-                speech_epoch: self.state.epochs.speech,
-                class,
-                text: clause.clone(),
-                priority: crate::speech::act::PRIORITY_FINAL,
-                interruptibility: Interruptibility::AfterClause,
-                evidence: evidence.clone(),
-                expires_at_monotonic_us: None,
-            };
-
-            let id = act.id;
-            if let Some(question) = self.text_analyzer.question(&clause) {
-                self.speech_questions.insert(id, question);
-            }
-            self.turn_speech
-                .get_mut(&task_id)
-                .expect("reply owner registered")
-                .clauses
-                .push((id, clause.clone()));
-            if self.authorize_and_enqueue(act, Some(task_id)).await? {
-                spoken.push((id, clause));
-            }
-        }
-
-        // Tracked until every clause settles. A reply whose clauses were all
-        // rejected by the claim gate settles immediately as undelivered, so
-        // an unverified claim never stands in memory as if the user heard it.
-        self.turn_speech.insert(
-            task_id,
-            TurnSpeech {
-                final_text: text.clone(),
-                clauses: spoken,
-            },
-        );
-
-        self.state.task = crate::interaction::TaskState::Completed;
-        Ok(())
+        self.on_strict_final(task_id, text).await
     }
 
     async fn on_agent_failed(
@@ -3442,6 +3371,7 @@ impl VoiceSession {
 
         let kind = self.active_tasks.get(&task_id).map(|task| task.kind);
         self.active_tasks.remove(&task_id);
+        self.retire_task_progress(task_id);
 
         if kind == Some(ActiveTaskKind::SpeculativeRead) {
             self.metrics.inc("voice_speculative_failed_total");
@@ -4275,6 +4205,21 @@ impl VoiceSession {
         !(queued || active || playing)
     }
 
+    /// Resolves a reply with what was heard and releases its held clauses.
+    fn resolve_heard_turn(&mut self, task_id: TaskId, turn: TurnSpeech) {
+        let heard = self.heard_rendering(&turn);
+        for (id, _) in &turn.clauses {
+            self.audible_ledger.release(*id);
+        }
+        self.resolve_turn(
+            task_id,
+            TurnResolution::Audible {
+                final_text: turn.final_text,
+                heard,
+            },
+        );
+    }
+
     fn heard_rendering(&self, turn: &TurnSpeech) -> String {
         let clauses: Vec<(&str, Heard)> = turn
             .clauses
@@ -4353,14 +4298,7 @@ impl VoiceSession {
 
         for task_id in settled {
             if let Some(turn) = self.turn_speech.remove(&task_id) {
-                let heard = self.heard_rendering(&turn);
-                self.resolve_turn(
-                    task_id,
-                    TurnResolution::Audible {
-                        final_text: turn.final_text,
-                        heard,
-                    },
-                );
+                self.resolve_heard_turn(task_id, turn);
             }
         }
     }
@@ -4413,14 +4351,7 @@ impl VoiceSession {
             .collect();
         for task_id in unresolved {
             if let Some(turn) = self.turn_speech.remove(&task_id) {
-                let heard = self.heard_rendering(&turn);
-                self.resolve_turn(
-                    task_id,
-                    TurnResolution::Audible {
-                        final_text: turn.final_text,
-                        heard,
-                    },
-                );
+                self.resolve_heard_turn(task_id, turn);
             }
         }
 
@@ -4576,14 +4507,7 @@ impl VoiceSession {
         self.deferred_turn = None;
         let turns: Vec<(TaskId, TurnSpeech)> = self.turn_speech.drain().collect();
         for (task_id, turn) in turns {
-            let heard = self.heard_rendering(&turn);
-            self.resolve_turn(
-                task_id,
-                TurnResolution::Audible {
-                    final_text: turn.final_text,
-                    heard,
-                },
-            );
+            self.resolve_heard_turn(task_id, turn);
         }
         // Tokens for acts queued but never dequeued must not outlive the
         // session either.
@@ -4643,20 +4567,6 @@ impl VoiceSession {
     }
 }
 
-fn is_transactional_claim(text: &str) -> bool {
-    let patterns = [
-        "예약이 완료",
-        "예약되었습니다",
-        "취소가 완료",
-        "취소되었습니다",
-        "결제가 완료",
-        "결제되었습니다",
-        "처리되었습니다",
-        "등록되었습니다",
-    ];
-    patterns.iter().any(|pattern| text.contains(pattern))
-}
-
 fn split_clauses(text: &str) -> Vec<String> {
     let normalized = text.trim();
     if normalized.is_empty() {
@@ -4711,13 +4621,16 @@ fn render_turn_context(
     let fingerprint = semantic_frame.dependency_fingerprint(&dependencies);
 
     // The synthesis language is configuration, and the reply must be in it to
-    // be pronounced correctly. The runtime does not detect languages.
+    // be pronounced correctly. The runtime does not detect languages; with no
+    // configured language the line is omitted rather than defaulted.
     let mut brief = format!(
         "transcript_revision: {revision}\n\
-         idempotency_key: {idempotency_key}\n\
-         speech_language: {speech_language}\n\
-         semantic_frame: {frame_json}"
+         idempotency_key: {idempotency_key}\n"
     );
+    if !speech_language.trim().is_empty() {
+        brief.push_str(&format!("speech_language: {speech_language}\n"));
+    }
+    brief.push_str(&format!("semantic_frame: {frame_json}"));
 
     let matching_speculation: Vec<&str> = speculative_hints
         .iter()
@@ -7202,6 +7115,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unrelated_main_turn_accepts_its_original_epoch_after_a_correction() {
         let (mut session, recorder, _) = harness();
+        // A read-only lookup, so the reply is not held back as an unconfirmed write.
+        Arc::make_mut(&mut session.config)
+            .tools
+            .effects
+            .insert("profile".into(), ToolEffect::PureRead);
         let mut profile = slot("user");
         profile.slot = "user_id".into();
         session
@@ -7480,6 +7398,74 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn queued_progress_is_not_spoken_after_the_task_ends() {
+        for fail in [true, false] {
+            let (mut session, _, _) = harness();
+            let config = Arc::make_mut(&mut session.config);
+            config.speech.failure_text = "Failed.".into();
+            config.speech.progress_templates.insert(
+                "lookup".into(),
+                crate::config::ProgressTemplate {
+                    text: "Working.".into(),
+                    minimum_expected_latency_ms: 1,
+                    expire_after_ms: 60_000,
+                },
+            );
+            session
+                .start_main_task(TurnId::new(), "request".into(), Revision(1))
+                .await
+                .unwrap();
+            let task = session.state.active_task_id.unwrap();
+            let epoch = session.state.epochs.thought;
+            let (tx, mut rx) = mpsc::channel(8);
+            session.speech_tx = tx;
+            session.state.speech = SpeechState::Playing;
+            session
+                .handle_event(VoiceEvent::ToolStarted {
+                    meta: session.new_meta(),
+                    task_id: task,
+                    thought_epoch: epoch,
+                    tool: "lookup".into(),
+                    args: serde_json::Value::Null,
+                })
+                .await
+                .unwrap();
+            assert_eq!(session.pending_speech.len(), 1);
+            let end = if fail {
+                VoiceEvent::AgentFailed {
+                    meta: session.new_meta(),
+                    task_id: task,
+                    thought_epoch: epoch,
+                    message: "timed out".into(),
+                }
+            } else {
+                VoiceEvent::AgentFinal {
+                    meta: session.new_meta(),
+                    task_id: task,
+                    thought_epoch: epoch,
+                    text: "Done.".into(),
+                }
+            };
+            session.handle_event(end).await.unwrap();
+
+            // Playback frees up long before the progress line would expire.
+            let mut spoken = Vec::new();
+            for _ in 0..4 {
+                session.state.speech = SpeechState::Silent;
+                session.start_next_speech_if_possible().await.unwrap();
+                while let Ok((act, _)) = rx.try_recv() {
+                    spoken.push(act.text);
+                }
+            }
+            assert!(
+                !spoken.iter().any(|text| text == "Working."),
+                "fail={fail}: {spoken:?}"
+            );
+            session.shutdown_active_work().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn partial_commit_rejects_late_audio_before_projection() {
         let (mut session, _, _) = harness();
         session
@@ -7632,36 +7618,6 @@ mod tests {
     }
 
     #[test]
-    fn expected_answer_type_classifies_assistant_questions() {
-        let analyzer = crate::semantics::text::ConfiguredTextAnalyzer::shared(
-            &crate::config::TurnControlConfig::korean_example(),
-        )
-        .unwrap();
-        let expected_answer_type = |text: &str| analyzer.question(text);
-        use crate::interaction::ExpectedAnswerType;
-
-        assert_eq!(
-            expected_answer_type("토요일 7시로 예약할까요?"),
-            Some(ExpectedAnswerType::YesNo)
-        );
-        assert_eq!(
-            expected_answer_type("몇 명이서 가시나요?"),
-            Some(ExpectedAnswerType::Number)
-        );
-        assert_eq!(
-            expected_answer_type("강남과 홍대 중에 어디가 좋으세요?"),
-            Some(ExpectedAnswerType::Choice)
-        );
-        assert_eq!(expected_answer_type("두 곳이 가능합니다."), None);
-    }
-
-    #[test]
-    fn transactional_claims_are_detected() {
-        assert!(is_transactional_claim("예약이 완료되었습니다."));
-        assert!(!is_transactional_claim("토요일 7시에 두 곳이 가능합니다."));
-    }
-
-    #[test]
     fn clauses_split_on_sentence_boundaries() {
         assert_eq!(
             split_clauses("확인했습니다. 두 곳이 가능합니다."),
@@ -7695,7 +7651,6 @@ mod tests {
         let mut config =
             VoiceRuntimeConfig::from_yaml_str("observability:\n  event_log: false").unwrap();
         config.turn_control = crate::config::TurnControlConfig::korean_example();
-        config.speech.mode = crate::speech::render::SpeechMode::Legacy;
         config.speech.hard_stop_ack_text = "네, 멈췄어요.".into();
         let config = Arc::new(config);
         let (session, _) =
@@ -8216,6 +8171,17 @@ mod tests {
         session.shutdown_active_work().await;
     }
 
+    #[test]
+    fn brief_names_the_speech_language_only_when_configured() {
+        let frame = SemanticFrame::default();
+        let render = |language: &str| {
+            render_turn_context(TurnId::new(), Revision(1), &frame, &[], &[], language).brief
+        };
+        assert!(render("English").contains("speech_language: English\n"));
+        let unset = render("");
+        assert!(!unset.contains("speech_language"));
+        assert!(unset.contains("idempotency_key: ") && unset.contains("semantic_frame: "));
+    }
     #[tokio::test(start_paused = true)]
     async fn shutdown_cancels_owned_workers_and_resolves_a_running_turn_once() {
         let (mut session, recorder, _) = harness();

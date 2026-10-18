@@ -68,7 +68,6 @@ fn neutral_rules_preserve_unknown_and_explicit_rules_are_not_language_modes() {
         let analysis = neutral.user(text);
         assert!(analysis.cues.is_empty());
         assert!(!analysis.complete && !analysis.incomplete && !analysis.backchannel);
-        assert!(neutral.question(text).is_none());
     }
     let cfg = VoiceRuntimeConfig::from_yaml_str(
         r#"
@@ -78,9 +77,6 @@ turn_control:
   complete_endings: ["finished"]
   text_rules:
     correction: ["instead of"]
-    questions:
-      - {pattern: 'how many', answer_type: number}
-      - {pattern: '\?', answer_type: yes_no}
 "#,
     )
     .unwrap();
@@ -93,10 +89,17 @@ turn_control:
         policy.classify_overlap("stop please", "", &cfg.turn_control, &cfg.echo),
         voice_live::interaction::policy::OverlapOutcome::Interruption
     );
-    assert_eq!(
-        analyzer.question("how many?"),
-        Some(voice_live::interaction::ExpectedAnswerType::Number)
-    );
+    // Removed speech keys fail loudly instead of being ignored.
+    for removed in [
+        "speech:\n  mode: legacy",
+        "speech:\n  responses: {}",
+        "speech:\n  mock_response: Hi",
+    ] {
+        assert!(
+            VoiceRuntimeConfig::from_yaml_str(removed).is_err(),
+            "{removed}"
+        );
+    }
     assert!(
         VoiceRuntimeConfig::from_yaml_str("turn_control:\n  text_rules:\n    correction: ['[']")
             .is_err()

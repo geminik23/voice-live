@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use super::cue::{CueExtractor, SemanticCue};
 use crate::config::TurnControlConfig;
-use crate::interaction::ExpectedAnswerType;
 
 /// Application-owned advisory rules, compiled once at session construction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -15,14 +14,6 @@ pub struct TextRules {
     pub negation: Vec<String>,
     pub intents: BTreeMap<String, Vec<String>>,
     pub entities: BTreeMap<String, String>,
-    pub questions: Vec<QuestionRule>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionRule {
-    pub pattern: String,
-    pub answer_type: ExpectedAnswerType,
 }
 
 #[derive(Default)]
@@ -36,30 +27,19 @@ pub struct UserTextAnalysis {
 /// Pure, synchronous interpretation; authorization, clocks and state remain in the runtime.
 pub trait TextAnalyzer: Send + Sync {
     fn user(&self, text: &str) -> UserTextAnalysis;
-    fn question(&self, _text: &str) -> Option<ExpectedAnswerType> {
-        None
-    }
 }
 
 pub struct ConfiguredTextAnalyzer {
     config: TurnControlConfig,
     cues: CueExtractor,
-    questions: Vec<(regex::Regex, ExpectedAnswerType)>,
 }
 
 impl ConfiguredTextAnalyzer {
     pub fn new(config: &TurnControlConfig) -> anyhow::Result<Self> {
         validate_rules(config)?;
-        let questions = config
-            .text_rules
-            .questions
-            .iter()
-            .map(|r| Ok((regex::Regex::new(&r.pattern)?, r.answer_type)))
-            .collect::<anyhow::Result<_>>()?;
         Ok(Self {
             config: config.clone(),
             cues: CueExtractor::try_from_config(config)?,
-            questions,
         })
     }
     pub fn shared(config: &TurnControlConfig) -> anyhow::Result<Arc<dyn TextAnalyzer>> {
@@ -76,7 +56,6 @@ pub fn validate_rules(config: &TurnControlConfig) -> anyhow::Result<()> {
         .chain(rules.intents.values().flatten())
         .map(String::as_str)
         .chain(rules.entities.values().map(String::as_str))
-        .chain(rules.questions.iter().map(|r| r.pattern.as_str()))
         .collect();
     let literals: Vec<&str> = config
         .hard_stop_phrases
@@ -161,11 +140,5 @@ impl TextAnalyzer for ConfiguredTextAnalyzer {
                 .any(|p| text.trim_end().ends_with(p))
                 || ending(text, &self.config.incomplete_endings),
         }
-    }
-    fn question(&self, text: &str) -> Option<ExpectedAnswerType> {
-        self.questions
-            .iter()
-            .find(|(re, _)| re.is_match(text))
-            .map(|(_, t)| *t)
     }
 }

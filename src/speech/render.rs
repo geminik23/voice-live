@@ -4,14 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpeechMode {
-    #[default]
-    Strict,
-    Legacy,
-}
-
 /// Bounded executor observation, not a business success assertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvocationProof {

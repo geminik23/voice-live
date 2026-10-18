@@ -78,3 +78,22 @@ async fn runtime_pipeline_without_gateway() {
     assert!(audio_frames > 0, "client must receive audio chunks");
     assert!(saw_speech_done, "client must receive speech_done");
 }
+
+#[tokio::test]
+async fn network_providers_need_an_explicit_language() {
+    // There is no default language; a network provider must not silently get one.
+    for (yaml, key) in [
+        (
+            "asr:\n  provider: cartesia\nobservability:\n  event_log: false",
+            "asr.locale",
+        ),
+        (
+            "tts:\n  provider: qwen\nobservability:\n  event_log: false",
+            "tts.language",
+        ),
+    ] {
+        let config = VoiceRuntimeConfig::from_yaml_str(yaml).unwrap();
+        let error = VoiceRuntime::build(config).await.err().expect("rejected");
+        assert!(error.to_string().contains(key), "{error}");
+    }
+}

@@ -24,6 +24,7 @@ asr:
   api_key_env: TOGETHER_API_KEY
   chunk_ms: 160
   manual_commit: false
+  # No default; network ASR providers refuse to start without it.
   locale: ko-KR
   # Bounded safety limits for the duplex recognizer connection.
   open_timeout_ms: 10000
@@ -51,7 +52,9 @@ tts:
   voice_env: QWEN_VOICE_ID
   sample_rate_hz: 24000
   chunk_ms: 60
-  # Language sent with synthesis and premade warmup requests.
+  # Language sent with synthesis and premade warmup requests, and the reply
+  # language given to the task agent. No default; network TTS providers
+  # refuse to start without it.
   language: Korean
   # Bounded safety limits for one synthesis response.
   open_timeout_ms: 10000
@@ -108,7 +111,6 @@ agents:
     allow_pure_read: true
 
 speech:
-  mode: strict
   # Reply of the keyless mock task agent. This and the other spoken texts
   # below are in the sample's session language (tts.language); the task agent
   # writes its own replies in that language.

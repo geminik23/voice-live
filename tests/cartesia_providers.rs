@@ -179,6 +179,7 @@ fn config(endpoint: &str) -> TtsConfig {
         voice: "test-voice".into(),
         api_key_env: "CARTESIA_API_KEY".into(),
         voice_env: "CARTESIA_VOICE_ID".into(),
+        language: "Korean".into(),
         ..TtsConfig::default()
     }
 }
@@ -284,7 +285,8 @@ async fn selectors_preserve_region_script_and_aliases_on_every_fragment() {
         );
         close(session, server).await;
     }
-    assert_eq!(TtsConfig::default().language, "Korean");
+    // No built-in language: the session language is always explicit.
+    assert_eq!(TtsConfig::default().language, "");
 }
 
 #[tokio::test]
@@ -781,6 +783,7 @@ async fn pcm_to_two_cartesia_providers_reaches_authorized_playback() {
         provider: "cartesia".into(),
         model: "ink-whisper".into(),
         manual_commit: true,
+        locale: "ko-KR".into(),
         ..voice_live::config::AsrConfig::default()
     };
     let asr = voice_live::asr::cartesia::CartesiaStreamingAsr::with_api_key(
@@ -791,7 +794,7 @@ async fn pcm_to_two_cartesia_providers_reaches_authorized_playback() {
     let tts =
         CartesiaStreamingTts::with_api_key(&config(&tts_server.endpoint), "test-secret".into())
             .unwrap();
-    let runtime_config = VoiceRuntimeConfig::from_yaml_str("speech:\n  mock_reply: Ready. Continue?\nasr:\n  manual_commit: true\ntts:\n  language: ko\n  voice: test-voice\nturn_control:\n  soft_silence_ms: 100\n  hard_silence_ms: 200\nobservability:\n  event_log: false").unwrap();
+    let runtime_config = VoiceRuntimeConfig::from_yaml_str("speech:\n  mock_reply: Ready. Continue?\nasr:\n  manual_commit: true\n  locale: ko-KR\ntts:\n  language: ko\n  voice: test-voice\nturn_control:\n  soft_silence_ms: 100\n  hard_silence_ms: 200\nobservability:\n  event_log: false").unwrap();
     let runtime = VoiceRuntime::build_with_providers(
         runtime_config,
         SpeechProviders {

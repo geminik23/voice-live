@@ -1,6 +1,6 @@
 # Configuration reference (voice-runtime.yaml)
 
-All fields are optional and use defaults when omitted. The YAML below illustrates the Korean demo, not the library's neutral linguistic defaults. In a minimal configuration, text rules and automatic speech resources are empty and `speech.mode` is `strict`. Task-agent replies are spoken as the model writes them; outcome rules only decide whether a named business outcome may be claimed. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
+All fields are optional and use defaults when omitted. The YAML below illustrates the Korean demo, not the library's neutral linguistic defaults. In a minimal configuration, text rules, automatic speech resources, `asr.locale`, and `tts.language` are empty. Task-agent replies are spoken as the model writes them; outcome rules only decide whether a named business outcome may be claimed. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
 
 ```yaml
 version: 1
@@ -21,7 +21,7 @@ asr:
   chunk_ms: 160
   manual_commit: false     # when true, server VAD controls endpointing and
                            # admits a FIFO provider commit after the frame's PCM
-  locale: ko-KR
+  locale: ko-KR            # no default; required by the together and cartesia providers
   open_timeout_ms: 10000
   write_timeout_ms: 2000
   input_buffer_ms: 1000
@@ -44,7 +44,7 @@ tts:
   voice_env: QWEN_VOICE_ID # voice IDs are account-specific; do not commit one to config
   sample_rate_hz: 24000
   chunk_ms: 60
-  language: Korean
+  language: Korean         # no default; required by qwen and cartesia; also the agent's reply language
   open_timeout_ms: 10000
   request_timeout_ms: 30000
   max_input_bytes: 65536
@@ -124,7 +124,7 @@ echo:
 observability:
   event_log: true
   event_log_dir: target/voice-traces
-  include_sensitive_payloads: false  # default: redact transcript/audio text
+  include_sensitive_payloads: false  # default: redact transcript, reply, and tool-result text
 
 dev:
   allow_text_injection: true   # allow the inject_user_text client message
@@ -195,7 +195,7 @@ The dedicated sample disables premade warmup and uses the reservation task spec.
 
 ## Language scope
 
-The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The reservation samples configure Korean automatic resources (backchannel, stop acknowledgement, failure, progress, and keyless mock reply) and enable semantic LLM interpretation without Korean rule collections. ASR locale (`ko-KR`) and TTS language (`Korean`) remain independent library defaults, not supported-language restrictions. The task agent receives `tts.language` as `speech_language` in its turn brief; the demo task spec tells the model to reply in it, because the voice synthesizes one configured language per session. The runtime does not detect or switch languages. If semantic inference is unavailable, neutral timing and conservative overlap control remain active. Multilingual end-to-end quality remains unverified.
+The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The reservation samples configure Korean automatic resources (backchannel, stop acknowledgement, failure, progress, and keyless mock reply) and enable semantic LLM interpretation without Korean rule collections. `asr.locale` and `tts.language` have no default; the built-in network providers refuse to start without them, and mock/inject providers do not need them. The task agent receives `tts.language` as `speech_language` in its turn brief; the demo task spec tells the model to reply in it, because the voice synthesizes one configured language per session. With `tts.language` unset the brief has no `speech_language` line and the demo spec replies in the user's language. The runtime does not detect or switch languages. If semantic inference is unavailable, neutral timing and conservative overlap control remain active. Multilingual end-to-end quality remains unverified.
 
 Cartesia selectors are trimmed, limited to 63 ASCII bytes, and accept a 2–8 letter primary subtag followed by nonempty 1–8 alphanumeric subtags separated by `-`. `_` is accepted as a separator alias. Empty values, `auto`, malformed separators, control characters, and query delimiters are rejected. ASR lowercases the primary code; TTS retains the selector's case and region/script content. Factory and session validation use the same resolver. Together retains its encoded full locale and Qwen its provider-native language string. No discovery, language detection, translation, or silent provider/model fallback is performed.
 
@@ -209,12 +209,10 @@ Library text-rule collections are empty by default. Configure `turn_control.hard
 | `turn_control.text_rules.negation` | `[]` | Regex list producing advisory Negation cues |
 | `turn_control.text_rules.intents` | `{}` | Intent name to regex list; first matching name in sorted order wins |
 | `turn_control.text_rules.entities` | `{}` | Slot name to regex; retains the first matched text verbatim, without domain normalization |
-| `turn_control.text_rules.questions` | `[]` | Ordered `{pattern, answer_type}` rules; first matching regex wins. Types: `yes_no`, `choice`, `free_text`, `number` |
 | `turn_control.slot_fallback` | `neutral` | `neutral` yields no slot updates; `korean_example` explicitly enables the reservation heuristic |
 | `speech.backchannel_text` | `""` | Trusted automatic backchannel text; empty disables the act, not floor control |
 | `speech.hard_stop_ack_text` | `""` | Empty suppresses only the spoken ACK; hard-stop Abort and epoch/queue recovery remain active |
 | `speech.failure_text` | `""` | Optional trusted failure/repeat prompt; empty does not skip failure resolution |
-| `speech.mode` | `strict` | Strict reply path or explicit `legacy` raw-text compatibility |
 | `speech.outcomes` | `{}` | Outcome rules a strict reply may name, described below |
 | `speech.mock_reply` | absent | Reply text of the keyless mock task agent; 1–4096 bytes |
 
@@ -256,11 +254,11 @@ Independently of the reply, if a tool not declared `pure_read` in `tools.effects
 
 At most 128 outcome rules are accepted, names have at most 128 bytes, operation IDs at most 256 bytes, and receipt/default mappings and bindings at most 32 entries each. Configured receipt/default values have at most 1024 serialized bytes. Finals have at most 16384 bytes. A custom `SpeechRenderer` is trusted application code responsible for its own domain validation, not an untrusted model classifier.
 
-What strict mode does not do: a reply that names no outcome is spoken without any check of its content, so the model can still say in words that something happened when no tool ran. Strict mode blocks that only when a write failed in the same turn. Arbitrary natural-language truth is not proven in either mode.
+What this does not do: a reply that names no outcome is spoken without any check of its content, so the model can still say in words that something happened when no tool ran. It is blocked only when a write failed in the same turn. Arbitrary natural-language truth is not proven.
 
-Migration from the earlier strict format on this branch: `speech.responses` and `speech.mock_response` are replaced by `speech.outcomes` and `speech.mock_reply`. `kind: prompt` resources are gone; the model writes those replies. `kind: tool_outcome` entries become outcome rules without `kind` and `text`. `{"response": …, "call_id": …, "arguments": …}` proposals are rejected; task specs must return the format above. Unknown keys under `speech` are ignored by the config loader, so remove the old keys rather than relying on an error.
+Migration from the earlier strict format on this branch: `speech.responses` and `speech.mock_response` are replaced by `speech.outcomes` and `speech.mock_reply`. `kind: prompt` resources are gone; the model writes those replies. `kind: tool_outcome` entries become outcome rules without `kind` and `text`. `{"response": …, "call_id": …, "arguments": …}` proposals are rejected; task specs must return the format above. Unknown keys under `speech` are rejected at load, so the old keys fail with an error.
 
-Minimal YAML and direct builders do not select Korean grammar or canned replies. Existing arbitrary `Final { text }` integrations that need the older behaviour can select `speech.mode: legacy`; that mode retains the old transaction detector, which only recognizes Korean success phrases, and does not provide the strict checks. Locale never selects legacy mode.
+Minimal YAML and direct builders do not select Korean grammar, canned replies, or a language. `speech.mode` and its `legacy` mode are removed: plain-text Finals are already spoken as written, and legacy's only remaining difference was a success-phrase detector that recognized Korean only. Remove `speech.mode` from configs; it is now a load error. `turn_control.text_rules.questions` is removed for the same reason (its only caller was legacy mode); a reply's `question` field supplies the hint. Configs that relied on the former `ko-KR`/`Korean` defaults with a network provider must set `asr.locale` and `tts.language`.
 
 `CognitiveEvent`/`VoiceEvent` add `InvocationProof`, and `EvidenceKind`/`SessionEvidence` add exact authorized-speech bindings. Exhaustive Rust matches and struct literals may require migration. Browser messages are unchanged. New automatic phrases and domain policies need actual callers, configuration, and tests; adding a locale string alone does not supply them.
 
@@ -272,7 +270,7 @@ Minimal YAML and direct builders do not select Korean grammar or canned replies.
 | `asr.write_timeout_ms` | 2000 | Audio and commit socket writes |
 | `asr.input_buffer_ms` | 1000 | Pending mono PCM16 sample budget, `input_sample_rate_hz * input_buffer_ms / 1000`; commands are separately bounded at 64 |
 | `tts.open_timeout_ms` | 10000 | Text-session open and built-in Qwen setup; a buffered bridge does not start its provider until finish |
-| `tts.language` | `Korean` | Normal and premade synthesis requests, separately from `asr.locale` |
+| `tts.language` | none | Normal and premade synthesis requests, separately from `asr.locale`; required by the built-in network TTS providers |
 | `tts.request_timeout_ms` | 30000 | One response; buffered deadline starts at finish admission, native providers start at the first accepted nonempty text and must not extend it on append |
 | `tts.max_input_bytes` | 65536 | Accumulated UTF-8 text bytes per response |
 | `speech.playback_stop_ack_timeout_ms` | 1000 | After Abort, await interrupted ACK before conservative settlement; valid range 1–5000 |
@@ -342,7 +340,7 @@ system_prompt: |
 ```
 
 `brief` contains `transcript_revision`, `idempotency_key`, `speech_language`
-(the configured `tts.language`), `semantic_frame`, and any speculative/deep
+(the configured `tts.language`; omitted when unset), `semantic_frame`, and any speculative/deep
 results. You can also use
 `{{ context.voice.idempotency_key }}` separately.
 

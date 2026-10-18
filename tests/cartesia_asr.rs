@@ -215,7 +215,8 @@ async fn english_session_locale_is_sent_on_wire_without_changing_defaults() {
         matches!(next(&mut session).await,Some(AsrEvent::Final {text,..}) if text == "English speech")
     );
     assert!(next(&mut session).await.is_none());
-    assert_eq!(AsrConfig::default().locale, "ko-KR");
+    // No built-in language: the session locale is always explicit.
+    assert_eq!(AsrConfig::default().locale, "");
     cleanup(session, worker).await;
 }
 

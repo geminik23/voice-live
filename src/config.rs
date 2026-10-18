@@ -203,8 +203,9 @@ fn default_chunk_ms() -> u64 {
     160
 }
 
+/// No built-in language: providers that need one must be configured with it.
 fn default_asr_locale() -> String {
-    "ko-KR".into()
+    String::new()
 }
 
 fn default_asr_open_timeout_ms() -> u64 {
@@ -326,8 +327,9 @@ fn default_tts_chunk_ms() -> u64 {
     60
 }
 
+/// No built-in language; it is also the reply language given to the task agent.
 fn default_tts_language() -> String {
-    "Korean".into()
+    String::new()
 }
 
 fn default_tts_open_timeout_ms() -> u64 {
@@ -389,7 +391,6 @@ pub enum SlotFallback {
 impl TurnControlConfig {
     /// Explicit compatibility resources for the Korean reservation example.
     pub fn korean_example() -> Self {
-        use crate::interaction::ExpectedAnswerType;
         Self {
             hard_stop_phrases: default_hard_stop_phrases(),
             incomplete_endings: default_incomplete_endings(),
@@ -414,20 +415,6 @@ impl TurnControlConfig {
                     ),
                 ]
                 .into(),
-                questions: vec![
-                    crate::semantics::text::QuestionRule {
-                        pattern: "몇 명".into(),
-                        answer_type: ExpectedAnswerType::Number,
-                    },
-                    crate::semantics::text::QuestionRule {
-                        pattern: "어디|중에".into(),
-                        answer_type: ExpectedAnswerType::Choice,
-                    },
-                    crate::semantics::text::QuestionRule {
-                        pattern: r"\?|할까요|맞나요|드릴까요|하시겠어요|어떠세요|인가요".into(),
-                        answer_type: ExpectedAnswerType::YesNo,
-                    },
-                ],
             },
             ..Self::default()
         }
@@ -684,7 +671,10 @@ impl Default for SpeculativeConfig {
     }
 }
 
+/// Unknown keys are rejected so removed or renamed keys (`mode`,
+/// `responses`, `mock_response`) fail at load instead of being ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeechConfig {
     #[serde(default)]
     pub progress_templates: HashMap<String, ProgressTemplate>,
@@ -694,8 +684,6 @@ pub struct SpeechConfig {
     pub backchannel_text: String,
     #[serde(default)]
     pub failure_text: String,
-    #[serde(default)]
-    pub mode: crate::speech::render::SpeechMode,
     /// Business outcomes a strict reply may name, checked against the turn's
     /// executed tool records. The spoken words come from the model.
     #[serde(default)]

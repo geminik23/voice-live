@@ -35,7 +35,6 @@ turn_control:
   slot_fallback: neutral
 
 speech:
-  mode: strict
   # Reply of the keyless mock task agent. This and the other spoken texts
   # below are in the sample's session language (tts.language); the task agent
   # writes its own replies in that language.

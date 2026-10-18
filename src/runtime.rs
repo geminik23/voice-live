@@ -128,6 +128,22 @@ impl VoiceRuntime {
     }
 
     pub async fn build_from_arc(config: Arc<VoiceRuntimeConfig>) -> anyhow::Result<Arc<Self>> {
+        // Built-in network providers get the configured language verbatim;
+        // there is no default language to fall back on.
+        if matches!(config.asr.provider.as_str(), "together" | "cartesia") {
+            anyhow::ensure!(
+                !config.asr.locale.trim().is_empty(),
+                "asr.locale must be set for asr.provider '{}'",
+                config.asr.provider
+            );
+        }
+        if matches!(config.tts.provider.as_str(), "qwen" | "cartesia") {
+            anyhow::ensure!(
+                !config.tts.language.trim().is_empty(),
+                "tts.language must be set for tts.provider '{}'",
+                config.tts.provider
+            );
+        }
         let asr: Arc<dyn StreamingAsr> = match config.asr.provider.as_str() {
             "together" => Arc::new(TogetherNemotronAsr::from_config(&config.asr)?),
             "cartesia" => Arc::new(CartesiaStreamingAsr::from_config(&config.asr)?),

@@ -163,7 +163,12 @@ fn event_payload(event: &VoiceEvent, include_sensitive: bool) -> Value {
             success,
             output,
             ..
-        } => serde_json::json!({ "tool": tool, "success": success, "output": output }),
+        } => serde_json::json!({
+            "tool": tool,
+            "success": success,
+            // Tool results can carry customer data, such as a reservation name.
+            "output": sensitive_text(output, include_sensitive),
+        }),
         VoiceEvent::ToolExecuted {
             tool,
             call_id,
@@ -264,5 +269,26 @@ mod tests {
         assert_eq!(redacted["hypothesis"]["redacted"], true);
         assert_eq!(redacted["hypothesis"]["chars"], 9);
         assert_eq!(included["hypothesis"], "민감한 예약 내용");
+    }
+
+    #[test]
+    fn tool_output_is_redacted_by_default() {
+        let event = VoiceEvent::ToolCompleted {
+            meta: meta(),
+            task_id: crate::ids::TaskId::new(),
+            thought_epoch: 1,
+            tool: "reserve_restaurant".into(),
+            success: true,
+            output: r#"{"status":"committed","customer_name":"Test Person"}"#.into(),
+        };
+
+        let redacted = event_payload(&event, false);
+        assert_eq!(redacted["tool"], "reserve_restaurant");
+        assert_eq!(redacted["success"], true);
+        assert!(!redacted.to_string().contains("Test Person"));
+        assert_eq!(redacted["output"]["redacted"], true);
+
+        let included = event_payload(&event, true);
+        assert!(included["output"].as_str().unwrap().contains("Test Person"));
     }
 }

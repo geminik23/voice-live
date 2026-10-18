@@ -96,6 +96,18 @@ cargo test --test provider_contracts -- --ignored
 
 For an unverified provider combination, start diagnosis with the `provider_error` events in the logs and `target/voice-traces/<date>/<session>/events.jsonl`.
 
+### When the demo sends data out and can incur charges
+
+Each of these happens on its own; changing one setting can start external calls even if everything else is still mock.
+
+- **Semantic interpretation:** with `agents.interaction.enabled: true` (the default sample) and `OPENAI_API_KEY` present, each candidate utterance and the recently heard assistant text go to the model, even when the task agent is mock.
+- **Task agent:** with `agents.task.spec` set and `OPENAI_API_KEY` present, every committed turn goes to the model.
+- **Speculative reads and deep work:** off in the sample. Enabling `agents.speculative` or `agents.deep` adds model calls of their own.
+- **Premade warmup:** the default sample has `tts.premade.enabled: true`. With mock TTS this is free, but switching `tts.provider` to `qwen` or `cartesia` synthesizes every premade phrase at startup, before any browser connects.
+- **Real ASR/TTS:** a network ASR streams microphone audio from session start, and a network TTS is called for every spoken act.
+
+A built-in network provider also needs an explicit `asr.locale` or `tts.language`; startup fails without one.
+
 ## Cartesia streaming STT and TTS
 
 `full-duplex-demo/configs/voice-runtime.cartesia.yaml` selects Cartesia Ink Whisper manual streaming STT and native Sonic TTS. The default configuration stays keyless. For typed-input TTS-only diagnosis, use `voice-runtime.cartesia-tts.yaml` instead; it deliberately keeps inject ASR.
@@ -124,7 +136,7 @@ Together uses its documented `session.created` readiness and JSON/base64 PCM pro
 
 Use `VoiceRuntime::build_with_policies(config, providers, RuntimePolicies)` to supply a pure shared `TextAnalyzer`, per-session slot-extractor factory, or trusted `SpeechRenderer`. Pass `None` for `providers` to retain built-in factories. Explicit host overrides take precedence; otherwise configured framework extraction and the declared fallback remain active. Direct sessions expose matching builder injection points and `try_build` validation. The library adds no locale negotiation or transport dependency.
 
-The shipped task spec returns `{"text", "outcome", "question"}` replies for a bounded reservation example. Another spec needs its own `speech.outcomes` rules and `tools.effects` declarations before it can report business outcomes, or can explicitly opt into legacy free text with its documented safety limits. Changing `tts.language` changes the `speech_language` the task agent is asked to reply in, but not the automatic resources (backchannel, stop acknowledgement, failure, progress), `asr.locale`, or any grammar; set those together. A custom framework agent using `VoiceAgentHooks` must register tools through `hooks.bind_tool`; unbound results cannot authorize strict business speech. The adapter uses a stable session actor and an immutable per-turn sender token for execution provenance, not as user authentication.
+The shipped task spec returns `{"text", "outcome", "question"}` replies for a bounded reservation example. Another spec can return plain text, which is spoken unchecked; it needs its own `speech.outcomes` rules and `tools.effects` declarations before it can report business outcomes. Changing `tts.language` changes the `speech_language` the task agent is asked to reply in, but not the automatic resources (backchannel, stop acknowledgement, failure, progress), `asr.locale`, or any grammar; set those together. With `tts.language` unset, the brief has no `speech_language` and the shipped spec tells the agent to reply in the user's language. A custom framework agent using `VoiceAgentHooks` must register tools through `hooks.bind_tool`; unbound results cannot authorize strict business speech. The adapter uses a stable session actor and an immutable per-turn sender token for execution provenance, not as user authentication.
 
 ## Environment variables
 
@@ -164,8 +176,9 @@ Microphone permissions require HTTPS in production, so terminate TLS at a revers
 
 - **JSONL event log**: `target/voice-traces/<date>/<session_id>/events.jsonl`
   - Records every partial revision, commit, tool lifecycle event, TTS chunk, and playback ACK.
-  - By default, redacts transcript/agent text, retaining only character counts.
-  - Stores original text and SessionClosed text only when `include_sensitive_payloads: true`.
+  - By default, redacts transcript text, agent replies, and tool results (which can carry customer data such as a reservation name), retaining only character counts. Tool names and success flags are kept; tool arguments are never logged.
+  - Stores original text, tool results, and SessionClosed text only when `include_sensitive_payloads: true`.
+  - Error messages (`agent_failed`, `provider_error`, and the matching `tracing` warnings) are logged as produced, because they are needed for operation. Tools and providers should not put customer data in error text.
   - The writer drains the event channel until it closes, recording the final SessionClosed event.
 - **Metrics**: `Metrics` counters and latency series (P50/P95/P99) are recorded within each session under `voice_*` names.
 - When the browser WebSocket disconnects, the session supervisor is canceled and all tasks and TTS are cleaned up.

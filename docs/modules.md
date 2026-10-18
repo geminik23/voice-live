@@ -13,7 +13,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `events.rs` | All `VoiceEvent` variants and `SessionSummary` |
 | `config.rs` | `VoiceRuntimeConfig` with neutral linguistic defaults, bounded rule/resource validation, explicit `SlotFallback`, and `TurnControlConfig::korean_example()` compatibility resources |
 | `metrics.rs` | P50/P95/P99 snapshots of counters and latency series (up to 1024 samples) |
-| `logging.rs` | JSONL event log (`target/voice-traces/<date>/<session>/events.jsonl`) |
+| `logging.rs` | JSONL event log (`target/voice-traces/<date>/<session>/events.jsonl`); transcript, reply, and tool-result text is redacted to a character count unless `include_sensitive_payloads` is set |
 | `echo.rs` | Text-similarity self-echo filter (bigram Dice) |
 | `media.rs` | Audio frame codec, sequence tracker, and resampler. `build_resampler` chooses `DecimatingResampler` for integer ratios (windowed-sinc anti-alias; phase calculated from the absolute stream index), otherwise `LinearResampler` (low-pass then linear interpolation; carries over the last sample of the previous chunk to rebase phase, avoiding length-proportional drift). Failures are not silently ignored |
 | `replay.rs` | PCM16 WAV source + realtime replay API using actual 20ms timestamps |
@@ -35,7 +35,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | Module | Description |
 |---|---|
 | `cue.rs` | `CueExtractor`. Application-owned literal hard stops and configured correction/negation/intent/entity regexes; no implicit language grammar |
-| `text.rs` | Pure `TextAnalyzer`, `UserTextAnalysis`, bounded `TextRules`/ordered `QuestionRule`, and compiled `ConfiguredTextAnalyzer`; no clock, I/O, state mutation, or authorization |
+| `text.rs` | Pure `TextAnalyzer`, `UserTextAnalysis`, bounded `TextRules`, and compiled `ConfiguredTextAnalyzer`; no clock, I/O, state mutation, or authorization |
 | `frame.rs` | `SemanticFrame`, turn-local negation, `SemanticValue(status)`, slot operations, dependency fingerprint. `SlotOperation::Clear` actually removes the slot |
 | `extractor.rs` | `SlotExtractor`, `NoopSlotExtractor`, explicit `configured_fallback`, and optional `HeuristicKoreanSlotExtractor` compatibility helper. Extracts date/time/party size and detects `X 말고 Y` corrections for **all three slots**. The supervisor invalidates dependencies when an accepted value changes, including Clear and absence-to-value; provisional cues do not cancel work. Values are compared as `Value` values. Can be replaced by `RuntimeSlotExtractor` (LLM) when the framework is enabled |
 | `partial_policy.rs` | Gate for partial controller calls. Urgent calls run immediately; semantic deltas have a minimum interval and a maximum flush interval. Injected clock |
@@ -45,16 +45,16 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | Module | Description |
 |---|---|
 | `act.rs` | `SpeechAct`, `ClaimClass`, `Interruptibility`, `EvidenceRef`, priority constants. The abort path respects `Interruptibility::Never`, but hard stop takes precedence; `AfterClause` is already satisfied because acts are split by clause |
-| `claim_gate.rs` | Exact strict clause authorization binding plus legacy class checks; Process checks start-evidence existence, and queue/TTS admission rechecks expiry |
-| `render.rs` | Strict/explicit legacy modes, bounded invocation observations, trusted `SpeechRenderer` host contract, and `ConfiguredRenderer`: parses the `{text, outcome, question}` reply (or plain text) and checks a named outcome against the turn's executed records by operation, receipt, and target bindings |
-| `ledger.rs` | `AudibleLedger`. Records `Heard::{Full, Partial, None}` per clause. Interrupted clauses retain their original text, exposing only the heard portion through `heard_text()`. Keeps only the most recent `speech.audible_history_max_clauses` clauses (for self-echo detection and summaries; agent memory holds the long-term record). `render_heard_turn` renders a reply as text to retain in memory (`… [voice-live:interrupted]`, etc.) |
+| `claim_gate.rs` | Exact reply-clause authorization binding plus class evidence checks for unbound acts; Process checks start-evidence existence, and queue/TTS admission rechecks expiry |
+| `render.rs` | Bounded invocation observations, trusted `SpeechRenderer` host contract, and `ConfiguredRenderer`: parses the `{text, outcome, question}` reply (or plain text) and checks a named outcome against the turn's executed records by operation, receipt, and target bindings |
+| `ledger.rs` | `AudibleLedger`. Records `Heard::{Full, Partial, None}` per clause. Interrupted clauses retain their original text, exposing only the heard portion through `heard_text()`. Keeps only the most recent `speech.audible_history_max_clauses` clauses (for self-echo detection and summaries; agent memory holds the long-term record); clauses of a reply whose turn is not yet resolved are held outside that window, so a long reply still resolves with what was heard. `render_heard_turn` renders a reply as text to retain in memory (`… [voice-live:interrupted]`, etc.) |
 
 ## session/
 
 | Module | Description |
 |---|---|
 | `view.rs` | Pure `SessionView` projection + `SessionEvidence` storage |
-| `supervisor.rs` | Event orchestration with consumed-audio and speech admission, bounded semantic and compatibility extraction, candidate provenance/journal rollback, dependency-scoped work invalidation, deep-task admission, strict reply admission (unconfirmed-write check and failure text on rejection), `speech_language` in the turn brief, playback recovery, and worker-finished turn resolution |
+| `supervisor.rs` | Event orchestration with consumed-audio and speech admission, bounded semantic and compatibility extraction, candidate provenance/journal rollback, dependency-scoped work invalidation, deep-task admission, reply admission (unconfirmed-write check and failure text on rejection), retiring a task's queued progress when the task ends, `speech_language` in the turn brief when configured, playback recovery, and worker-finished turn resolution |
 | `task_runner.rs` | Manages `ActiveTask` and consumes agent turns. Dropping the stream releases the framework root-turn gate |
 | `tts_worker.rs` | Complete authorized act → cache hook or duplex text admission/audio drain, request/open deadlines, response/format/sequence validation, pre-admission provider error preservation, and cancellation registry |
 | `deep_worker.rs` | `DeepWorker` trait, `DeepWorkRequest/Result`, `FakeDeepWorker` for scenarios. No automatic trigger; `VoiceSessionHandle::request_deep_work` sends `DeepWorkRequested`. Results must match a pending task and its original epoch, and use the request's dependencies |
