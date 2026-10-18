@@ -11,6 +11,293 @@ use voice_live::tts::buffered::BufferedTtsAdapter;
 use voice_live::tts::qwen::QwenRealtimeTts;
 use voice_live::tts::{StreamingTts, TtsEvent, TtsInputLimits, TtsSessionOptions};
 
+const ENGLISH_FIRST: &str = "This is a streaming speech test. ";
+const ENGLISH_SECOND: &str = "Please check the appointment for Monday at ten.";
+
+fn english_artifact(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("temp/cartesia-validation")
+        .join(name)
+}
+
+#[tokio::test]
+#[ignore = "paid Cartesia English TTS; writes synthetic PCM16 WAV under git-ignored temp"]
+async fn cartesia_tts_english_streaming_contract() {
+    let mut config = voice_live::VoiceRuntimeConfig::from_file(
+        "full-duplex-demo/configs/voice-runtime.cartesia.yaml",
+    )
+    .unwrap()
+    .tts;
+    config.language = "en".into();
+    config.sample_rate_hz = 16000;
+    let tts = voice_live::tts::cartesia::CartesiaStreamingTts::from_config(&config)
+        .expect("Cartesia credentials");
+    std::fs::create_dir_all(english_artifact("")).unwrap();
+    let token = CancellationToken::new();
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(15),
+        tts.open_text_stream(
+            TtsSessionOptions {
+                speech_id: voice_live::SpeechId::new(),
+                speech_epoch: 1,
+                language: "English".into(),
+                voice: config.resolved_voice(),
+                claim_class: ClaimClass::Phatic,
+                preferred_sample_rate_hz: Some(16000),
+            },
+            TtsInputLimits {
+                max_input_bytes: 65536,
+                request_timeout: Duration::from_secs(30),
+            },
+            token.clone(),
+        ),
+    )
+    .await
+    .expect("bounded TTS open")
+    .expect("English TTS ready");
+    let result = tokio::time::timeout(Duration::from_secs(35), async {
+        let started = tokio::time::Instant::now();
+        session.input.push_text(ENGLISH_FIRST.into())?;
+        let first = session
+            .events
+            .next_event()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("closed before first audio"))?;
+        let TtsEvent::Audio {
+            sample_rate,
+            pcm_s16le,
+            ..
+        } = first
+        else {
+            if let TtsEvent::Error { message, .. } = first {
+                anyhow::bail!(message);
+            }
+            anyhow::bail!("audio before finish required");
+        };
+        anyhow::ensure!(
+            sample_rate == 16000 && !pcm_s16le.is_empty() && pcm_s16le.len().is_multiple_of(2),
+            "invalid first PCM"
+        );
+        let first_audio_ms = started.elapsed().as_millis();
+        let mut pcm = pcm_s16le.to_vec();
+        let mut chunks = 1;
+        session.input.push_text(ENGLISH_SECOND.into())?;
+        session.input.finish_input()?;
+        while let Some(event) = session.events.next_event().await? {
+            match event {
+                TtsEvent::Audio {
+                    sample_rate,
+                    pcm_s16le,
+                    ..
+                } => {
+                    anyhow::ensure!(
+                        sample_rate == 16000 && pcm_s16le.len().is_multiple_of(2),
+                        "invalid PCM"
+                    );
+                    anyhow::ensure!(
+                        pcm_s16le.len() <= (16000 * 2 * 15usize).saturating_sub(pcm.len()),
+                        "generated fixture exceeds 15 seconds"
+                    );
+                    pcm.extend_from_slice(&pcm_s16le);
+                    chunks += 1;
+                }
+                TtsEvent::AudioDone { .. } => {
+                    return Ok::<_, anyhow::Error>((
+                        pcm,
+                        chunks,
+                        first_audio_ms,
+                        started.elapsed().as_millis(),
+                    ));
+                }
+                TtsEvent::Error { message, .. } => anyhow::bail!(message),
+            }
+        }
+        anyhow::bail!("TTS closed without terminal")
+    })
+    .await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(2), session.control.close())
+        .await
+        .expect("bounded TTS cleanup")
+        .expect("TTS cleanup");
+    let (pcm, chunks, first_audio_ms, total_ms) = result
+        .expect("bounded TTS contract")
+        .expect("English TTS audio before finish and normal done");
+    let mut wav = hound::WavWriter::create(
+        english_artifact("english-tts-16k.wav"),
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for sample in pcm.as_chunks::<2>().0 {
+        wav.write_sample(i16::from_le_bytes(*sample)).unwrap();
+    }
+    wav.finalize().unwrap();
+    let report = serde_json::json!({"status":"passed","language":"en","model":config.model,"api_version":config.cartesia.api_version,"sample_rate":16000,"channels":1,"bits_per_sample":16,"text":format!("{ENGLISH_FIRST}{ENGLISH_SECOND}"),"chunks":chunks,"pcm_bytes":pcm.len(),"audio_duration_ms":pcm.len()/32,"first_audio_before_finish":true,"first_audio_ms":first_audio_ms,"total_ms":total_ms});
+    std::fs::write(
+        english_artifact("tts-english.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    eprintln!("English TTS: {report}");
+}
+
+#[tokio::test]
+#[ignore = "paid Cartesia English STT; streams the WAV generated by the English TTS contract twice"]
+async fn cartesia_stt_english_streaming_contract() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut wav = hound::WavReader::open(english_artifact("english-tts-16k.wav"))
+        .expect("run cartesia_tts_english_streaming_contract first");
+    let spec = wav.spec();
+    assert_eq!(
+        (spec.channels, spec.sample_rate, spec.bits_per_sample),
+        (1, 16000, 16)
+    );
+    assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+    assert!(wav.duration() > 0 && wav.duration() <= 16000 * 15);
+    let pcm: Vec<i16> = wav.samples::<i16>().collect::<Result<_, _>>().unwrap();
+    let mut config = voice_live::VoiceRuntimeConfig::from_file(
+        "full-duplex-demo/configs/voice-runtime.cartesia.yaml",
+    )
+    .unwrap()
+    .asr;
+    config.locale = "en-US".into();
+    let asr = voice_live::asr::cartesia::CartesiaStreamingAsr::from_config(&config)
+        .expect("Cartesia credentials");
+    let token = CancellationToken::new();
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(15),
+        asr.open_duplex(
+            AsrSessionConfig {
+                sample_rate_hz: 16000,
+                locale: "en-US".into(),
+                manual_commit: true,
+            },
+            AsrDuplexLimits {
+                sample_budget: 16000,
+                command_budget: 64,
+                write_timeout: Duration::from_secs(2),
+            },
+            token.clone(),
+        ),
+    )
+    .await
+    .expect("bounded STT open")
+    .expect("English STT ready");
+    let finalized = Arc::new(AtomicBool::new(false));
+    let feed_finalized = finalized.clone();
+    let started = tokio::time::Instant::now();
+    let feed = async {
+        let mut pace = tokio::time::interval(Duration::from_millis(20));
+        pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        for _ in 0..2 {
+            for frame in pcm.chunks(320) {
+                pace.tick().await;
+                anyhow::ensure!(
+                    matches!(
+                        session.input.push_audio(frame.to_vec()).await?,
+                        voice_live::asr::AsrAudioPush::Accepted
+                    ),
+                    "PCM admission failed"
+                );
+            }
+            session.input.commit_utterance().await?;
+            feed_finalized.store(true, Ordering::Release);
+            for _ in 0..10 {
+                pace.tick().await;
+                anyhow::ensure!(
+                    matches!(
+                        session.input.push_audio(vec![0; 320]).await?,
+                        voice_live::asr::AsrAudioPush::Accepted
+                    ),
+                    "silence admission failed"
+                );
+            }
+        }
+        session.input.finish_input()?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let drain = async {
+        let mut finals = Vec::new();
+        let mut events = Vec::new();
+        let mut partials = 0;
+        let mut first_partial_ms = None;
+        let mut before_finalize = false;
+        while let Some(event) = session.events.next_event().await? {
+            match event {
+                AsrEvent::Partial {
+                    utterance_id, text, ..
+                } => {
+                    if !text.trim().is_empty() {
+                        partials += 1;
+                        first_partial_ms.get_or_insert(started.elapsed().as_millis());
+                        before_finalize |= !finalized.load(Ordering::Acquire);
+                        if events.len() < 128 {
+                            events.push(serde_json::json!({"kind":"partial","utterance_id":utterance_id,"at_ms":started.elapsed().as_millis(),"text":text}));
+                        }
+                    }
+                }
+                AsrEvent::Final { utterance_id, text } => {
+                    if events.len() < 128 {
+                        events.push(serde_json::json!({"kind":"final","utterance_id":utterance_id,"at_ms":started.elapsed().as_millis(),"text":text}));
+                    }
+                    finals.push((utterance_id, text));
+                }
+                AsrEvent::Error { message, .. } => anyhow::bail!(message),
+                AsrEvent::InjectedFinal { .. } => {
+                    anyhow::bail!("injection cannot satisfy a provider contract")
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>((finals, events, partials, first_partial_ms, before_finalize))
+    };
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::try_join!(feed, drain)
+    })
+    .await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(2), session.control.close())
+        .await
+        .expect("bounded STT cleanup")
+        .expect("STT cleanup");
+    let ((), (finals, events, partials, first_partial_ms, before_finalize)) = result
+        .expect("bounded STT contract")
+        .expect("two English utterances and done required");
+    let ordered = finals.len() == 2
+        && finals
+            .iter()
+            .enumerate()
+            .all(|(index, (id, text))| *id == index as u64 && !text.trim().is_empty());
+    let content_matches = ordered
+        && finals.iter().all(|(_, text)| {
+            let lower = text.to_ascii_lowercase();
+            lower.contains("streaming")
+                && lower.contains("monday")
+                && (lower.contains("ten") || lower.contains("10"))
+        });
+    let passed = ordered && content_matches && partials > 0 && before_finalize;
+    let report = serde_json::json!({"status":if passed {"passed"} else {"failed"},"language":"en","model":config.model,"api_version":config.cartesia.api_version,"fixture_duration_ms":pcm.len()/16,"repetitions":2,"partials":partials,"first_partial_ms":first_partial_ms,"partial_before_first_finalize":before_finalize,"ordered_nonempty_finals":ordered,"content_matches":content_matches,"finals":finals,"events":events,"total_ms":started.elapsed().as_millis()});
+    std::fs::write(
+        english_artifact("stt-english.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    eprintln!("English STT: {report}");
+    assert!(ordered, "expected two nonempty ordered utterance finals");
+    assert!(
+        content_matches,
+        "recognized English must retain streaming, Monday, and ten/10"
+    );
+    assert!(
+        partials > 0 && before_finalize,
+        "no nonempty partial before first finalize admission; streaming UX not established"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires paid Cartesia key and consented Korean WAV; streams the fixture twice"]
 async fn cartesia_stt_korean_streaming_contract() {

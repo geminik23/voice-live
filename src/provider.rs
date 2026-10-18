@@ -58,3 +58,17 @@ impl ProviderSessionControl for OwnedProviderTasks {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn websocket_tls_can_select_a_crypto_provider() {
+        let _builder = rustls::ClientConfig::builder();
+        assert!(
+            !rustls::crypto::CryptoProvider::get_default()
+                .expect("crypto provider selected")
+                .cipher_suites
+                .is_empty()
+        );
+    }
+}

@@ -119,7 +119,8 @@ fn validate_rate(rate: u32) -> anyhow::Result<()> {
 fn language(value: &str) -> anyhow::Result<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "ko" | "ko-kr" | "korean" => Ok("ko"),
-        _ => anyhow::bail!("Cartesia TTS currently supports Korean session language only"),
+        "en" | "en-us" | "en-gb" | "english" => Ok("en"),
+        _ => anyhow::bail!("Cartesia TTS supports English and Korean session languages"),
     }
 }
 

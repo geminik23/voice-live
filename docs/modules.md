@@ -78,7 +78,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `tts/fake.rs` | `FakeTts` (guarantees chunk→done→None termination) |
 | `tts/premade.rs` | Success-only premade cache with matching text/language/voice and fixed factory settings; bounded warmup, complete-request cache hook, native capability forwarding, cancellable replay |
 | `tts/qwen.rs` | DashScope realtime adapter. Cancels by closing the socket if `response.cancel` is unsupported |
-| `tts/cartesia.rs` | `CartesiaStreamingTts::from_config` or host-owned `with_api_key`; native incremental Sonic WebSocket input, context-scoped raw PCM normalization, bounded I/O, absolute response deadline, separate terminal slot, typed/redacted errors, and owned legacy `synthesize` convenience. Initial Korean language path; provider behavior still requires paid validation |
+| `tts/cartesia.rs` | `CartesiaStreamingTts::from_config` or host-owned `with_api_key`; native incremental Sonic WebSocket input, context-scoped raw PCM normalization, bounded I/O, absolute response deadline, separate terminal slot, typed/redacted errors, and owned legacy `synthesize` convenience. English/Korean session language normalization; account/voice combinations still require validation |
 
 ## Remaining modules
 

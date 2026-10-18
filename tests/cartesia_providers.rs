@@ -239,6 +239,45 @@ async fn close(mut session: TtsDuplexSession, server: Server) {
 }
 
 #[tokio::test]
+async fn english_aliases_are_sent_consistently_without_changing_defaults() {
+    for alias in ["en", "en-US", "en-GB", "English"] {
+        let server = server(Reply::Audio).await;
+        let provider =
+            CartesiaStreamingTts::with_api_key(&config(&server.endpoint), "test-secret".into())
+                .unwrap();
+        let mut session = provider
+            .open_text_stream(
+                TtsSessionOptions {
+                    language: alias.into(),
+                    ..options()
+                },
+                TtsInputLimits {
+                    max_input_bytes: 1024,
+                    request_timeout: Duration::from_secs(2),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        session.input.push_text("English speech.".into()).unwrap();
+        session.input.finish_input().unwrap();
+        assert!(matches!(
+            terminal(&mut session).await,
+            TtsEvent::AudioDone { .. }
+        ));
+        assert!(
+            server
+                .requests
+                .lock()
+                .iter()
+                .all(|request| request["language"] == "en")
+        );
+        close(session, server).await;
+    }
+    assert_eq!(TtsConfig::default().language, "Korean");
+}
+
+#[tokio::test]
 async fn native_wire_streams_before_finish_and_preserves_fragments() {
     let server = server(Reply::Audio).await;
     let provider =

@@ -152,7 +152,7 @@ When `allow_text_injection` is enabled, the runtime owns a per-session injection
 | `inject` (ASR) | Development text injection: the browser text box acts as the user's utterance | `dev.allow_text_injection` |
 | `together` (ASR) | Live streaming recognition | `TOGETHER_API_KEY` |
 | `qwen` (TTS) | Live speech synthesis | `DASHSCOPE_API_KEY`, `QWEN_VOICE_ID` (or `tts.voice`) |
-| `cartesia` (ASR) | Ink Whisper manual streaming recognition | Explicit Cartesia endpoint/model/env; Korean, 16 kHz, `manual_commit: true`, `CARTESIA_API_KEY` |
+| `cartesia` (ASR) | Ink Whisper manual streaming recognition | Explicit Cartesia endpoint/model/env; English or Korean, 16 kHz, `manual_commit: true`, `CARTESIA_API_KEY` |
 | `cartesia` (TTS) | Native incremental Sonic synthesis | Explicit Cartesia endpoint/model/env settings; `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID` (or `tts.voice`) |
 
 Unknown provider names fail the built-in runtime build; they do not silently fall back to `mock`. The injected builder uses the host's factories instead of resolving these names.
@@ -161,7 +161,7 @@ Validate each real provider with its individual ignored contract only after cred
 
 ## Cartesia STT
 
-Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together. Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, locale `ko-KR`, and `audio.input_sample_rate_hz: 16000`. Korean `ko`/`ko-KR` is normalized to `ko`. Other models, locales, rates, or automatic commit are rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
+Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together. Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, locale `ko-KR`, and `audio.input_sample_rate_hz: 16000`. Korean `ko`/`ko-KR` is normalized to `ko`; English `en`/`en-US`/`en-GB` is normalized to `en` and sent from the session locale. Other models, locales, rates, or automatic commit are rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
 
 | Key | Default | Validation and use |
 |---|---:|---|
@@ -184,7 +184,7 @@ Confirmed transcript deltas append verbatim; mutable tails replace, never append
 
 The full Cartesia sample selects both providers. `full-duplex-demo/configs/voice-runtime.cartesia-tts.yaml` remains available for typed input plus Cartesia TTS diagnosis. The keyless default sample remains inject ASR plus mock TTS.
 
-Set all provider-specific common fields explicitly: `tts.provider: cartesia`, endpoint `wss://api.cartesia.ai/tts/websocket`, model `sonic-3.6`, `api_key_env: CARTESIA_API_KEY`, `voice_env: CARTESIA_VOICE_ID`, language `ko`, and rate `24000`. Changing just the provider name keeps the Qwen defaults and is not a supported migration. The factory accepts `sonic-3.6`, `sonic-3.5`, `sonic-3`, and `sonic-latest`; model aliases and account/voice availability still require paid validation. The initial language path accepts `ko`, `ko-KR`, and `Korean`, normalized to `ko`, and rejects other languages rather than silently falling back.
+Set all provider-specific common fields explicitly: `tts.provider: cartesia`, endpoint `wss://api.cartesia.ai/tts/websocket`, model `sonic-3.6`, `api_key_env: CARTESIA_API_KEY`, `voice_env: CARTESIA_VOICE_ID`, language `ko`, and rate `24000`. Changing just the provider name keeps the Qwen defaults and is not a supported migration. The factory accepts `sonic-3.6`, `sonic-3.5`, `sonic-3`, and `sonic-latest`; model aliases and account/voice availability still require paid validation. Session language accepts `ko`, `ko-KR`, and `Korean`, normalized to `ko`, or `en`, `en-US`, `en-GB`, and `English`, normalized to `en`. Other languages are rejected rather than silently falling back. This provider-level support does not adapt the demo agent prompts or turn-taking policy.
 
 | Key | Default | Validation and use |
 |---|---|---|

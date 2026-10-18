@@ -22,21 +22,23 @@ use voice_live::asr::{
 use voice_live::config::AsrConfig;
 
 type ServerSocket = WebSocketStream<TcpStream>;
-enum Handshake {
-    Ready,
-    Reject(u16, Option<&'static str>),
+const EXPECTED_QUERY: &[&str] = &[
+    "model=ink-whisper",
+    "encoding=pcm_s16le",
+    "sample_rate=16000",
+    "language=ko",
+];
+
+struct Handshake {
+    expected_query: &'static [&'static str],
+    rejection: Option<(u16, Option<&'static str>)>,
 }
 impl Callback for Handshake {
     fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
         assert_eq!(request.headers()["authorization"], "Bearer test-secret");
         assert_eq!(request.headers()["cartesia-version"], "2026-08-14");
         let query = request.uri().query().unwrap();
-        for field in [
-            "model=ink-whisper",
-            "encoding=pcm_s16le",
-            "sample_rate=16000",
-            "language=ko",
-        ] {
+        for &field in self.expected_query {
             assert!(query.split('&').any(|value| value == field));
         }
         assert!(
@@ -44,16 +46,14 @@ impl Callback for Handshake {
                 && !query.contains("api_key")
                 && !query.contains("cartesia_version")
         );
-        match self {
-            Self::Ready => Ok(response),
-            Self::Reject(status, code) => {
-                Err(tokio_tungstenite::tungstenite::http::Response::builder()
-                    .status(status)
-                    .body(Some(
-                        json!({"error_code":code,"message":"test-secret"}).to_string(),
-                    ))
-                    .unwrap())
-            }
+        match self.rejection {
+            None => Ok(response),
+            Some((status, code)) => Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status)
+                .body(Some(
+                    json!({"error_code":code,"message":"test-secret"}).to_string(),
+                ))
+                .unwrap()),
         }
     }
 }
@@ -95,9 +95,15 @@ where
     ));
     let worker = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let socket = tokio_tungstenite::accept_hdr_async(stream, Handshake::Ready)
-            .await
-            .unwrap();
+        let socket = tokio_tungstenite::accept_hdr_async(
+            stream,
+            Handshake {
+                expected_query: EXPECTED_QUERY,
+                rejection: None,
+            },
+        )
+        .await
+        .unwrap();
         handler(socket).await;
     });
     (config, worker)
@@ -153,6 +159,64 @@ async fn wait_close(socket: &mut ServerSocket) {
             break;
         }
     }
+}
+
+#[tokio::test]
+async fn english_session_locale_is_sent_on_wire_without_changing_defaults() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config(&format!(
+        "ws://{}/stt/websocket",
+        listener.local_addr().unwrap()
+    ));
+    cfg.locale = "en-US".into();
+    let worker = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_hdr_async(
+            stream,
+            Handshake {
+                expected_query: &[
+                    "model=ink-whisper",
+                    "encoding=pcm_s16le",
+                    "sample_rate=16000",
+                    "language=en",
+                ],
+                rejection: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(receive(&mut socket).await, Message::Binary(_)));
+        json_send(&mut socket, delta("English speech", true)).await;
+        assert_eq!(receive(&mut socket).await, Message::Text("finalize".into()));
+        json_send(&mut socket, ack()).await;
+        assert_eq!(receive(&mut socket).await, Message::Text("close".into()));
+        json_send(&mut socket, done()).await;
+        wait_close(&mut socket).await;
+    });
+    let provider = CartesiaStreamingAsr::with_api_key(&cfg, "test-secret".into()).unwrap();
+    let mut session = provider
+        .open_duplex(
+            AsrSessionConfig {
+                locale: "en-GB".into(),
+                ..session_config()
+            },
+            limits(16000, 64),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    session.input.try_push_audio(vec![0; 320]).unwrap();
+    assert!(
+        matches!(next(&mut session).await,Some(AsrEvent::Partial {text,..}) if text == "English speech")
+    );
+    session.input.try_commit_utterance().unwrap();
+    session.input.finish_input().unwrap();
+    assert!(
+        matches!(next(&mut session).await,Some(AsrEvent::Final {text,..}) if text == "English speech")
+    );
+    assert!(next(&mut session).await.is_none());
+    assert_eq!(AsrConfig::default().locale, "ko-KR");
+    cleanup(session, worker).await;
 }
 
 #[tokio::test]
@@ -879,8 +943,14 @@ async fn handshake_errors_are_classified_and_redacted() {
         let config = config(&format!("ws://{}/stt", listener.local_addr().unwrap()));
         let worker = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let _ =
-                tokio_tungstenite::accept_hdr_async(socket, Handshake::Reject(status, code)).await;
+            let _ = tokio_tungstenite::accept_hdr_async(
+                socket,
+                Handshake {
+                    expected_query: EXPECTED_QUERY,
+                    rejection: Some((status, code)),
+                },
+            )
+            .await;
         });
         let provider = CartesiaStreamingAsr::with_api_key(&config, "test-secret".into()).unwrap();
         let error = provider
@@ -954,7 +1024,7 @@ fn factory_validation_rejects_unsupported_or_unsafe_settings_without_secrets() {
             ..base.clone()
         },
         AsrConfig {
-            locale: "en".into(),
+            locale: "fr".into(),
             ..base.clone()
         },
         AsrConfig {
@@ -987,7 +1057,7 @@ async fn open_rejects_incompatible_session_options_before_network_io() {
             ..session_config()
         },
         AsrSessionConfig {
-            locale: "en".into(),
+            locale: "fr".into(),
             ..session_config()
         },
     ] {

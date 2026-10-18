@@ -123,7 +123,8 @@ fn validate_config(config: &AsrConfig) -> anyhow::Result<()> {
 fn language(locale: &str) -> anyhow::Result<&'static str> {
     match locale.trim().to_ascii_lowercase().as_str() {
         "ko" | "ko-kr" => Ok("ko"),
-        _ => anyhow::bail!("Cartesia ASR currently supports Korean locale only"),
+        "en" | "en-us" | "en-gb" => Ok("en"),
+        _ => anyhow::bail!("Cartesia ASR supports English and Korean locales"),
     }
 }
 
@@ -165,13 +166,14 @@ impl StreamingAsr for CartesiaStreamingAsr {
             || Instant::now().checked_add(limits.write_timeout).is_none()
         {
             return Err(AsrOpenError::Rejected(
-                "Cartesia ASR requires 16 kHz Korean manual input and positive bounded limits"
+                "Cartesia ASR requires 16 kHz supported-language manual input and positive bounded limits"
                     .into(),
             ));
         }
         let endpoint = format!(
-            "{}?model=ink-whisper&encoding=pcm_s16le&sample_rate=16000&language=ko",
-            self.config.endpoint
+            "{}?model=ink-whisper&encoding=pcm_s16le&sample_rate=16000&language={}",
+            self.config.endpoint,
+            language(&config.locale).expect("validated locale")
         );
         let mut request = endpoint
             .into_client_request()

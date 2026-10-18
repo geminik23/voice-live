@@ -96,7 +96,33 @@ The ignored `cartesia_stt_korean_streaming_contract` requires `CARTESIA_API_KEY`
 cargo test --locked --test provider_contracts cartesia_stt_korean_streaming_contract -- --ignored --nocapture
 ```
 
-Both tests compile in the default suite but remain ignored and have not been run against Cartesia. The adapter's FIFO association of finalizes and `flush_done` is an explicit integration assumption; fake-server success and even a finite live fixture run do not establish all vendor silence/overlap semantics. Inspect repeated utterances, silence auto-finalization, empty flushes, first-partial cadence/latency, and boundary attribution during subsequent live validation. PCM validity is not evidence that natural speech sounds correct; listening, real microphone input, physical interruption, actual LLM heard-memory, and browser playback need separate checks.
+The two Korean contracts compile in the default suite but remain ignored and have not been run against Cartesia. The adapter's FIFO association of finalizes and `flush_done` is an explicit integration assumption; fake-server success and even a finite live fixture run do not establish all vendor silence/overlap semantics. Inspect repeated utterances, silence auto-finalization, empty flushes, first-partial cadence/latency, and boundary attribution during subsequent live validation. PCM validity is not evidence that natural speech sounds correct; listening, real microphone input, physical interruption, actual LLM heard-memory, and browser playback need separate checks.
+
+### English provider-only validation
+
+The English contracts generate their own synthetic fixture, so no microphone recording, `VOICE_KOREAN_FIXTURE`, or LLM key is needed. Run them in order from a shell containing `CARTESIA_API_KEY` and `CARTESIA_VOICE_ID`. Keys assigned in PowerShell `$PROFILE` are available to its child processes; loading the profile is an explicit shell step, not runtime behavior. Do not print the profile or credentials.
+
+```sh
+cargo test --locked --test provider_contracts cartesia_tts_english_streaming_contract -- --ignored --exact --nocapture
+cargo test --locked --test provider_contracts cartesia_stt_english_streaming_contract -- --ignored --exact --nocapture
+```
+
+The first test sends two English text fragments, requires audio before finish and a normal terminal, and writes a mono 16 kHz signed PCM16 WAV and metrics into a git-ignored local artifact directory. The second test reuses that generated WAV twice, checks ordered nonempty Finals and expected content, requires a partial before the first finalize admission, and records metrics before asserting the acceptance criteria. Both remain ignored in the default suite. Audio, local logs, account voice IDs, and credentials must not be committed.
+
+On 2026-10-18 UTC, the English tests passed against Cartesia after explicitly enabling Rustls's `ring` backend. The initial attempt failed at client-side crypto-provider selection before synthesis; it was not a provider streaming failure. The Cargo change selects the missing backend without disabling TLS certificate verification, and a local regression exercises crypto-provider selection.
+
+| Check | Observed result |
+|---|---|
+| Requested configuration | `sonic-3.6` TTS, `ink-whisper` STT, API version `2026-08-14`, language `en` |
+| TTS first audio before finish | 185 ms after text admission on the open socket |
+| Generated fixture | 4.88 seconds, mono 16 kHz PCM16, 30 normalized chunks |
+| STT first replacement Partial | 2568 ms after feeding began on the open socket |
+| STT updates and boundaries | 4 Partials, 2 nonempty Finals in order, normal completion |
+| Recognition content | Both repetitions matched the expected streaming/Monday/ten-or-10 content |
+
+Synthetic input was: `This is a streaming speech test. Please check the appointment for Monday at ten.` Both recognized Finals were: `This is a streaming speech test. Please check the appointment for Monday at 10.` Leading provider whitespace is omitted here for display. These are individual observations, not latency percentiles; they exclude socket establishment from the first-audio/first-partial measurements. Actual billed amounts were not queried.
+
+This verifies the limited English provider flow, not the Korean contracts, physical microphone or speaker behavior, naturalness, browser E2E, English agent prompts/turn-taking, or every silence/overlap/FIFO case. English provider normalization does not change the Korean demo defaults or establish multilingual runtime validation.
 
 ## Platform validation
 
