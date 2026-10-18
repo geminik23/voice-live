@@ -115,6 +115,11 @@ states:
         Present verified options only.
 
       transitions:
+        - to: executing
+          when: |
+            The assistant already restated one concrete option and asked to book it,
+            and the user now explicitly confirms that booking and the customer name
+            is known.
         - to: confirming
           when: |
             The user has selected one concrete option.

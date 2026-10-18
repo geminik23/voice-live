@@ -90,7 +90,9 @@ agents:
     enabled: true
     spec: ../agents/voice-interaction.yaml
     minimum_interval_ms: 250
-    timeout_ms: 900
+    # Hosted models took 1.1-1.6 s per assessment in a live check; 900 ms
+    # timed out every time. Overlap waits up to twice this before aborting.
+    timeout_ms: 1500
   task:
     spec: ../agents/reservation.yaml
     timeout_ms: 30000
