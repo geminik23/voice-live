@@ -189,7 +189,7 @@ impl Tool for ReserveRestaurantTool {
     }
 
     fn description(&self) -> &str {
-        "Create one demo reservation after the user explicitly confirms every detail. An idempotency key is required and repeated calls return the original record."
+        "Create one demo reservation after the user explicitly confirms every detail. Call it only when the user has given the customer name; otherwise ask for the name instead. An idempotency key is required and repeated calls return the original record."
     }
 
     fn input_schema(&self) -> Value {
@@ -200,7 +200,7 @@ impl Tool for ReserveRestaurantTool {
                 "date": { "type": "string" },
                 "time": { "type": "string" },
                 "party_size": { "type": "integer", "minimum": 1 },
-                "customer_name": { "type": "string" },
+                "customer_name": { "type": "string", "minLength": 1, "description": "The name the user gave. Never guess it or leave it empty." },
                 "window_seat_requested": { "type": "boolean", "default": false },
                 "confirmed": { "type": "boolean", "description": "True only after explicit user confirmation" },
                 "idempotency_key": { "type": "string" }

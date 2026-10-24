@@ -24,6 +24,10 @@ system_prompt: |
   Use search_availability for read-only option lookup. Use
   reserve_restaurant only after the user explicitly confirms every detail,
   and always pass the idempotency_key given below, unchanged.
+  Call reserve_restaurant only when you already know the restaurant, date, time, party size, and customer name.
+  If one of them is missing, ask for it instead of calling reserve_restaurant.
+  This rule is only for reserve_restaurant: call search_availability as soon as the date, time, and party size are known, without asking for a restaurant first.
+  Once reserve_restaurant has committed in this conversation, never call it again unless the user asks for a new, different booking.
 
   Book only a restaurant and time that search_availability returned in this
   conversation. If the user names a restaurant or time that was not returned,
@@ -48,6 +52,7 @@ system_prompt: |
     "availability_checked" after search_availability succeeded, or
     "reserved" after reserve_restaurant committed. Otherwise use null.
   - When you repeat or summarize a result from an earlier turn without calling the tool again, use null.
+  - If you did not call a tool in this turn, "outcome" is null, even when the reservation already exists.
   - Set "question" when the reply ends with a question, to its expected answer.
   The runtime checks a named outcome against the tools actually executed in
   this turn. If they do not confirm it, or a reservation tool failed in this
@@ -115,9 +120,12 @@ states:
   initial: collecting
 
   states:
+    # Only `executing` may book, so a turn that is still choosing or confirming cannot call the write tool, and a finished booking cannot be repeated.
     collecting:
+      tools: [search_availability]
       prompt: |
-        Collect the reservation target, date, time, and party size.
+        Collect the date, time, and party size; the restaurant is chosen from the search results.
+        Once all three are known, call search_availability in this turn.
         Do not perform a write action.
 
       transitions:
@@ -127,9 +135,11 @@ states:
             Required search slots (date, time, party size) are known.
 
     searching:
+      tools: [search_availability]
       prompt: |
         Use read-only availability and search tools.
         Present verified options only.
+        Booking happens once the user confirms one option and gives a name; until then, ask for what is missing and never say you cannot book.
 
       transitions:
         - to: executing
@@ -144,8 +154,10 @@ states:
             The user has selected one concrete option.
 
     confirming:
+      tools: [search_availability]
       prompt: |
-        Restate all transactional details and ask for explicit confirmation.
+        Restate all transactional details and ask for explicit confirmation, or for the customer name if it is still missing.
+        Booking happens after the user confirms; never say you cannot book.
 
       transitions:
         - to: executing
@@ -157,6 +169,7 @@ states:
       prompt: |
         Execute the transactional tool exactly once.
         Use the runtime-provided idempotency key.
+        If reserve_restaurant already committed earlier in this conversation, do not call it again; say it is already booked, with "outcome" null.
 
       # Depends on the tool result, so it stays after the reply.
       transitions:
@@ -167,5 +180,8 @@ states:
     completed:
       # The executing reply already reports the result; regenerating it here only adds a model call.
       regenerate_on_enter: false
+      tools: [search_availability]
       prompt: |
-        Report the verified result and any confirmation identifier.
+        The reservation is already booked; do not call reserve_restaurant again.
+        If the user agrees, thanks you, or asks to go ahead, say briefly that it is already booked and ask whether they need anything else, with "outcome" null.
+        Report the result again only if the user asks, still with "outcome" null.
