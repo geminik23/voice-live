@@ -1,3 +1,7 @@
+//! Streaming speech recognition: the [`StreamingAsr`] factory trait, session events, and the built-in providers.
+//!
+//! The `fake` and `inject` modules back the `mock` and `inject` config providers and are always available; `cartesia` and `together` need their crate features.
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -7,7 +11,9 @@ use crate::ids::Revision;
 use crate::provider::ProviderSessionControl;
 use tokio_util::sync::CancellationToken;
 
+/// An event from a streaming recognizer session.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AsrEvent {
     /// A revised hypothesis for `utterance_id`.
     ///
@@ -43,8 +49,12 @@ pub struct AsrSessionConfig {
     pub manual_commit: bool,
 }
 
+/// A streaming speech recognizer factory, shared across sessions.
+///
+/// Each session opens its own stream. Implement [`StreamingAsr::open_duplex`] (and return true from [`StreamingAsr::supports_duplex`]) to serve the runtime's duplex path, where audio input and events flow independently.
 #[async_trait]
 pub trait StreamingAsr: Send + Sync {
+    /// Opens a serial session that takes audio and yields events through one object.
     async fn open(&self, config: AsrSessionConfig) -> anyhow::Result<Box<dyn AsrSession>>;
 
     /// Whether this factory can serve the runtime duplex path.
@@ -97,6 +107,7 @@ pub fn asr_session_config(config: &AsrConfig, sample_rate_hz: u32) -> AsrSession
 
 /// Typed duplex open errors, so retry policy never string-matches messages.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AsrOpenError {
     /// The factory does not implement duplex sessions.
     #[error("duplex asr sessions are unsupported")]
@@ -141,6 +152,7 @@ pub enum AsrAudioPush {
 
 /// Typed input admission failures.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AsrInputError {
     /// The input is finished or the session is closed.
     #[error("asr input closed")]
@@ -241,7 +253,9 @@ impl AsrSession for LegacyDuplexFacade {
     }
 }
 
+#[cfg(feature = "cartesia")]
 pub mod cartesia;
 pub mod fake;
 pub mod inject;
+#[cfg(feature = "together")]
 pub mod together;

@@ -1232,6 +1232,7 @@ async fn buffered_adapter_waits_for_finish_before_the_inner_request() {
                 break;
             }
             TtsEvent::Error { .. } => panic!("a healthy provider must not fail"),
+            _ => unreachable!("unexpected event variant"),
         }
     }
 
@@ -1463,6 +1464,7 @@ async fn premade_cache_hit_replays_without_calling_the_provider() {
                 break;
             }
             TtsEvent::Error { .. } => panic!("a cached clip must replay cleanly"),
+            _ => unreachable!("unexpected event variant"),
         }
     }
 
@@ -1509,6 +1511,7 @@ async fn buffered_deadline_survives_a_full_output_queue_without_polling() {
                 failed = true;
             }
             TtsEvent::AudioDone { .. } => panic!("a full undrained output must expire"),
+            _ => unreachable!("unexpected event variant"),
         }
     }
     assert!(failed);

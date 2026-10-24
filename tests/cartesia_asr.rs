@@ -1,4 +1,5 @@
 //! Offline Cartesia manual STT protocol and lifecycle tests, not vendor ordering proof.
+#![cfg(feature = "cartesia")]
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;

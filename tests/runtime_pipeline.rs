@@ -97,3 +97,15 @@ async fn network_providers_need_an_explicit_language() {
         assert!(error.to_string().contains(key), "{error}");
     }
 }
+
+/// A provider whose feature is disabled is named in the error instead of being reported as unknown.
+#[cfg(not(feature = "cartesia"))]
+#[tokio::test]
+async fn a_provider_without_its_feature_names_the_feature() {
+    let config = VoiceRuntimeConfig::from_yaml_str(
+        "asr:\n  provider: cartesia\n  locale: ko-KR\nobservability:\n  event_log: false",
+    )
+    .unwrap();
+    let error = VoiceRuntime::build(config).await.err().expect("rejected");
+    assert!(error.to_string().contains("`cartesia` feature"), "{error}");
+}

@@ -1,4 +1,4 @@
-# Full-duplex voice runtime configuration with Korean demo defaults.
+# Full-duplex voice runtime configuration for the English example.
 #
 # Providers: "together" (Nemotron streaming ASR), "qwen" (DashScope realtime
 # TTS), "cartesia" (streaming STT/TTS), "inject" (dev text injection),
@@ -29,7 +29,7 @@ asr:
   # With manual_commit, a commit is sent every this much silence so the recognizer never holds a long silence; 0 disables.
   idle_commit_ms: 2000
   # No default; network ASR providers refuse to start without it.
-  locale: ko-KR
+  locale: en-US
   # Bounded safety limits for the duplex recognizer connection.
   open_timeout_ms: 10000
   write_timeout_ms: 2000
@@ -58,7 +58,7 @@ tts:
   chunk_ms: 60
   # Language sent with synthesis and premade warmup requests, and the reply language given to the task agent.
   # No default; network TTS providers refuse to start without it.
-  language: Korean
+  language: English
   # Bounded safety limits for one synthesis response.
   open_timeout_ms: 10000
   request_timeout_ms: 30000
@@ -70,8 +70,8 @@ tts:
   premade:
     enabled: true
     phrases:
-      - "네"
-      - "네, 확인했어요."
+      - "Okay."
+      - "Okay, got it."
 
 turn_control:
   slot_fallback: neutral
@@ -91,23 +91,23 @@ turn_control:
 agents:
   interaction:
     enabled: true
-    spec: ../agents/voice-interaction.yaml
+    spec: ../../agents/voice-interaction.yaml
     minimum_interval_ms: 250
     # Hosted models took 1.1-1.6 s per assessment in a live check; 900 ms timed out every time.
     # Overlap waits up to twice this before aborting.
     timeout_ms: 1500
   task:
-    spec: ../agents/reservation.yaml
+    spec: ../../agents/reservation.yaml
     timeout_ms: 30000
   deep:
     enabled: false
     # A dedicated spec: the task agent's spec requires per-turn voice context,
     # which deep work does not have.
-    spec: ../agents/deep-worker.yaml
+    spec: ../../agents/deep-worker.yaml
     timeout_ms: 60000
   speculative:
     enabled: false
-    spec: ../agents/reservation-readonly.yaml
+    spec: ../../agents/reservation-readonly.yaml
     allowed_tools:
       - search_availability
     minimum_intent_confidence: 0.85
@@ -118,9 +118,9 @@ agents:
 speech:
   # Reply of the keyless mock task agent.
   # This and the other spoken texts below are in the sample's session language (tts.language); the task agent writes its own replies in that language.
-  mock_reply: "예약할 날짜와 시간, 인원을 알려 주세요."
-  backchannel_text: "네"
-  failure_text: "죄송합니다. 응답을 준비하지 못했어요. 다시 말씀해 주세요."
+  mock_reply: "Tell me the date, time, and party size for the reservation."
+  backchannel_text: "Mm-hm."
+  failure_text: "Sorry, I couldn't prepare a reply. Please say that again."
   # Outcomes a reply may name.
   # The model writes the words; the runtime checks the named outcome against the tools executed in that turn.
   outcomes:
@@ -135,7 +135,7 @@ speech:
       receipt_fields: {status: committed}
       bindings: [restaurant_id, date, time, party_size, customer_name, window_seat_requested]
       argument_defaults: {window_seat_requested: false}
-  hard_stop_ack_text: "네, 멈췄어요."
+  hard_stop_ack_text: "Okay, I stopped."
   # Speech state only advances on a client playback ACK; this releases the
   # queue if a client disconnects mid-utterance.
   playback_ack_timeout_ms: 15000
@@ -147,7 +147,7 @@ speech:
   audible_history_max_clauses: 64
   progress_templates:
     search_availability:
-      text: "조건에 맞는 곳을 확인하고 있어요."
+      text: "Checking for places that match."
       minimum_expected_latency_ms: 1200
       expire_after_ms: 4000
 

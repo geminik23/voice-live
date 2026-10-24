@@ -1,6 +1,6 @@
 # Module reference
 
-Module layout of `.`. The `framework` feature (enabled by default) pulls in the optional crates.io `ai-agents` dependency at version `1.0.11`; building with `--no-default-features` leaves only the deterministic core for fast testing.
+Module layout of `.`. The `framework` feature (enabled by default) pulls in the optional crates.io `ai-agents` dependency at version `1.0.11`; the `cartesia`, `together`, and `qwen` features (also default) compile the matching network speech providers in `asr/` and `tts/` and pull in the WebSocket and TLS stack. Building with `--no-default-features` leaves only the deterministic core and the `mock`/`inject` development providers for fast testing.
 
 ## Foundations
 
@@ -90,9 +90,8 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 |---|---|
 | `provider.rs` | `ProviderSessionControl` cancellation/close contract and private owned worker cleanup; custom providers must enforce Drop and bounded teardown themselves |
 | `playback.rs` | `PlaybackCommand`, `ClientPlaybackSink` (runtime nonblocking overload shutdown, which is not reported as an error once the session is already closing, or legacy standalone admission), `SimulatedPlaybackSink` (simulates the actual playback ACK flow in virtual-time tests), `UnacknowledgedPlaybackSink` (for ACK timeout scenarios) |
-| `tools/reservation.rs` | Explicit reservation example: shared in-memory backend, `search_availability` with `searched` receipts (its schema lists the demo areas; an empty or omitted area searches every area), and confirmed/idempotent `reserve_restaurant` with `committed` receipts that carry a readable `confirmation_suffix`; not a core speech-meaning registry |
 | `scenario.rs` | Scenario DSL runner. YAML → virtual-time execution → expectation evaluation |
-| `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, `RuntimePolicies`/`build_with_policies` host overrides and per-session interaction/slot factories, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, fresh ASR retry and identity mapping, one-second terminal drain after input closure to preserve fatal classification, bounded client output |
+| `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, `RuntimePolicies`/`build_with_policies` host overrides (task and speculative tools, per-session interaction/slot factories, text analyzer, speech renderer), provider match arms gated by the `cartesia`/`together`/`qwen` features, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, manual commit timing (trailing-audio delay, idle commits during silence, and dropping their empty Finals), fresh ASR retry and identity mapping, one-second terminal drain after input closure to preserve fatal classification, bounded client output |
 | `protocol.rs` | `ClientControlMessage` / `ServerMessage`. Defines **what** is exchanged, not **how** it is transported |
 
 ## Per-session vs. shared
@@ -103,7 +102,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `RuntimeAgent` (task/speculative/interaction/deep) | **Per session** | Holds conversation memory and serializes root turns per runtime |
 | Task agent conversation memory | **Per session, owned by voice-live** | To reconcile replies with what was heard and roll back turns |
 | `InjectionQueue` | **Per session** | One client's input must not become another client's transcript |
-| `ReservationStore` | Shared | Models an external system (reservation backend) |
+| Host tools (`RuntimePolicies` task and speculative tools) | Shared | Model an external system; the browser example's reservation backend in `examples/browser/src/reservation.rs` is one such host tool set |
 | `Metrics` | Shared | Process-wide observability |
 
 ## Transport boundary
@@ -111,17 +110,17 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 The library has no web framework dependency. The runtime exposes only a pair of channels; the host connects them to a socket.
 
 ```text
-  voice-live (library)                full-duplex-demo (host)
+  voice-live (library)                examples/browser (host)
   ─────────────────────               ─────────────────────────
   VoiceRuntime::create_session(
-      client_tx: Sender<ServerMessage>  ◄── demo writes to WebSocket
+      client_tx: Sender<ServerMessage>  ◄── host writes to WebSocket
   ) -> GatewaySession {
-      input_tx: Sender<ClientInput>     ◄── demo reads from WebSocket
+      input_tx: Sender<ClientInput>     ◄── host reads from WebSocket
   }
 
   protocol.rs  message types only      src/gateway.rs  axum / ServeDir
   media.rs     binary frame format
 ```
 
-Switching to WebRTC requires replacing only `full-duplex-demo/src/gateway.rs`.
+Switching to WebRTC requires replacing only `examples/browser/src/gateway.rs`.
 **Adding a web dependency to the root `Cargo.toml` is an architectural regression.**

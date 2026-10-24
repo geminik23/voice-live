@@ -202,16 +202,13 @@ async fn semantic_host_factory_runs_with_mock_task_agent_per_session() {
     let factories = Arc::new(AtomicUsize::new(0));
     let count = factories.clone();
     let provider = mock.clone();
-    let policies = voice_live::RuntimePolicies {
-        interaction_brain: Some(Arc::new(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-            Arc::new(voice_live::agent::framework::RuntimeSemanticBrain::new(
-                Arc::new(provider.clone()),
-                "Interpret the current speech.".into(),
-            )) as Arc<dyn InteractionBrain>
-        })),
-        ..Default::default()
-    };
+    let policies = voice_live::RuntimePolicies::default().with_interaction_brain(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        Arc::new(voice_live::agent::framework::RuntimeSemanticBrain::new(
+            Arc::new(provider.clone()),
+            "Interpret the current speech.".into(),
+        )) as Arc<dyn InteractionBrain>
+    });
     let config = voice_live::VoiceRuntimeConfig::from_yaml_str(
         "asr: {provider: inject}\ntts: {provider: mock}\ndev: {allow_text_injection: true}\nobservability: {event_log: false}",
     ).unwrap();
@@ -337,4 +334,67 @@ async fn framework_outcome_reply_is_checked_against_executed_tool_without_call_i
     ])
     .await;
     assert_eq!(spoken, ["Please say that again."]);
+}
+
+/// The built-in framework path takes its tools from the host, so a spec that names a host tool builds with that tool and without any demo backend.
+#[tokio::test]
+async fn framework_task_agent_uses_the_tools_the_host_supplies() {
+    // Building an agent reads the key from the environment but never calls the model.
+    unsafe { std::env::set_var("VOICE_LIVE_TEST_TOOL_KEY", "offline") };
+    let dir = std::env::temp_dir().join(format!("voice-live-host-tools-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = dir.join("task.yaml");
+    std::fs::write(
+        &spec,
+        "name: HostToolAgent
+system_prompt: |
+  Use the create tool.
+  {{ context.voice.brief }}
+tools: [create]
+context:
+  voice:
+    type: runtime
+    required: true
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+    api_key_env: VOICE_LIVE_TEST_TOOL_KEY
+llm:
+  default: default
+",
+    )
+    .unwrap();
+    let config = || {
+        let mut config = voice_live::VoiceRuntimeConfig::from_yaml_str(
+            "asr: {provider: inject}
+tts: {provider: mock}
+dev: {allow_text_injection: true}
+observability: {event_log: false}",
+        )
+        .unwrap();
+        config.agents.task.spec = Some(spec.clone());
+        config
+    };
+
+    let with_tools = voice_live::VoiceRuntime::build_with_policies(
+        config(),
+        None,
+        voice_live::RuntimePolicies::default().with_task_tools(vec![Arc::new(Create)]),
+    )
+    .await
+    .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let session = with_tools.create_session(tx).await;
+    assert!(session.is_ok(), "{:?}", session.err());
+
+    let without_tools =
+        voice_live::VoiceRuntime::build_with_policies(config(), None, Default::default())
+            .await
+            .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    assert!(
+        without_tools.create_session(tx).await.is_err(),
+        "no demo tools may stand in for the missing host tool"
+    );
 }

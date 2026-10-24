@@ -1,10 +1,10 @@
 # WebSocket protocol
 
-Transport contract between the browser client (`full-duplex-demo/web/index.html`)
+Transport contract between the browser client (`examples/browser/web/index.html`)
 and the Rust gateway.
 
 The message types live in the library (`src/protocol.rs`), while the WebSocket
-adapter lives in the demo (`full-duplex-demo/src/gateway.rs`). The library is
+adapter lives in the browser example (`examples/browser/src/gateway.rs`). The library is
 transport-agnostic.
 
 ## Overview

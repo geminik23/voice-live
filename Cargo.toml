@@ -2,24 +2,41 @@
 name = "voice-live"
 version = "0.1.0"
 edition = "2024"
-description = "Full-duplex voice interaction runtime"
+rust-version = "1.88"
+description = "Full-duplex voice interaction runtime: streaming STT, an agent, and streaming TTS with barge-in and heard-text memory"
 license = "Apache-2.0"
+repository = "https://github.com/geminik23/voice-live"
+documentation = "https://docs.rs/voice-live"
+readme = "README.md"
+keywords = ["voice", "speech", "full-duplex", "barge-in", "agent"]
+categories = ["multimedia::audio", "asynchronous"]
+# The published crate is the library; tests, docs, and examples stay in the repository.
+# Patterns are anchored to the package root; an unanchored name would also match nested files of the same name.
+include = ["/src/**/*.rs", "/Cargo.toml", "/README.md", "/LICENSE"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [workspace]
-members = ["full-duplex-demo"]
+members = ["examples/browser"]
 
 [features]
-default = ["framework"]
+default = ["framework", "cartesia", "together", "qwen"]
+# ai-agents task, interaction, speculative, and deep agents.
 framework = ["dep:ai-agents"]
+# Network speech providers. Each pulls in the WebSocket and TLS stack; disable the ones you do not use.
+cartesia = ["dep:tokio-tungstenite", "dep:rustls", "dep:base64"]
+together = ["dep:tokio-tungstenite", "dep:rustls", "dep:base64"]
+qwen = ["dep:tokio-tungstenite", "dep:rustls", "dep:base64"]
 
 [dependencies]
 ai-agents = { version = "1.0.11", default-features = false, optional = true }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
 # The WebSocket rustls connector requires an explicitly enabled crypto backend.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 futures = "0.3"
 async-trait = "0.1"
 async-stream = "0.3"
@@ -38,10 +55,13 @@ regex = "1"
 regex-syntax = "0.8"
 rubato = "0.16"
 hound = "3.5"
-base64 = "0.22"
+base64 = { version = "0.22", optional = true }
 parking_lot = "0.12"
 
 [dev-dependencies]
+# Local WebSocket fakes in the provider tests, independent of which provider features are enabled.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+base64 = "0.22"
 # MockLLMProvider, for framework-backed memory tests without an API key.
 ai-agents-llm = "1.0.11"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

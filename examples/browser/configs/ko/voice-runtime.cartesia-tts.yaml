@@ -59,10 +59,10 @@ speech:
 agents:
   interaction:
     enabled: true
-    spec: ../agents/voice-interaction.yaml
+    spec: ../../agents/voice-interaction.yaml
     timeout_ms: 1500
   task:
-    spec: ../agents/reservation.yaml
+    spec: ../../agents/reservation.yaml
     timeout_ms: 30000
 
 observability:

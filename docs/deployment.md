@@ -2,7 +2,7 @@
 
 ## Supported platforms and build prerequisites
 
-The `voice-live` library and `full-duplex-demo` server target **native execution on Linux, Windows, and macOS**. They should not depend on a particular developer's OS, shell, or absolute paths. This applies both to the default build with the `framework` feature and to the core build without it. The library is a server-side Rust runtime; the browser is the demo client. This support scope does not imply that the Rust library supports WASM.
+The `voice-live` library and the browser example server target **native execution on Linux, Windows, and macOS**. They should not depend on a particular developer's OS, shell, or absolute paths. This applies both to the default build with the `framework` feature and to the core build without it. The library is a server-side Rust runtime; the browser is the demo client. This support scope does not imply that the Rust library supports WASM.
 
 - All platforms: install stable Rust with rustup and the native build tools for your target. `cargo` and `rustc` must be available on your shell's PATH. The runtime explicitly enables Rustls's `ring` crypto backend for WSS; certificate verification and WebPKI trust roots remain enabled.
 - Linux: install your distribution's build tools, including a C/C++ compiler and linker.
@@ -17,20 +17,22 @@ Distinguish supported targets from actual validation results. Check OS, CPU arch
 Run this command from the repository root; it is the same in Bash, Zsh, and PowerShell.
 
 ```bash
-cargo run -p full-duplex-demo -- --config full-duplex-demo/configs/voice-runtime.yaml
+cargo run -p browser-example -- --config examples/browser/configs/en/voice-runtime.yaml
 # Open http://localhost:8080 → Start session
 ```
+
+`configs/en/` and `configs/ko/` are complete language sets: each holds the keyless `voice-runtime.yaml`, `voice-runtime.cartesia.yaml`, and the `restaurants.yaml` the demo reservation backend loads (`--restaurants <path>` overrides it). Both use the same language-neutral agent specs under `examples/browser/agents/`. For a library-only check without a browser, run `cargo run --example quickstart`.
 
 Paths are resolved as follows:
 
 - Relative paths passed to `--config` are relative to the **process working directory**. From another directory, supply the correct relative or absolute path.
 - Relative `agents.*.spec` paths loaded with `VoiceRuntimeConfig::from_file` are relative to the **config file's directory**. `from_yaml_str` does not adjust these paths.
-- The demo's default web root is `../web` relative to the config directory. A relative path set via `VOICE_WEB_DIR` is relative to the working directory.
+- The browser example serves its own `examples/browser/web/` directory. A relative path set via `VOICE_WEB_DIR` is relative to the working directory.
 - Relative `observability.event_log_dir` paths are also relative to the working directory, independent of Cargo's build output location.
 
-Use portable relative paths such as `../agents/reservation.yaml` in shared YAML. `/` separators also work on Windows. Configure OS-specific absolute paths on each host instead of fixing them in the repository. Quote CLI paths containing spaces and match filename case exactly for case-sensitive filesystems such as those commonly used on Linux.
+Use portable relative paths such as `../../agents/reservation.yaml` in shared YAML. `/` separators also work on Windows. Configure OS-specific absolute paths on each host instead of fixing them in the repository. Quote CLI paths containing spaces and match filename case exactly for case-sensitive filesystems such as those commonly used on Linux.
 
-The sample uses `asr.provider: inject`, `dev.allow_text_injection: true`, and `agents.interaction.enabled: true`. It supplies Korean automatic resources and a keyless mock reply (`speech.mock_reply`), but no Korean text-rule fallback. If the semantic provider is unavailable, the session uses neutral timing and control rather than guessing language-specific meaning. The mock reply asks for reservation details rather than asserting invented availability. With `OPENAI_API_KEY` set, the task agent writes its own replies in the configured `tts.language`.
+The keyless configs use `asr.provider: inject`, `dev.allow_text_injection: true`, and `agents.interaction.enabled: true`. Each supplies automatic resources in its language and a keyless mock reply (`speech.mock_reply`), but no text-rule fallback. If the semantic provider is unavailable, the session uses neutral timing and control rather than guessing language-specific meaning. The mock reply asks for reservation details rather than asserting invented availability. With `OPENAI_API_KEY` set, the task agent writes its own replies in the configured `tts.language`.
 
 - Text typed in the input box at the bottom of the page becomes the user's utterance. It follows the same commit → agent → claim gate → TTS → playback path as speech.
 - With the microphone enabled, you can also check full-duplex behavior such as duck/resume/abort using mock TTS.
@@ -40,15 +42,15 @@ The sample uses `asr.provider: inject`, `dev.allow_text_injection: true`, and `a
 
 The browser must support WebSocket, Web Audio, AudioWorklet, and `getUserMedia`. Microphone access requires browser and OS permissions and a secure context. For local development, use `http://localhost:8080`; for access from another device, use HTTPS/WSS. Currently, `Start session` requests microphone permission even when using only text injection. If permission is denied, the page closes the session socket, shows `microphone blocked` with a note in the log, and re-enables Start; allow the microphone for the site and start again. The sample `mock` TTS emits silent PCM, so it cannot verify that natural speech is audible.
 
-The web client sets `ws.binaryType = 'arraybuffer'` and decodes the `ArrayBuffer` directly. `node --test full-duplex-demo/tests/web_playback.test.cjs` checks the real inline script's WebSocket initialization, binary PCM delivery, and ACK after simulated playback completes. It covers more than `node --check` (syntax only), but does not guarantee actual audio output or microphone permission behavior in a browser/OS combination.
+The web client sets `ws.binaryType = 'arraybuffer'` and decodes the `ArrayBuffer` directly. `node --test examples/browser/tests/web_playback.test.cjs` checks the real inline script's WebSocket initialization, binary PCM delivery, and ACK after simulated playback completes. It covers more than `node --check` (syntax only), but does not guarantee actual audio output or microphone permission behavior in a browser/OS combination.
 
 <a id="manual-browser-playback-ack-check"></a>
 
 ### Manual browser playback ACK check without API keys
 
-1. From the repository root, run the `cargo run -p full-duplex-demo -- --config ...` command above. Without real keys configured, the sample uses inject ASR, mock TTS, a mock task agent, and neutral semantic fallback. If `OPENAI_API_KEY` is set, the task agent or the independently configured semantic provider can call a real LLM and transmit transcript/context text. Use a separate shell without the key for a key-free check.
+1. From the repository root, run the `cargo run -p browser-example -- --config ...` command above. Without real keys configured, the sample uses inject ASR, mock TTS, a mock task agent, and neutral semantic fallback. If `OPENAI_API_KEY` is set, the task agent or the independently configured semantic provider can call a real LLM and transmit transcript/context text. Use a separate shell without the key for a key-free check.
 2. On the same computer, open `http://localhost:8080` in a browser, then open developer tools to **Console** and **Network → WS → `/api/voice/ws` → Messages/Frames**.
-3. Click **Start session** and allow microphone access. This demo opens the microphone even when using only text injection. A remote browser not on `localhost` requires HTTPS/WSS.
+3. Click **Start session** and allow microphone access. The example opens the microphone even when using only text injection. A remote browser not on `localhost` requires HTTPS/WSS.
 4. Type `예약하고 싶어요` into the text input at the bottom and click **Send**. Check that received frames include `speech_started`, binary PCM chunks, and `speech_done` in that order. After playback ends, check sent frames for `playback_chunk_completed` and `playback_completed`. The Console should have no `TypeError`. Mock TTS is silent, so the chunks play without audible speech.
 5. If this fails, check Console errors, WS frames, `provider_error` in the server logs, and `target/voice-traces/<date>/<session>/events.jsonl`. Stop the test with Ctrl+C in the server terminal.
 
@@ -74,7 +76,7 @@ $env:QWEN_VOICE_ID = "..."
 $env:OPENAI_API_KEY = "..."
 ```
 
-In `full-duplex-demo/configs/voice-runtime.yaml`:
+In `examples/browser/configs/<language>/voice-runtime.yaml`:
 
 ```yaml
 asr:
@@ -96,7 +98,7 @@ cargo test --test provider_contracts -- --ignored
 
 For an unverified provider combination, start diagnosis with the `provider_error` events in the logs and `target/voice-traces/<date>/<session>/events.jsonl`.
 
-### When the demo sends data out and can incur charges
+### When the example sends data out and can incur charges
 
 Each of these happens on its own; changing one setting can start external calls even if everything else is still mock.
 
@@ -110,17 +112,17 @@ A built-in network provider also needs an explicit `asr.locale` or `tts.language
 
 ## Cartesia streaming STT and TTS
 
-`full-duplex-demo/configs/voice-runtime.cartesia.yaml` selects Cartesia Ink Whisper manual streaming STT and native Sonic TTS. The default configuration stays keyless. For typed-input TTS-only diagnosis, use `voice-runtime.cartesia-tts.yaml` instead; it deliberately keeps inject ASR.
+`examples/browser/configs/<language>/voice-runtime.cartesia.yaml` selects Cartesia Ink Whisper manual streaming STT and native Sonic TTS. The default configuration stays keyless. For typed-input TTS-only diagnosis, use `voice-runtime.cartesia-tts.yaml` instead; it deliberately keeps inject ASR.
 
 Set `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID`, and `OPENAI_API_KEY` in your server environment, then run:
 
 ```sh
-cargo run -p full-duplex-demo -- --config full-duplex-demo/configs/voice-runtime.cartesia.yaml
+cargo run -p browser-example -- --config examples/browser/configs/en/voice-runtime.cartesia.yaml
 ```
 
 For Bash/Zsh/Git Bash, use `export CARTESIA_API_KEY=...` and `export CARTESIA_VOICE_ID=...`; for PowerShell, use `$env:CARTESIA_API_KEY = "..."` and `$env:CARTESIA_VOICE_ID = "..."`. Keep secrets out of committed files and browser code. The existing reservation task agent requires the OpenAI key; a failed task-spec probe is not silently replaced by a mock agent in this live-provider setup. The full configuration captures microphone audio; the TTS-only configuration still requests browser microphone permission but uses typed input for recognition. The server does not automatically load a `.env` file: export the variables into its process environment. If keys are assigned by PowerShell `$PROFILE`, launch the command from that profile-loaded PowerShell session; a previously launched editor shell does not inherit later profile assignments. A separate `.env` file is not required.
 
-The full sample explicitly selects `ink-whisper`, 16 kHz mono `pcm_s16le`, locale `ko-KR` normalized to `ko`, and `manual_commit: true`; local VAD enqueues finalizes without pausing PCM for acknowledgements. TTS selects `sonic-3.6`, raw mono PCM16 at 24 kHz, `ko`, and zero managed text buffering delay. Both use API version `2026-08-14`. Premade warmup is disabled; enabling it can incur synthesis costs at startup. STT traffic may begin at browser session start, before a complete utterance. Microphone audio and conversation text leave the host and can incur Cartesia/OpenAI charges. Approve account/voice use, cost limits, fixture consent, and data transmission before running; zero-data-retention is not assumed for a standard account.
+The Cartesia configs explicitly select `ink-whisper`, 16 kHz mono `pcm_s16le`, locale `ko-KR` or `en-US` (sent as the primary code `ko` or `en`), and `manual_commit: true`; local VAD enqueues finalizes without pausing PCM for acknowledgements. TTS selects `sonic-3.6`, raw mono PCM16 at 24 kHz, `ko` or `en`, and zero managed text buffering delay. Both use API version `2026-08-14`. Premade warmup is disabled; enabling it can incur synthesis costs at startup. STT traffic may begin at browser session start, before a complete utterance. Microphone audio and conversation text leave the host and can incur Cartesia/OpenAI charges. Approve account/voice use, cost limits, fixture consent, and data transmission before running; zero-data-retention is not assumed for a standard account.
 
 Run the individual [ignored STT and TTS contracts](testing.md#cartesia-provider-regressions-and-paid-contracts) only after approval, then validate both providers in the browser. STT requires a consented Korean WAV through `VOICE_KOREAN_FIXTURE`; TTS requires an approved voice. The tests do not call the LLM. Socket upgrade is send-readiness, not proof of model/voice compatibility. Offline tests cover both adapters in one runtime. English TTS and STT have also passed the limited synthetic-input checks recorded in [testing](testing.md#english-provider-only-validation). Korean provider checks, browser/microphone behavior, naturalness, and the broader silence/overlap/cancellation cases remain unverified. In particular, FIFO transcript/flush attribution is an explicit assumption to verify, not an established vendor guarantee. See [STT boundaries and limits](configuration.md#cartesia-stt) and [TTS continuations](configuration.md#cartesia-tts).
 
@@ -134,15 +136,15 @@ Together uses its documented `session.created` readiness and JSON/base64 PCM pro
 
 ## Host language and response policies
 
-Use `VoiceRuntime::build_with_policies(config, providers, RuntimePolicies)` to supply a pure shared `TextAnalyzer`, per-session slot-extractor factory, or trusted `SpeechRenderer`. Pass `None` for `providers` to retain built-in factories. Explicit host overrides take precedence; otherwise configured framework extraction and the declared fallback remain active. Direct sessions expose matching builder injection points and `try_build` validation. The library adds no locale negotiation or transport dependency.
+Use `VoiceRuntime::build_with_policies(config, providers, RuntimePolicies)` to supply a pure shared `TextAnalyzer`, per-session slot-extractor factory, or trusted `SpeechRenderer`, and, with `framework`, the task and speculative tools (`with_task_tools`, `with_speculative_tools`). The library ships no business tools: a task spec that names a tool the host did not supply fails when the session's agent is built. `RuntimePolicies` is `#[non_exhaustive]`; build it from `RuntimePolicies::default()` and the `with_*` methods. Pass `None` for `providers` to retain built-in factories. Explicit host overrides take precedence; otherwise configured framework extraction and the declared fallback remain active. Direct sessions expose matching builder injection points and `try_build` validation. The library adds no locale negotiation or transport dependency.
 
-The shipped task spec returns `{"text", "outcome", "question"}` replies for a bounded reservation example. All shipped agent specs use `gpt-5.4-mini`. The task spec gives the model the server-local date each turn through an ai-agents `builtin` `datetime` context, so relative dates such as "tomorrow" resolve correctly; it also tells the model to read only the last four characters of a confirmation ID, which the demo reservation tool returns as `confirmation_suffix` so the model does not cut them itself. Once the agent has asked whether to book one option and the user agrees, the spec books it instead of asking a second time; it asks only for a detail that is still missing, such as the name. It books only a restaurant and time that a search returned, and it never promises to check or come back later, because nothing runs after a reply until the user speaks again. When it repeats a result from an earlier turn without calling the tool again, it names no outcome; naming one would fail the outcome check and replace the repeat with the failure text. Its state transitions use ai-agents `timing: parallel`: the transition is judged beside the reply instead of after it, so a turn without a transition costs one model call. The judge sees only the current user message and the runtime context, not the conversation history, so slots given over several turns may keep the agent in an earlier state. The executing-to-completed transition depends on the tool result and still runs after the reply, and the `completed` state does not regenerate the reply. In a live check, turns took about 1–5 s with this layout; with transitions judged after the reply they took about 2–9 s, and 3 of 9 turns ended with an empty reply after two chained transitions. Another spec can return plain text, which is spoken unchecked; it needs its own `speech.outcomes` rules and `tools.effects` declarations before it can report business outcomes. Changing `tts.language` changes the `speech_language` the task agent is asked to reply in, but not the automatic resources (backchannel, stop acknowledgement, failure, progress), `asr.locale`, or any grammar; set those together. With `tts.language` unset, the brief has no `speech_language` and the shipped spec tells the agent to reply in the user's language. A custom framework agent using `VoiceAgentHooks` must register tools through `hooks.bind_tool`; unbound results cannot authorize strict business speech. The adapter uses a stable session actor and an immutable per-turn sender token for execution provenance, not as user authentication.
+The browser example's task spec returns `{"text", "outcome", "question"}` replies for a bounded reservation example. All example agent specs use `gpt-5.4-mini`. The task spec gives the model the server-local date each turn through an ai-agents `builtin` `datetime` context, so relative dates such as "tomorrow" resolve correctly; it also tells the model to read only the last four characters of a confirmation ID, which the demo reservation tool returns as `confirmation_suffix` so the model does not cut them itself. Once the agent has asked whether to book one option and the user agrees, the spec books it instead of asking a second time; it asks only for a detail that is still missing, such as the name. It books only a restaurant and time that a search returned, and it never promises to check or come back later, because nothing runs after a reply until the user speaks again. When it repeats a result from an earlier turn without calling the tool again, it names no outcome; naming one would fail the outcome check and replace the repeat with the failure text. Its state transitions use ai-agents `timing: parallel`: the transition is judged beside the reply instead of after it, so a turn without a transition costs one model call. The judge sees only the current user message and the runtime context, not the conversation history, so slots given over several turns may keep the agent in an earlier state. The executing-to-completed transition depends on the tool result and still runs after the reply, and the `completed` state does not regenerate the reply. In a live check, turns took about 1–5 s with this layout; with transitions judged after the reply they took about 2–9 s, and 3 of 9 turns ended with an empty reply after two chained transitions. Another spec can return plain text, which is spoken unchecked; it needs its own `speech.outcomes` rules and `tools.effects` declarations before it can report business outcomes. Changing `tts.language` changes the `speech_language` the task agent is asked to reply in, but not the automatic resources (backchannel, stop acknowledgement, failure, progress), `asr.locale`, or any grammar; set those together. With `tts.language` unset, the brief has no `speech_language` and the shipped spec tells the agent to reply in the user's language. A custom framework agent using `VoiceAgentHooks` must register tools through `hooks.bind_tool`; unbound results cannot authorize strict business speech. The adapter uses a stable session actor and an immutable per-turn sender token for execution provenance, not as user authentication.
 
 ## Environment variables
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `VOICE_BIND_ADDR` | Bind address | `0.0.0.0:8080` |
+| `VOICE_BIND_ADDR` | Browser example bind address | `0.0.0.0:8080` |
 | `RUST_LOG` | Tracing filter | `info` |
 | `TOGETHER_API_KEY` | ASR | - |
 | `DASHSCOPE_API_KEY` | TTS | - |
@@ -150,27 +152,10 @@ The shipped task spec returns `{"text", "outcome", "question"}` replies for a bo
 | `CARTESIA_API_KEY` | Cartesia STT/TTS credential; selected by `asr.api_key_env` and `tts.api_key_env` in the full Cartesia sample | - |
 | `CARTESIA_VOICE_ID` | Approved Cartesia voice; selected by `tts.voice_env` when `tts.voice` is empty | - |
 | `OPENAI_API_KEY` | Task/Interaction LLM | - |
-| `VOICE_WEB_DIR` | Override the browser client directory | `../web` relative to the config file |
+| `VOICE_WEB_DIR` | Override the browser example's client directory | `examples/browser/web` |
 | `VOICE_KOREAN_FIXTURE` | Together/Cartesia STT contracts: consented 16 kHz mono PCM16 WAV; the Cartesia contract sends a fixture of at most 15 seconds twice. The server does not read it | - |
 
 All keys remain in the Rust gateway and are not sent to the browser.
-
-## Docker
-
-Docker is an **optional Linux-container deployment method**, not a replacement for native multiplatform support. The current Dockerfile uses Linux builder and runtime images. It can run on Windows/macOS with a Linux container engine such as Docker Desktop or a remote Linux engine. A successful Docker build does not validate native Windows/macOS builds or browser/microphone behavior; the Dockerfile itself also requires a separate build check.
-
-The runtime image includes `/app/LICENSE` for this project's Apache-2.0
-license. Third-party components retain their own licenses; review their
-notices when distributing images.
-
-Use one-line commands to avoid shell-specific line-continuation syntax.
-
-```sh
-docker build -t full-duplex-demo .
-docker run -p 8080:8080 -e TOGETHER_API_KEY -e DASHSCOPE_API_KEY -e QWEN_VOICE_ID -e OPENAI_API_KEY full-duplex-demo
-```
-
-Microphone permissions require HTTPS in production, so terminate TLS at a reverse proxy. WebSocket PCM is sufficient before a switch to WebRTC.
 
 ## Observability
 
@@ -188,7 +173,7 @@ Microphone permissions require HTTPS in production, so terminate TLS at a revers
 
 ## Multiple sessions
 
-A separate `RuntimeAgent` (task/speculative/interaction/deep) is created for each session. Conversation memory does not mix across clients, and root turns do not block each other, but session creation includes the cost of building agents. Only the reservation backend (`ReservationStore`) is shared across the process.
+A separate `RuntimeAgent` (task/speculative/interaction/deep) is created for each session. Conversation memory does not mix across clients, and root turns do not block each other, but session creation includes the cost of building agents. Only the host's tools, and whatever backend they wrap, are shared across the process; in the browser example that is the demo reservation store.
 
 ## What to watch in production event logs
 

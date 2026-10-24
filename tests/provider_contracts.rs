@@ -1,4 +1,5 @@
 //! Paid provider contracts; ignored by default and bounded across open, I/O, and cleanup.
+#![cfg(all(feature = "cartesia", feature = "together", feature = "qwen"))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +25,7 @@ fn english_artifact(name: &str) -> std::path::PathBuf {
 #[ignore = "paid Cartesia English TTS; writes synthetic PCM16 WAV under git-ignored temp"]
 async fn cartesia_tts_english_streaming_contract() {
     let mut config = voice_live::VoiceRuntimeConfig::from_file(
-        "full-duplex-demo/configs/voice-runtime.cartesia.yaml",
+        "examples/browser/configs/ko/voice-runtime.cartesia.yaml",
     )
     .unwrap()
     .tts;
@@ -110,6 +111,7 @@ async fn cartesia_tts_english_streaming_contract() {
                     ));
                 }
                 TtsEvent::Error { message, .. } => anyhow::bail!(message),
+                _ => unreachable!("unexpected event variant"),
             }
         }
         anyhow::bail!("TTS closed without terminal")
@@ -161,7 +163,7 @@ async fn cartesia_stt_english_streaming_contract() {
     assert!(wav.duration() > 0 && wav.duration() <= 16000 * 15);
     let pcm: Vec<i16> = wav.samples::<i16>().collect::<Result<_, _>>().unwrap();
     let mut config = voice_live::VoiceRuntimeConfig::from_file(
-        "full-duplex-demo/configs/voice-runtime.cartesia.yaml",
+        "examples/browser/configs/ko/voice-runtime.cartesia.yaml",
     )
     .unwrap()
     .asr;
@@ -251,6 +253,7 @@ async fn cartesia_stt_english_streaming_contract() {
                 AsrEvent::InjectedFinal { .. } => {
                     anyhow::bail!("injection cannot satisfy a provider contract")
                 }
+                _ => unreachable!("unexpected event variant"),
             }
         }
         Ok::<_, anyhow::Error>((finals, events, partials, first_partial_ms, before_finalize))
@@ -319,7 +322,7 @@ async fn cartesia_stt_korean_streaming_contract() {
         "use a consented fixture of at most 15 seconds"
     );
     let config = voice_live::VoiceRuntimeConfig::from_file(
-        "full-duplex-demo/configs/voice-runtime.cartesia.yaml",
+        "examples/browser/configs/ko/voice-runtime.cartesia.yaml",
     )
     .unwrap();
     let asr = voice_live::asr::cartesia::CartesiaStreamingAsr::from_config(&config.asr)
@@ -402,6 +405,7 @@ async fn cartesia_stt_korean_streaming_contract() {
                 AsrEvent::InjectedFinal { .. } => {
                     anyhow::bail!("injection is not a provider contract")
                 }
+                _ => unreachable!("unexpected event variant"),
             }
         }
         anyhow::ensure!(
@@ -437,7 +441,7 @@ async fn cartesia_stt_korean_streaming_contract() {
 #[ignore = "requires paid Cartesia API key and consented Korean voice; sends text externally"]
 async fn cartesia_tts_korean_streaming_contract() {
     let config = voice_live::VoiceRuntimeConfig::from_file(
-        "full-duplex-demo/configs/voice-runtime.cartesia-tts.yaml",
+        "examples/browser/configs/ko/voice-runtime.cartesia-tts.yaml",
     )
     .unwrap();
     let tts = voice_live::tts::cartesia::CartesiaStreamingTts::from_config(&config.tts)
@@ -506,6 +510,7 @@ async fn cartesia_tts_korean_streaming_contract() {
                 ),
                 TtsEvent::AudioDone { .. } => return Ok::<_, anyhow::Error>(()),
                 TtsEvent::Error { message, .. } => anyhow::bail!(message),
+                _ => unreachable!("unexpected event variant"),
             }
         }
         anyhow::bail!("Cartesia closed without terminal")
@@ -586,6 +591,7 @@ async fn together_nemotron_korean_contract() {
                     anyhow::bail!("provider contract cannot use injected text")
                 }
                 AsrEvent::Error { message, .. } => anyhow::bail!(message),
+                _ => unreachable!("unexpected event variant"),
             }
         }
         anyhow::bail!("ASR closed without a final")
@@ -661,6 +667,7 @@ async fn qwen_tts_korean_streaming_contract() {
                     return Ok(());
                 }
                 TtsEvent::Error { message, .. } => anyhow::bail!(message),
+                _ => unreachable!("unexpected event variant"),
             }
         }
         anyhow::bail!("TTS closed without terminal")

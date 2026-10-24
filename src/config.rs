@@ -1,8 +1,13 @@
+//! The `voice-runtime.yaml` configuration types, loaded and validated by [`VoiceRuntimeConfig::from_file`].
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// The `voice-runtime.yaml` configuration.
+///
+/// Every key and its default is documented in the repository's `docs/configuration.md`; unknown keys are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VoiceRuntimeConfig {
@@ -398,6 +403,7 @@ pub struct TurnControlConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SlotFallback {
     #[default]
     Neutral,
@@ -766,6 +772,7 @@ impl Default for ToolsConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ToolEffect {
     PureRead,
     IdempotentWrite,
@@ -879,6 +886,7 @@ impl TtsConfig {
 }
 
 impl VoiceRuntimeConfig {
+    /// Loads and validates a YAML file, resolving relative paths such as agent specs against the file's directory.
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)?;
@@ -890,6 +898,7 @@ impl VoiceRuntimeConfig {
         Ok(config)
     }
 
+    /// Parses and validates YAML text; relative paths stay relative to the current directory.
     pub fn from_yaml_str(raw: &str) -> anyhow::Result<Self> {
         let config: VoiceRuntimeConfig = serde_yaml::from_str(raw)?;
         config.validate()?;

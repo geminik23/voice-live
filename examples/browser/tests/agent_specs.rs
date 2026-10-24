@@ -19,7 +19,7 @@ fn demo_root() -> PathBuf {
 }
 
 fn sample_config() -> VoiceRuntimeConfig {
-    VoiceRuntimeConfig::from_file(demo_root().join("configs/voice-runtime.yaml"))
+    VoiceRuntimeConfig::from_file(demo_root().join("configs/ko/voice-runtime.yaml"))
         .expect("sample config parses")
 }
 
@@ -72,8 +72,11 @@ async fn task_agent_spec_rejects_a_turn_without_voice_context() {
     let (runtime, mock) = runtime_with_mock(
         &spec,
         "unused",
-        voice_live::tools::reservation::task_tools(
-            voice_live::tools::reservation::ReservationStore::demo(),
+        browser_example::reservation::task_tools(
+            browser_example::reservation::ReservationStore::from_yaml_file(
+                &demo_root().join("configs/ko/restaurants.yaml"),
+            )
+            .unwrap(),
         ),
     );
 

@@ -1,4 +1,5 @@
 //! Offline Cartesia TTS wire and ownership contracts; no paid endpoints.
+#![cfg(feature = "cartesia")]
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -42,39 +42,23 @@ pub struct ReservationStore {
 }
 
 impl ReservationStore {
-    pub fn demo() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            restaurants: vec![
-                RestaurantOption {
-                    id: "gangnam-table".into(),
-                    name: "강남 테이블".into(),
-                    area: "강남".into(),
-                    available_times: vec!["18:30".into(), "19:00".into(), "20:00".into()],
-                    parking: true,
-                    window_seat: true,
-                    maximum_party_size: 8,
-                },
-                RestaurantOption {
-                    id: "hongdae-kitchen".into(),
-                    name: "홍대 키친".into(),
-                    area: "홍대".into(),
-                    available_times: vec!["19:00".into(), "19:30".into()],
-                    parking: false,
-                    window_seat: true,
-                    maximum_party_size: 6,
-                },
-                RestaurantOption {
-                    id: "seongsu-dining".into(),
-                    name: "성수 다이닝".into(),
-                    area: "성수".into(),
-                    available_times: vec!["18:00".into(), "19:00".into(), "20:30".into()],
-                    parking: true,
-                    window_seat: false,
-                    maximum_party_size: 10,
-                },
-            ],
+    /// Loads the example restaurants from a YAML list, one file per example language.
+    pub fn from_yaml_file(path: &std::path::Path) -> anyhow::Result<Arc<Mutex<Self>>> {
+        Self::from_yaml_str(&std::fs::read_to_string(path)?)
+    }
+
+    pub fn from_yaml_str(raw: &str) -> anyhow::Result<Arc<Mutex<Self>>> {
+        let restaurants: Vec<RestaurantOption> = serde_yaml::from_str(raw)?;
+        anyhow::ensure!(!restaurants.is_empty(), "the restaurant list is empty");
+        Ok(Arc::new(Mutex::new(Self {
+            restaurants,
             reservations_by_key: HashMap::new(),
-        }))
+        })))
+    }
+
+    #[cfg(test)]
+    fn demo() -> Arc<Mutex<Self>> {
+        Self::from_yaml_str(include_str!("../configs/ko/restaurants.yaml")).unwrap()
     }
 }
 

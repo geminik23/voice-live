@@ -10,7 +10,7 @@ fn demo_root() -> PathBuf {
 #[test]
 fn dual_cartesia_sample_wires_both_providers_and_relative_task_spec() {
     let config =
-        VoiceRuntimeConfig::from_file(demo_root().join("configs/voice-runtime.cartesia.yaml"))
+        VoiceRuntimeConfig::from_file(demo_root().join("configs/ko/voice-runtime.cartesia.yaml"))
             .unwrap();
     assert_eq!(config.asr.provider, "cartesia");
     assert_eq!(config.asr.endpoint, "wss://api.cartesia.ai/stt/websocket");
@@ -38,9 +38,10 @@ fn dual_cartesia_sample_wires_both_providers_and_relative_task_spec() {
 
 #[test]
 fn cartesia_tts_sample_is_explicit_and_preserves_keyless_defaults() {
-    let config =
-        VoiceRuntimeConfig::from_file(demo_root().join("configs/voice-runtime.cartesia-tts.yaml"))
-            .unwrap();
+    let config = VoiceRuntimeConfig::from_file(
+        demo_root().join("configs/ko/voice-runtime.cartesia-tts.yaml"),
+    )
+    .unwrap();
     assert_eq!(config.asr.provider, "inject");
     assert!(config.dev.allow_text_injection);
     assert_eq!(config.tts.provider, "cartesia");
@@ -57,7 +58,7 @@ fn cartesia_tts_sample_is_explicit_and_preserves_keyless_defaults() {
     assert!(spec.exists());
     AgentBuilder::from_yaml_file(spec).unwrap();
     let keyless =
-        VoiceRuntimeConfig::from_file(demo_root().join("configs/voice-runtime.yaml")).unwrap();
+        VoiceRuntimeConfig::from_file(demo_root().join("configs/ko/voice-runtime.yaml")).unwrap();
     assert_eq!(keyless.asr.provider, "inject");
     assert_eq!(keyless.tts.provider, "mock");
 }
@@ -65,7 +66,7 @@ fn cartesia_tts_sample_is_explicit_and_preserves_keyless_defaults() {
 #[test]
 fn demo_runtime_and_agent_yaml_files_parse() {
     let root = demo_root();
-    let runtime_path = root.join("configs/voice-runtime.yaml");
+    let runtime_path = root.join("configs/ko/voice-runtime.yaml");
     let config = VoiceRuntimeConfig::from_file(&runtime_path).expect("runtime config parses");
 
     let task_spec = config.agents.task.spec.expect("task agent spec");
@@ -127,5 +128,24 @@ fn task_agent_declares_and_renders_the_voice_context() {
             !prompt.contains(stale),
             "system prompt still refers to {stale}"
         );
+    }
+}
+
+/// Each language directory is a complete example: its configs load, name that language, and carry a restaurant list.
+#[test]
+fn korean_and_english_example_directories_are_complete() {
+    for (language, locale, speech) in [("ko", "ko-KR", "Korean"), ("en", "en-US", "English")] {
+        let dir = demo_root().join("configs").join(language);
+        let keyless = VoiceRuntimeConfig::from_file(dir.join("voice-runtime.yaml")).unwrap();
+        assert_eq!(keyless.asr.locale, locale);
+        assert_eq!(keyless.tts.language, speech);
+        assert!(keyless.agents.task.spec.unwrap().exists());
+        let cartesia =
+            VoiceRuntimeConfig::from_file(dir.join("voice-runtime.cartesia.yaml")).unwrap();
+        assert_eq!(cartesia.asr.locale, locale);
+        browser_example::reservation::ReservationStore::from_yaml_file(
+            &dir.join("restaurants.yaml"),
+        )
+        .unwrap();
     }
 }

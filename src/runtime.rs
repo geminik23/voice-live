@@ -1,3 +1,5 @@
+//! The host entry point: [`VoiceRuntime`] builds speech providers and agents once and creates a pipeline per client session.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,9 +9,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::CognitiveAgent;
 use crate::agent::mock::FakeAgent;
+#[cfg(feature = "cartesia")]
 use crate::asr::cartesia::CartesiaStreamingAsr;
 use crate::asr::fake::MockAsr;
 use crate::asr::inject::InjectionQueue;
+#[cfg(feature = "together")]
 use crate::asr::together::TogetherNemotronAsr;
 use crate::asr::{
     AsrAudioInput, AsrAudioPush, AsrDuplexLimits, AsrDuplexSession, AsrEvent, AsrEventStream,
@@ -31,21 +35,29 @@ use crate::semantics::extractor::SlotExtractor;
 use crate::session::VoiceSessionBuilder;
 use crate::session::deep_worker::DeepWorker;
 use crate::tts::buffered::BufferedTtsAdapter;
+#[cfg(feature = "cartesia")]
 use crate::tts::cartesia::CartesiaStreamingTts;
 use crate::tts::fake::FakeTts;
 use crate::tts::premade::PremadeTts;
+#[cfg(feature = "qwen")]
 use crate::tts::qwen::QwenRealtimeTts;
 use crate::tts::{StreamingTts, TextInputMode};
 use crate::vad::EnergyVad;
 
+/// One item from the client, sent through [`GatewaySession::input_tx`].
 #[derive(Debug)]
 pub enum ClientInput {
     Audio(AudioFrame),
     Control(ClientControlMessage),
 }
 
+/// A live session returned by [`VoiceRuntime::create_session`].
+///
+/// The host forwards its client's microphone frames and control messages into `input_tx`, and forwards everything the runtime writes to the `client_tx` it passed in back to the client.
 pub struct GatewaySession {
+    /// Identifies the session for [`VoiceRuntime::inject_user_text`] and [`VoiceRuntime::close_session`].
     pub session_id: crate::ids::SessionId,
+    /// Client audio and control input; closing it ends the session's input.
     pub input_tx: mpsc::Sender<ClientInput>,
 }
 
@@ -78,6 +90,10 @@ struct SessionBrains {
     deep_worker: Option<Arc<dyn DeepWorker>>,
 }
 
+/// The process-wide runtime: speech factories, agent specs, and host policies, from which per-session pipelines are created.
+///
+/// Build it once with [`VoiceRuntime::build`], [`VoiceRuntime::build_with_policies`], or [`VoiceRuntime::build_with_providers`], then call [`VoiceRuntime::create_session`] for each client.
+/// Each session gets its own agents and memory; only speech factories and host tools are shared.
 pub struct VoiceRuntime {
     config: Arc<VoiceRuntimeConfig>,
     /// Source provider. `StreamingAsr` is a factory, so sharing it is safe;
@@ -91,12 +107,74 @@ pub struct VoiceRuntime {
 }
 
 /// Host overrides are independent of provider names and applied before configured fallbacks.
+///
+/// Build it with [`RuntimePolicies::default`] and the `with_*` methods; new policies may be added without breaking callers.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct RuntimePolicies {
     pub interaction_brain: Option<Arc<dyn Fn() -> Arc<dyn InteractionBrain> + Send + Sync>>,
     pub text_analyzer: Option<Arc<dyn crate::semantics::text::TextAnalyzer>>,
     pub slot_extractor: Option<Arc<dyn Fn() -> Arc<dyn SlotExtractor> + Send + Sync>>,
     pub speech_renderer: Option<Arc<dyn crate::speech::render::SpeechRenderer>>,
+    /// Tools the framework task agent may call, bound per session through [`crate::agent::framework::VoiceAgentHooks`].
+    /// The tool objects are shared by every session, so any backend state behind them is shared too.
+    #[cfg(feature = "framework")]
+    pub task_tools: Vec<Arc<dyn ai_agents::tools::Tool>>,
+    /// Tools for the speculative read-only agent; config validation still requires each to be declared `pure_read`.
+    #[cfg(feature = "framework")]
+    pub speculative_tools: Vec<Arc<dyn ai_agents::tools::Tool>>,
+}
+
+impl RuntimePolicies {
+    /// A per-session factory for the interaction brain, replacing the configured semantic brain.
+    pub fn with_interaction_brain(
+        mut self,
+        factory: impl Fn() -> Arc<dyn InteractionBrain> + Send + Sync + 'static,
+    ) -> Self {
+        self.interaction_brain = Some(Arc::new(factory));
+        self
+    }
+
+    /// A host text analyzer, which selects the compatibility interaction path.
+    pub fn with_text_analyzer(
+        mut self,
+        analyzer: Arc<dyn crate::semantics::text::TextAnalyzer>,
+    ) -> Self {
+        self.text_analyzer = Some(analyzer);
+        self
+    }
+
+    /// A per-session factory for the slot extractor, replacing `turn_control.slot_fallback`.
+    pub fn with_slot_extractor(
+        mut self,
+        factory: impl Fn() -> Arc<dyn SlotExtractor> + Send + Sync + 'static,
+    ) -> Self {
+        self.slot_extractor = Some(Arc::new(factory));
+        self
+    }
+
+    /// A host renderer that checks task replies instead of the configured outcome rules.
+    pub fn with_speech_renderer(
+        mut self,
+        renderer: Arc<dyn crate::speech::render::SpeechRenderer>,
+    ) -> Self {
+        self.speech_renderer = Some(renderer);
+        self
+    }
+
+    /// Tools the framework task agent may call.
+    #[cfg(feature = "framework")]
+    pub fn with_task_tools(mut self, tools: Vec<Arc<dyn ai_agents::tools::Tool>>) -> Self {
+        self.task_tools = tools;
+        self
+    }
+
+    /// Read-only tools for the speculative agent.
+    #[cfg(feature = "framework")]
+    pub fn with_speculative_tools(mut self, tools: Vec<Arc<dyn ai_agents::tools::Tool>>) -> Self {
+        self.speculative_tools = tools;
+        self
+    }
 }
 
 /// Externally supplied speech factories for [`VoiceRuntime::build_with_providers`].
@@ -123,10 +201,12 @@ impl VoiceRuntime {
         Ok(runtime)
     }
 
+    /// Builds a runtime with the built-in speech providers named in the config and default policies.
     pub async fn build(config: VoiceRuntimeConfig) -> anyhow::Result<Arc<Self>> {
         Self::build_from_arc(Arc::new(config)).await
     }
 
+    /// Like [`VoiceRuntime::build`], for a config the host already shares.
     pub async fn build_from_arc(config: Arc<VoiceRuntimeConfig>) -> anyhow::Result<Arc<Self>> {
         // Built-in network providers get the configured language verbatim; there is no default language to fall back on.
         if matches!(config.asr.provider.as_str(), "together" | "cartesia") {
@@ -144,8 +224,14 @@ impl VoiceRuntime {
             );
         }
         let asr: Arc<dyn StreamingAsr> = match config.asr.provider.as_str() {
+            #[cfg(feature = "together")]
             "together" => Arc::new(TogetherNemotronAsr::from_config(&config.asr)?),
+            #[cfg(feature = "cartesia")]
             "cartesia" => Arc::new(CartesiaStreamingAsr::from_config(&config.asr)?),
+            #[cfg(not(feature = "together"))]
+            "together" => anyhow::bail!("asr.provider 'together' needs the `together` feature"),
+            #[cfg(not(feature = "cartesia"))]
+            "cartesia" => anyhow::bail!("asr.provider 'cartesia' needs the `cartesia` feature"),
             // `inject` is `mock` plus a text channel; the media worker drains
             // the queue itself so every provider can be driven by typed text.
             "inject" | "mock" => Arc::new(MockAsr::quiet()),
@@ -157,8 +243,14 @@ impl VoiceRuntime {
         };
 
         let raw_tts: Arc<dyn StreamingTts> = match config.tts.provider.as_str() {
+            #[cfg(feature = "qwen")]
             "qwen" => Arc::new(QwenRealtimeTts::from_config(&config.tts)?),
+            #[cfg(feature = "cartesia")]
             "cartesia" => Arc::new(CartesiaStreamingTts::from_config(&config.tts)?),
+            #[cfg(not(feature = "qwen"))]
+            "qwen" => anyhow::bail!("tts.provider 'qwen' needs the `qwen` feature"),
+            #[cfg(not(feature = "cartesia"))]
+            "cartesia" => anyhow::bail!("tts.provider 'cartesia' needs the `cartesia` feature"),
             "mock" => Arc::new(FakeTts::new(
                 config.tts.sample_rate_hz,
                 config.tts.chunk_ms,
@@ -202,6 +294,7 @@ impl VoiceRuntime {
         Self::build_with_providers_from_arc(Arc::new(config), providers).await
     }
 
+    /// Like [`VoiceRuntime::build_with_providers`], for a config the host already shares.
     pub async fn build_with_providers_from_arc(
         config: Arc<VoiceRuntimeConfig>,
         providers: SpeechProviders,
@@ -267,10 +360,12 @@ impl VoiceRuntime {
         }))
     }
 
+    /// The validated configuration this runtime was built from.
     pub fn config(&self) -> &VoiceRuntimeConfig {
         &self.config
     }
 
+    /// Process-wide counters shared by every session.
     pub fn metrics(&self) -> &crate::metrics::Metrics {
         &self.metrics
     }
@@ -299,11 +394,14 @@ impl VoiceRuntime {
         }
     }
 
+    /// Creates a session whose output goes to `client_tx` and returns its input channel.
+    ///
+    /// The session starts processing audio after the client sends [`ClientControlMessage::SessionStart`].
     pub async fn create_session(
         self: &Arc<Self>,
         client_tx: mpsc::Sender<ServerMessage>,
     ) -> anyhow::Result<GatewaySession> {
-        let brains = self.brains.create().await?;
+        let brains = self.brains.create(&self.policies).await?;
         let session_id = crate::ids::SessionId::new();
         let shutdown = CancellationToken::new();
         let clock: crate::clock::ClockRef = Arc::new(TokioClock::new());
@@ -420,6 +518,7 @@ impl VoiceRuntime {
         })
     }
 
+    /// Stops a session's workers and releases its providers; unknown ids are ignored.
     pub async fn close_session(&self, session_id: crate::ids::SessionId) {
         let entry = self.sessions.lock().remove(&session_id);
         if let Some(mut entry) = entry {
@@ -437,6 +536,7 @@ impl VoiceRuntime {
         }
     }
 
+    /// The number of sessions currently open.
     pub fn session_count(&self) -> usize {
         self.sessions.lock().len()
     }
@@ -572,12 +672,9 @@ async fn send_client(
 enum BrainMode {
     /// Deterministic offline brains. Stateless, so construction is trivial.
     Mock,
+    /// Framework agents built from the configured specs with the host's tools from [`RuntimePolicies`].
     #[cfg(feature = "framework")]
-    Framework {
-        /// The demo booking backend. Shared on purpose: it models an external
-        /// system of record, not per-conversation state.
-        store: Arc<Mutex<crate::tools::reservation::ReservationStore>>,
-    },
+    Framework,
 }
 
 struct BrainProvider {
@@ -605,9 +702,7 @@ impl BrainProvider {
                 Ok(()) => {
                     return Ok(Self {
                         config: Arc::clone(config),
-                        mode: BrainMode::Framework {
-                            store: crate::tools::reservation::ReservationStore::demo(),
-                        },
+                        mode: BrainMode::Framework,
                     });
                 }
                 Err(error) if !injected && uses_only_development_providers(config) => {
@@ -623,7 +718,9 @@ impl BrainProvider {
         })
     }
 
-    async fn create(&self) -> anyhow::Result<SessionBrains> {
+    async fn create(&self, policies: &RuntimePolicies) -> anyhow::Result<SessionBrains> {
+        #[cfg(not(feature = "framework"))]
+        let _ = policies;
         match &self.mode {
             BrainMode::Mock => Ok(SessionBrains {
                 task_agent: Arc::new(FakeAgent::finalizing(
@@ -638,7 +735,7 @@ impl BrainProvider {
             }),
 
             #[cfg(feature = "framework")]
-            BrainMode::Framework { store } => {
+            BrainMode::Framework => {
                 let spec = self
                     .config
                     .agents
@@ -646,7 +743,7 @@ impl BrainProvider {
                     .spec
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("missing task agent spec"))?;
-                build_framework_brains(&self.config, spec, store).await
+                build_framework_brains(&self.config, spec, policies).await
             }
         }
     }
@@ -697,14 +794,13 @@ fn uses_only_development_providers(config: &VoiceRuntimeConfig) -> bool {
 async fn build_framework_brains(
     config: &Arc<VoiceRuntimeConfig>,
     task_spec: &std::path::Path,
-    reservation_store: &Arc<Mutex<crate::tools::reservation::ReservationStore>>,
+    policies: &RuntimePolicies,
 ) -> anyhow::Result<SessionBrains> {
     use crate::agent::framework::{
         AiAgentsCognitiveAgent, RuntimeDeepWorker, VoiceAgentHooks, build_runtime_agent,
         build_runtime_agent_with_memory, build_runtime_agent_with_tools,
         conversation_memory_for_spec,
     };
-    use crate::tools::reservation::{speculative_tools, task_tools};
 
     // voice-live owns the task agent's conversation memory so each turn can
     // be rewritten to what the user heard, or rolled back. The same handle
@@ -714,7 +810,7 @@ async fn build_framework_brains(
     let runtime = build_runtime_agent_with_memory(
         task_spec,
         Arc::clone(&hooks),
-        task_tools(Arc::clone(reservation_store)),
+        policies.task_tools.clone(),
         Some(Arc::clone(&memory)),
     )
     .await?;
@@ -737,7 +833,7 @@ async fn build_framework_brains(
         let speculative_runtime = build_runtime_agent_with_tools(
             speculative_spec,
             Arc::clone(&speculative_hooks),
-            speculative_tools(Arc::clone(reservation_store)),
+            policies.speculative_tools.clone(),
         )
         .await?;
         Some(Arc::new(AiAgentsCognitiveAgent::new(

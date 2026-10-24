@@ -59,6 +59,7 @@ impl ProviderSessionControl for OwnedProviderTasks {
     }
 }
 
+#[cfg(feature = "cartesia")]
 pub(crate) fn cartesia_selector(value: &str, primary_only: bool) -> anyhow::Result<String> {
     let value = value.trim();
     anyhow::ensure!(
@@ -92,6 +93,7 @@ pub(crate) fn cartesia_selector(value: &str, primary_only: bool) -> anyhow::Resu
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cartesia")]
     #[test]
     fn selectors_are_syntax_not_a_language_registry() {
         for (input, primary, full) in [
@@ -112,6 +114,7 @@ mod tests {
             assert!(super::cartesia_selector(input, false).is_err(), "{input:?}");
         }
     }
+    #[cfg(any(feature = "cartesia", feature = "together", feature = "qwen"))]
     #[test]
     fn websocket_tls_can_select_a_crypto_provider() {
         let _builder = rustls::ClientConfig::builder();

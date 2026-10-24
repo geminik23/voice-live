@@ -1,0 +1,22 @@
+# Example restaurants for the English configuration. The search tool lists these areas in its schema.
+- id: harbor-table
+  name: Harbor Table
+  area: Downtown
+  available_times: ["18:30", "19:00", "20:00"]
+  parking: true
+  window_seat: true
+  maximum_party_size: 8
+- id: garden-kitchen
+  name: Garden Kitchen
+  area: Midtown
+  available_times: ["19:00", "19:30"]
+  parking: false
+  window_seat: true
+  maximum_party_size: 6
+- id: riverside-dining
+  name: Riverside Dining
+  area: Riverside
+  available_times: ["18:00", "19:00", "20:30"]
+  parking: true
+  window_seat: false
+  maximum_party_size: 10

@@ -191,7 +191,7 @@ fn strict_renderer_checks_outcome_against_executed_records_without_model_ids() {
 fn reservation_receipt_binds_optional_backend_defaults_and_changed_requests() {
     let sample = VoiceRuntimeConfig::from_file(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("full-duplex-demo/configs/voice-runtime.yaml"),
+            .join("examples/browser/configs/ko/voice-runtime.yaml"),
     )
     .unwrap();
     let renderer = ConfiguredRenderer::new(&sample.speech.outcomes).unwrap();
@@ -256,15 +256,13 @@ async fn runtime_host_overrides_reach_real_sessions_and_factories_are_per_sessio
     cfg.dev.allow_text_injection = true;
     cfg.speech.mock_reply = Some("ask".into());
     cfg.turn_control.slot_fallback = voice_live::config::SlotFallback::KoreanExample;
-    let policies = voice_live::RuntimePolicies {
-        interaction_brain: None,
-        text_analyzer: Some(Arc::new(HostAnalyzer(analyses.clone()))),
-        slot_extractor: Some(Arc::new(move || {
+    let policies = voice_live::RuntimePolicies::default()
+        .with_text_analyzer(Arc::new(HostAnalyzer(analyses.clone())))
+        .with_slot_extractor(move || {
             calls.fetch_add(1, Ordering::SeqCst);
             Arc::new(voice_live::semantics::extractor::NoopSlotExtractor)
-        })),
-        speech_renderer: Some(Arc::new(HostRenderer)),
-    };
+        })
+        .with_speech_renderer(Arc::new(HostRenderer));
     let runtime = voice_live::VoiceRuntime::build_with_policies(
         cfg,
         Some(voice_live::SpeechProviders {
@@ -510,7 +508,9 @@ async fn neutral_agent_failure_has_no_implicit_spoken_language() {
     assert_eq!(resolutions, [TurnResolution::Discard]);
 }
 
+#[cfg(feature = "cartesia")]
 struct ExpectedLanguage(&'static str);
+#[cfg(feature = "cartesia")]
 impl tokio_tungstenite::tungstenite::handshake::server::Callback for ExpectedLanguage {
     fn on_request(
         self,
@@ -531,6 +531,7 @@ impl tokio_tungstenite::tungstenite::handshake::server::Callback for ExpectedLan
     }
 }
 
+#[cfg(feature = "cartesia")]
 #[tokio::test]
 async fn cartesia_asr_accepts_factory_and_session_selectors_and_sends_primary_code() {
     use futures::StreamExt;

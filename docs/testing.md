@@ -11,25 +11,25 @@ Layer 3c framework memory   real ai-agents runtime + MockLLMProvider
                              (tests/framework_memory.rs, framework feature)
 Layer 4  provider contract   paid API required, #[ignore] (tests/provider_contracts.rs)
 
--- full-duplex-demo (transport layer) ----------------------------------------
+-- examples/browser (transport layer) ----------------------------------------
 Layer 3b gateway E2E         in-process axum + real WebSocket
-                             (full-duplex-demo/tests/gateway_e2e.rs)
-         demo config         validates the demo agent YAML schema
-                             (full-duplex-demo/tests/demo_config.rs)
-         agent specs         runs demo agent specs with the real runtime + mock LLM;
+                             (examples/browser/tests/gateway_e2e.rs)
+         example config      validates the example configs and agent YAML schema
+                             (examples/browser/tests/demo_config.rs)
+         agent specs         runs example agent specs with the real runtime + mock LLM;
                              checks that the deep worker spec runs without voice
                              context and the task agent spec rejects missing context
-                             (full-duplex-demo/tests/agent_specs.rs)
+                             (examples/browser/tests/agent_specs.rs)
          browser script      uses the real inline script + mock WebSocket/AudioContext
                              to check binary PCM reception and playback ACKs
                              (Node's built-in test runner)
-                             (full-duplex-demo/tests/web_playback.test.cjs)
+                             (examples/browser/tests/web_playback.test.cjs)
 
 -- manual --------------------------------------------------------------------
 Layer 5  acoustic replay     `WavFrameSource` + `replay_wav_realtime`, real microphone
 ```
 
-Layer 3 is split because the library has no transport layer. `runtime_pipeline` checks only the channel interface exposed by `VoiceRuntime`; the demo's gateway checks the actual axum integration.
+Layer 3 is split because the library has no transport layer. `runtime_pipeline` checks only the channel interface exposed by `VoiceRuntime`; the browser example's gateway checks the actual axum integration.
 
 ## Running tests
 
@@ -37,14 +37,14 @@ Layer 3 is split because the library has no transport layer. `runtime_pipeline` 
 # Library only (default; the fastest path for routine development)
 cargo test
 
-# Entire workspace, including the demo
+# Entire workspace, including the browser example
 cargo test --workspace
 
-# Deterministic core only (without the framework)
+# Deterministic core only (without the framework and the network providers)
 cargo test --no-default-features
 
-# Real WebSocket gateway E2E (in the demo)
-cargo test -p full-duplex-demo --test gateway_e2e
+# Real WebSocket gateway E2E (in the browser example)
+cargo test -p browser-example --test gateway_e2e
 
 ```
 
@@ -90,9 +90,9 @@ Paid contracts are still ignored by default. They use actual outer timeouts acro
 
 ## Cartesia provider regressions and paid contracts
 
-`cargo test --test cartesia_providers` runs real localhost WebSocket fakes, not Cartesia endpoints. It checks header/version authentication, unchanged context settings, verbatim fragments, audio before finish, normal and audio-bearing terminals, context-less errors before/after input, wrong contexts, base64/PCM/format budgets, queue saturation with reserved finish, independent absolute deadlines, context expiry, cancellation/Drop, cancelled output polls, legacy ownership, and factory-only validation. The target also verifies native premade warmup/cache reuse and a channel runtime path from actual PCM/VAD through both Cartesia adapters to authorized playback, chunk/completion ACKs, and exactly-once turn resolution, without text injection or paid providers. Socket tests use bounded real time; runtime policy regressions use paused virtual time.
+`cargo test --test cartesia_providers` runs real localhost WebSocket fakes, not Cartesia endpoints. It checks header/version authentication, unchanged context settings, verbatim fragments, audio before finish, normal and audio-bearing terminals, context-less errors before/after input, wrong contexts, base64/PCM/format budgets, queue saturation with reserved finish, independent absolute deadlines, context expiry, cancellation/Drop, cancelled output polls, legacy ownership, and factory-only validation. The target also verifies native premade warmup/cache reuse and a channel runtime path from actual PCM/VAD through both Cartesia adapters to authorized playback, chunk/completion ACKs, and exactly-once turn resolution, without text injection or paid providers. It also counts the silent samples a fake recognizer receives before each finalize, so a manual commit sent before `asr.commit_delay_ms` of trailing audio, a short pause split into two utterances, or a missing idle commit after `asr.idle_commit_ms` of silence fails. Socket tests use bounded real time; runtime policy regressions use paused virtual time.
 
-`cargo test --test cartesia_asr` covers manual STT: header/query construction, raw little-endian PCM and plain-text finalize/close, exact delta concatenation and tail replacement, connection identity versus utterance identity, monotonic revisions, duplicate snapshot suppression, bounded PCM/command permits including writer-held data and outstanding flushes, pipelined finalize, continuous-silence/repeated-flush stress with positive ack latency, pending/finish deadlines, graceful confirmed-only drain, full/unpolled output, Ping handling during pacing, EOF and malformed events, redacted retry classification, cancelled admission/output polls, legacy facade, factory/injection validation, and Drop ownership. Regressions preserve acknowledged Finals across later receive failure and preserve the original finish deadline after finished-input Drop.
+`cargo test --test cartesia_asr` covers manual STT: header/query construction, raw little-endian PCM and plain-text finalize/close, exact delta concatenation and tail replacement, connection identity versus utterance identity, monotonic revisions, duplicate snapshot suppression, bounded PCM/command permits including writer-held data and outstanding flushes, pipelined finalize, continuous-silence/repeated-flush stress with positive ack latency, pending/finish deadlines, graceful confirmed-only drain, full/unpolled output, Ping handling during pacing, EOF and malformed events, redacted retry classification, cancelled admission/output polls, legacy facade, factory/injection validation, and Drop ownership. Regressions preserve acknowledged Finals across later receive failure and preserve the original finish deadline after finished-input Drop. Another checks that 20 ms frames reach the wire as `chunk_ms` messages and that held audio is sent before a finalize.
 
 `tests/duplex_providers.rs` additionally verifies non-retryable ASR errors racing with input closure and preservation of TTS provider errors before text admission. Supervisor regressions cover consumed audio after partial commit, preserving a successor hypothesis and transcript epoch, Final-first empty successors, mixed injection/audio, same-text fresh identities, and reset behavior. The scenario `partial_commit_does_not_repeat_on_late_audio_final` asserts exactly one committed turn instead of two. These regressions were first observed failing against the old behavior before their fixes.
 
@@ -149,13 +149,15 @@ cargo test --workspace
 cargo test --no-default-features
 ```
 
+Tests that need a network speech provider are gated on its feature: `tests/cartesia_asr.rs` and `tests/cartesia_providers.rs` on `cartesia`, `tests/provider_contracts.rs` on `cartesia`, `together`, and `qwen` together. Without `cartesia`, `tests/runtime_pipeline.rs` checks that selecting the provider fails with an error naming the missing feature.
+
 You can additionally check core lints with `cargo clippy --no-default-features --all-targets -- -D warnings`. Run the browser script's Node test:
 
 ```sh
-node --test full-duplex-demo/tests/web_playback.test.cjs
+node --test examples/browser/tests/web_playback.test.cjs
 ```
 
-The test applies `node --check` to the actual inline script in `full-duplex-demo/web/index.html` and checks `startSession`'s `binaryType` and `onmessage` setup through mock WebSocket PCM reception and the ACK after mock playback completes. A second test denies the microphone and checks that the page closes the socket, shows why, and re-enables Start. CI is configured to install Node 20 and run this command. It does not simulate a browser, AudioWorklet, physical playback, or microphone permissions, so perform the [manual browser playback check](deployment.md#manual-browser-playback-ack-check) separately.
+The test applies `node --check` to the actual inline script in `examples/browser/web/index.html` and checks `startSession`'s `binaryType` and `onmessage` setup through mock WebSocket PCM reception and the ACK after mock playback completes. A second test denies the microphone and checks that the page closes the socket, shows why, and re-enables Start. CI is configured to install Node 20 and run this command. It does not simulate a browser, AudioWorklet, physical playback, or microphone permissions, so perform the [manual browser playback check](deployment.md#manual-browser-playback-ack-check) separately.
 
 ### Evidence available so far
 
@@ -169,14 +171,14 @@ The automated checks below ran locally on Windows; a user additionally reported 
 
 After the decoder lint fix, local Windows tests passed with 117 workspace tests and 103 framework-free tests (2 paid contract tests ignored in each run). Decoder tests cover explicit little-endian sample values, empty payloads, short headers, and odd-length payload rejection. These tests preserve the existing wire contract; they do not replace checking the reported lint on the CI toolchain.
 
-Passing on one operating system or CPU architecture does not validate another target. Successful cross-compilation does not replace execution checks; a Linux Docker build does not validate native Windows or macOS.
+Passing on one operating system or CPU architecture does not validate another target. Successful cross-compilation does not replace execution checks; a Linux container build does not validate native Windows or macOS.
 
 ### Manual validation record
 
 - Record the server OS, CPU, Rust target/toolchain, client OS, and browser version separately.
 - Check microphone permissions, actual capture sample rate, text injection, binary chunk reception and playback ACKs, duck/resume/abort, and reconnection. Mock TTS is silent, so verifying audible natural speech requires a separate test with a real TTS provider.
 - Browser tests are separate from the server's Rust gateway E2E tests. Test supported browsers in person, including Safari on macOS if applicable.
-- Together/Qwen contract tests, heard-memory behavior with a real LLM, long-running stability, and Docker builds are separate checks. An ignored provider contract test in the default suite is unverified, not a pass or a failure.
+- Together/Qwen contract tests, heard-memory behavior with a real LLM, and long-running stability are separate checks. An ignored provider contract test in the default suite is unverified, not a pass or a failure.
 
 ## Scenario DSL
 

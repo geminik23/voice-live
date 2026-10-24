@@ -4,15 +4,15 @@ This document describes the runtime's actual architecture and current contracts.
 
 ## Overall structure
 
-The transport layer (axum WebSocket) belongs to the **demo**, not the library. The gateway connects the `ClientInput` / `ServerMessage` channels to the socket. The library's `runtime.rs` handles frame sequence validation, resampling, VAD, and the playback bridge.
+The transport layer (axum WebSocket) belongs to the **browser example** (or any host), not the library. The gateway connects the `ClientInput` / `ServerMessage` channels to the socket. The library's `runtime.rs` handles frame sequence validation, resampling, VAD, and the playback bridge.
 
-The library and demo server target native execution on Linux, Windows, and macOS, and must not require a particular OS or shell. The demo browser currently handles microphone capture and physical audio output, so runtime build validation is distinct from browser and device validation. See [deployment](deployment.md) and [testing](testing.md#platform-validation) for platform-specific prerequisites and validation scope.
+The library and the browser example server target native execution on Linux, Windows, and macOS, and must not require a particular OS or shell. The browser example currently handles microphone capture and physical audio output, so runtime build validation is distinct from browser and device validation. See [deployment](deployment.md) and [testing](testing.md#platform-validation) for platform-specific prerequisites and validation scope.
 
 ```text
 Browser (web/index.html)
     │  WebSocket: binary PCM (actual browser rate, 20 ms frames) + JSON control
     ▼
-Axum gateway (demo: src/gateway.rs)
+Axum gateway (examples/browser/src/gateway.rs)
     │  ClientInput channel
     ▼
 Media worker (library: runtime.rs)
@@ -41,7 +41,7 @@ VoiceEvent bus (events.rs)
 Playback bridge (library: runtime.rs → ServerMessage channel)
     │  speech_started JSON → binary chunks → speech_done JSON
     ▼
-Axum gateway (demo: src/gateway.rs → WebSocket)
+Axum gateway (examples/browser/src/gateway.rs → WebSocket)
     ▼
 Browser playback (24 kHz) → duck/resume/abort control + ACK
 ```
@@ -151,7 +151,7 @@ stale / failure / superseded by the next turn
 | Later clauses not played | Earlier clauses + `[voice-live:rest-undelivered]` |
 | Not delivered at all (TTS failure, claim rejection, etc.) | `[voice-live:undelivered]` |
 
-The markers are fixed tokens for the model, not phrases in any conversation language, and are never spoken. Agent instructions explain them (the demo task spec does). Even if the claim gate rejects the entire reply, it is reconciled to `[voice-live:undelivered]`. An unverified success claim must not remain in memory as though it had been delivered to the user.
+The markers are fixed tokens for the model, not phrases in any conversation language, and are never spoken. Agent instructions explain them (the example task spec does). Even if the claim gate rejects the entire reply, it is reconciled to `[voice-live:undelivered]`. An unverified success claim must not remain in memory as though it had been delivered to the user.
 
 Partial hearing is an estimate. For a clause whose synthesis has finished, it uses the played-to-synthesized sample ratio; for one still being synthesized, it uses a **conservative speaking time per character**. If playback catches up with streaming synthesis, a simple ratio would say “fully heard,” precisely the error this safeguard is meant to prevent: recording words the user did not hear as heard.
 
@@ -297,7 +297,7 @@ Both features are disabled by default in config, and their behavior is regressio
 
 `RuntimeAgent` holds conversation memory and serializes root turns per runtime. Therefore, **create a new brain for each session** (`BrainProvider`). Sharing one would mix transcripts from different clients and cause concurrent sessions to block each other.
 
-Only the tool backend (`ReservationStore`) is shared, as it models an external system. Text injection queues are also isolated per session.
+Only the host's tools, and the backend behind them, are shared, as they model an external system; the library ships no business tools. Text injection queues are also isolated per session.
 
 ## Failure recovery
 
