@@ -44,9 +44,8 @@ impl InvocationProof {
     }
 }
 
-/// How a named business outcome is checked against the turn's executed tool
-/// records. The words spoken come from the model; this rule decides whether the
-/// outcome it names actually happened.
+/// How a named business outcome is checked against the turn's executed tool records.
+/// The words spoken come from the model; this rule decides whether the outcome it names actually happened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutcomeRule {
@@ -58,9 +57,8 @@ pub struct OutcomeRule {
     pub argument_defaults: BTreeMap<String, Value>,
 }
 
-/// A strict task-agent Final: the reply text, an optional outcome name, and
-/// an optional answer-type hint for the last clause. A Final that is not a
-/// JSON object is read as reply text with no outcome.
+/// A strict task-agent Final: the reply text, an optional outcome name, and an optional answer-type hint for the last clause.
+/// A Final that is not a JSON object is read as reply text with no outcome.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Proposal {
@@ -97,8 +95,7 @@ pub struct RenderedReply {
 }
 
 /// Trusted host boundary between a task-agent Final and speech, without I/O.
-/// Reply text is model-generated; an implementation must not let a reply claim
-/// a business outcome that the turn's executed tool records do not confirm.
+/// Reply text is model-generated; an implementation must not let a reply claim a business outcome that the turn's executed tool records do not confirm.
 pub trait SpeechRenderer: Send + Sync {
     fn render(&self, proposal: &str, proofs: &[InvocationProof]) -> anyhow::Result<RenderedReply>;
 }
@@ -150,8 +147,7 @@ impl ConfiguredRenderer {
         })
     }
 
-    /// Every record of the rule's operation in this turn must be usable and
-    /// confirm the receipt and its targets; one failed attempt rejects the claim.
+    /// Every record of the rule's operation in this turn must be usable and confirm the receipt and its targets; one failed attempt rejects the claim.
     fn confirm(
         &self,
         rule: &OutcomeRule,

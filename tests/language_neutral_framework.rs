@@ -49,8 +49,7 @@ async fn published_framework_proof_origin_and_rendered_memory_keep_original_fina
     proof_origin_and_rendered_memory(false).await;
 }
 
-/// With SDK tool events on (as in the demo spec), a bound tool still reports
-/// exactly one start and one completion, and the completion carries the output.
+/// With SDK tool events on (as in the demo spec), a bound tool still reports exactly one start and one completion, and the completion carries the output.
 #[tokio::test]
 async fn bound_tool_events_are_not_duplicated_when_sdk_tool_events_are_on() {
     proof_origin_and_rendered_memory(true).await;
@@ -263,8 +262,7 @@ impl voice_live::tts::StreamingTts for RecordingTts {
     }
 }
 
-/// One committed user turn through a real framework agent with a scripted
-/// model and the offline `create` tool; returns what reached synthesis.
+/// One committed user turn through a real framework agent with a scripted model and the offline `create` tool; returns what reached synthesis.
 async fn spoken_through_framework(model_replies: Vec<String>) -> Vec<String> {
     let config = voice_live::VoiceRuntimeConfig::from_yaml_str(
         r#"

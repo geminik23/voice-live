@@ -88,8 +88,7 @@ impl PlaybackSink for ClientPlaybackSink {
     async fn command(&self, command: PlaybackCommand) {
         if let Some(shutdown) = &self.shutdown {
             if self.tx.try_send(command).is_err() {
-                // A closing session stops the bridge first; its last commands
-                // failing is part of the shutdown, not an overload.
+                // A closing session stops the bridge first; its last commands failing is part of the shutdown, not an overload.
                 if shutdown.is_cancelled() {
                     tracing::debug!("playback command dropped during session shutdown");
                 } else {

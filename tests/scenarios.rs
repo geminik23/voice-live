@@ -773,8 +773,7 @@ expect:
   - type: turn_resolved
     resolution: audible
     heard_contains: "확인했습니다."
-  # The cut is recorded (mid-clause or before the second clause, depending on
-  # how far playback got), and the unheard end of the second clause is gone.
+  # The cut is recorded (mid-clause or before the second clause, depending on how far playback got), and the unheard end of the second clause is gone.
   - type: turn_resolved
     resolution: audible
     heard_contains: "[voice-live:"
@@ -803,8 +802,7 @@ timeline:
     event:
       type: local_speech_ended
 expect:
-  # Every clause played in full; the bounded history must not turn the early
-  # ones into undelivered markers.
+  # Every clause played in full; the bounded history must not turn the early ones into undelivered markers.
   - type: turn_resolved
     resolution: audible
     heard_equals_final: true

@@ -1,12 +1,10 @@
 use crate::config::VadConfig;
 
-/// Frames this quiet are digital silence (a muted or gated input), not room
-/// noise, and must not pull the noise floor down.
+/// Frames this quiet are digital silence (a muted or gated input), not room noise, and must not pull the noise floor down.
 const DIGITAL_SILENCE_RMS: f32 = 2.0;
 
-/// While speech is on, the quietest frame of each window this long is checked
-/// against the offset threshold. Real speech has quiet gaps; a window with none
-/// means the noise level rose, so the floor is raised to it.
+/// While speech is on, the quietest frame of each window this long is checked against the offset threshold.
+/// Real speech has quiet gaps; a window with none means the noise level rose, so the floor is raised to it.
 const FLOOR_RECHECK_US: u64 = 1_000_000;
 
 /// Server-side energy VAD with adaptive noise floor and hysteresis. It drives
@@ -185,8 +183,7 @@ mod tests {
 
     #[test]
     fn muted_input_does_not_turn_room_noise_into_speech() {
-        // A muted microphone sends exact zeros; unmuting brings back ordinary
-        // room noise, which must not latch speech on.
+        // A muted microphone sends exact zeros; unmuting brings back ordinary room noise, which must not latch speech on.
         let mut vad = vad();
         let mut now = 0;
         run(&mut vad, 250, 0, &mut now);
@@ -196,8 +193,7 @@ mod tests {
 
     #[test]
     fn speech_does_not_stay_on_when_the_noise_level_rises() {
-        // Near-silent input (for example a noise suppressor's output) pulls
-        // the floor down; a later steady room noise must not hold speech on.
+        // Near-silent input (for example a noise suppressor's output) pulls the floor down; a later steady room noise must not hold speech on.
         let mut vad = vad();
         let mut now = 0;
         run(&mut vad, 250, 3, &mut now);

@@ -167,8 +167,7 @@ fn strict_renderer_checks_outcome_against_executed_records_without_model_ids() {
     ] {
         assert!(renderer.render(raw, &[proof()]).is_err(), "{raw}");
     }
-    // Reply text in any language passes through as general speech: it names
-    // no outcome, so it carries no business evidence.
+    // Reply text in any language passes through as general speech: it names no outcome, so it carries no business evidence.
     for raw in [
         "Pick a date.",
         "날짜를 알려 주세요.",
@@ -443,8 +442,7 @@ async fn generated_reply_text_is_spoken_and_keeps_original_final_identity() {
 async fn unconfirmed_write_replaces_any_reply_with_failure_text() {
     let mut failed = proof();
     failed.success = false;
-    // The reply claims success in plain words and names no outcome; the failed
-    // write in the same turn keeps it from being spoken.
+    // The reply claims success in plain words and names no outcome; the failed write in the same turn keeps it from being spoken.
     let (texts, resolutions) = exercise_with(
         config_with_failure_text(),
         "Your booking is confirmed.",
@@ -474,8 +472,8 @@ async fn unconfirmed_write_replaces_any_reply_with_failure_text() {
 
 #[tokio::test(start_paused = true)]
 async fn a_call_to_an_unregistered_tool_does_not_count_as_a_write() {
-    // The model asked for a tool that does not exist. The framework reports a
-    // failed result, but nothing ran, so nothing can have been written.
+    // The model asked for a tool that does not exist.
+    // The framework reports a failed result, but nothing ran, so nothing can have been written.
     let unknown = CognitiveEvent::ToolCompleted {
         tool: "search_reservation_availability".into(),
         success: false,

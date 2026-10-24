@@ -144,6 +144,10 @@ pub struct AsrConfig {
     pub chunk_ms: u64,
     #[serde(default)]
     pub manual_commit: bool,
+    /// With `manual_commit`, how long audio keeps flowing after local speech ends before the commit is sent.
+    /// A recognizer asked to finalize too soon after a short word can return an empty transcript; speech that resumes inside this window stays in the same utterance.
+    #[serde(default = "default_asr_commit_delay_ms")]
+    pub commit_delay_ms: u64,
     #[serde(default = "default_asr_locale")]
     pub locale: String,
     /// Deadline for one provider connect/auth/ready attempt.
@@ -197,6 +201,10 @@ fn default_asr_endpoint() -> String {
 
 fn default_asr_api_key_env() -> String {
     "TOGETHER_API_KEY".into()
+}
+
+fn default_asr_commit_delay_ms() -> u64 {
+    300
 }
 
 fn default_chunk_ms() -> u64 {
@@ -671,8 +679,7 @@ impl Default for SpeculativeConfig {
     }
 }
 
-/// Unknown keys are rejected so removed or renamed keys (`mode`,
-/// `responses`, `mock_response`) fail at load instead of being ignored.
+/// Unknown keys are rejected so removed or renamed keys (`mode`, `responses`, `mock_response`) fail at load instead of being ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeechConfig {
@@ -684,8 +691,8 @@ pub struct SpeechConfig {
     pub backchannel_text: String,
     #[serde(default)]
     pub failure_text: String,
-    /// Business outcomes a strict reply may name, checked against the turn's
-    /// executed tool records. The spoken words come from the model.
+    /// Business outcomes a strict reply may name, checked against the turn's executed tool records.
+    /// The spoken words come from the model.
     #[serde(default)]
     pub outcomes: std::collections::BTreeMap<String, crate::speech::render::OutcomeRule>,
     /// Reply text emitted by the keyless mock task agent.

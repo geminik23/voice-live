@@ -540,6 +540,25 @@ async fn pace(
     }
 }
 
+/// Sends one audio message at real-time pace.
+async fn write_chunk(
+    sink: &mut Sink,
+    pongs: &mut mpsc::Receiver<bytes::Bytes>,
+    next_audio: &mut Instant,
+    chunk: &[i16],
+    timeout: Duration,
+) -> Result<(), AsrEvent> {
+    pace(sink, pongs, *next_audio, timeout).await?;
+    let duration = Duration::from_secs_f64(chunk.len() as f64 / 16_000.0);
+    if Instant::now().saturating_duration_since(*next_audio) >= duration {
+        *next_audio = Instant::now();
+    }
+    let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+    send(sink, Message::Binary(bytes.into()), timeout).await?;
+    *next_audio += duration;
+    Ok(())
+}
+
 async fn write_audio(
     sink: &mut Sink,
     mut commands: mpsc::Receiver<Command>,
@@ -551,30 +570,57 @@ async fn write_audio(
     let mut next_audio = Instant::now();
     let mut marker = 0u64;
     let mut finished = false;
+    // Frames arrive in 20 ms pieces; Ink Whisper returned an empty transcript for a short word sent that way and the right one for the same audio in 100 ms messages.
+    // Audio is therefore sent in `chunk_samples` messages, and held frames keep their budget permits until they are sent.
+    // A partial message is sent once it has waited one chunk duration, so audio is never held longer than that.
+    let mut pending: Vec<i16> = Vec::with_capacity(settings.chunk_samples);
+    let mut held: Vec<(OwnedSemaphorePermit, OwnedSemaphorePermit)> = Vec::new();
+    let mut pending_since: Option<Instant> = None;
+    let chunk_duration = Duration::from_secs_f64(settings.chunk_samples as f64 / 16_000.0);
     loop {
         tokio::select! {
             pong = pongs.recv(), if !pongs.is_closed() => {
                 if let Some(pong) = pong { send(sink, Message::Pong(pong), settings.write_timeout).await?; }
             },
+            _ = tokio::time::sleep_until(pending_since.unwrap_or_else(Instant::now) + chunk_duration), if pending_since.is_some() => {
+                write_chunk(sink, &mut pongs, &mut next_audio, &pending, settings.write_timeout).await?;
+                pending.clear();
+                held.clear();
+                pending_since = None;
+            },
             command = commands.recv(), if !finished => match command {
                 Some(Command::Audio { pcm, _samples, _slot }) => {
-                    for chunk in pcm.chunks(settings.chunk_samples) {
-                        pace(sink, &mut pongs, next_audio, settings.write_timeout).await?;
-                        let duration = Duration::from_secs_f64(chunk.len() as f64 / 16_000.0);
-                        if Instant::now().saturating_duration_since(next_audio) >= duration { next_audio = Instant::now(); }
-                        let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
-                        send(sink, Message::Binary(bytes.into()), settings.write_timeout).await?;
-                        next_audio += duration;
+                    if pending.is_empty() { pending_since = Some(Instant::now()); }
+                    pending.extend_from_slice(&pcm);
+                    held.push((_samples, _slot));
+                    let mut sent = false;
+                    while pending.len() >= settings.chunk_samples {
+                        let chunk: Vec<i16> = pending.drain(..settings.chunk_samples).collect();
+                        write_chunk(sink, &mut pongs, &mut next_audio, &chunk, settings.write_timeout).await?;
+                        sent = true;
                     }
-                    drop((_samples, _slot));
+                    if pending.is_empty() { held.clear(); pending_since = None; } else if sent { pending_since = Some(Instant::now()); }
                 }
                 Some(Command::Commit(slot)) => {
+                    // The finalize must follow all of its audio.
+                    if !pending.is_empty() {
+                        write_chunk(sink, &mut pongs, &mut next_audio, &pending, settings.write_timeout).await?;
+                        pending.clear();
+                    }
+                    held.clear();
+                    pending_since = None;
                     marker = marker.checked_add(1).ok_or_else(|| error(false, "Cartesia ASR marker overflow"))?;
                     coordinator.register(marker, settings.write_timeout, slot);
                     send(sink, Message::Text("finalize".into()), settings.write_timeout).await?;
                     coordinator.sent(marker, settings.finalize_timeout);
                 }
                 None => {
+                    if !pending.is_empty() {
+                        write_chunk(sink, &mut pongs, &mut next_audio, &pending, settings.write_timeout).await?;
+                        pending.clear();
+                    }
+                    held.clear();
+                    pending_since = None;
                     let mut changes = coordinator.deadline.subscribe();
                     while !coordinator.pending.lock().is_empty() {
                         tokio::select! {

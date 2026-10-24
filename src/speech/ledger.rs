@@ -89,9 +89,8 @@ pub struct AudibleLedger {
     /// Speeches whose synthesis has finished, so `enqueued_samples` is their
     /// true length rather than a lower bound.
     synthesis_done: HashSet<SpeechId>,
-    /// Reply clauses whose turn has not been resolved yet, with their settled
-    /// result once known. Kept outside the bounded history so a reply longer
-    /// than the history still resolves with what was actually heard.
+    /// Reply clauses whose turn has not been resolved yet, with their settled result once known.
+    /// Kept outside the bounded history so a reply longer than the history still resolves with what was actually heard.
     held: HashMap<SpeechId, Option<Heard>>,
 }
 
@@ -114,8 +113,7 @@ impl AudibleLedger {
         }
     }
 
-    /// Keeps this speech's settled result until [`AudibleLedger::release`],
-    /// even after it leaves the bounded history.
+    /// Keeps this speech's settled result until [`AudibleLedger::release`], even after it leaves the bounded history.
     pub fn hold(&mut self, speech_id: SpeechId) {
         self.held.entry(speech_id).or_insert(None);
     }
@@ -330,8 +328,8 @@ fn heard_prefix(text: &str, heard: Heard) -> String {
     }
 }
 
-// Memory annotations for the model, never spoken. They are fixed tokens rather
-// than phrases in any one language; agent instructions explain them.
+// Memory annotations for the model, never spoken.
+// They are fixed tokens rather than phrases in any one language; agent instructions explain them.
 
 /// Marker appended where the user cut the assistant off mid-clause.
 pub const MARKER_INTERRUPTED: &str = "… [voice-live:interrupted]";

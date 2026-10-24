@@ -128,8 +128,7 @@ impl VoiceRuntime {
     }
 
     pub async fn build_from_arc(config: Arc<VoiceRuntimeConfig>) -> anyhow::Result<Arc<Self>> {
-        // Built-in network providers get the configured language verbatim;
-        // there is no default language to fall back on.
+        // Built-in network providers get the configured language verbatim; there is no default language to fall back on.
         if matches!(config.asr.provider.as_str(), "together" | "cartesia") {
             anyhow::ensure!(
                 !config.asr.locale.trim().is_empty(),
@@ -852,6 +851,10 @@ struct MediaState {
     vad: EnergyVad,
     channels: u16,
     manual_commit: bool,
+    /// Samples at the ASR rate to keep sending after speech ends before a manual commit.
+    commit_delay_samples: usize,
+    /// A manual commit waiting for its trailing audio: the connection generation it belongs to and the samples still to send.
+    pending_commit: Option<(u64, usize)>,
     identity: AsrIdentity,
 }
 
@@ -1104,6 +1107,10 @@ async fn run_media_worker(args: MediaWorkerArgs) {
         vad: EnergyVad::new(config.vad.clone()),
         channels: 1,
         manual_commit: config.asr.manual_commit,
+        commit_delay_samples: (config.asr.commit_delay_ms
+            * u64::from(config.audio.input_sample_rate_hz)
+            / 1_000) as usize,
+        pending_commit: None,
         identity: AsrIdentity::default(),
     };
     let mut link = AsrLink::new();
@@ -1456,8 +1463,39 @@ async fn handle_connection_loss(
     }
 
     state.identity.reset_generation();
+    state.pending_commit = None;
     link.drop_connection().await;
     true
+}
+
+/// Whether the manual commit is due after `pushed` more samples were admitted.
+/// Speech ending starts the countdown; a commit never crosses into another connection generation.
+fn commit_due(state: &mut MediaState, speech_ended: bool, generation: u64, pushed: usize) -> bool {
+    if !state.manual_commit {
+        return false;
+    }
+    if speech_ended {
+        if state.commit_delay_samples == 0 {
+            return true;
+        }
+        state.pending_commit = Some((generation, state.commit_delay_samples));
+        return false;
+    }
+    match state.pending_commit {
+        Some((pending, _)) if pending != generation => {
+            state.pending_commit = None;
+            false
+        }
+        Some((_, left)) if left <= pushed => {
+            state.pending_commit = None;
+            true
+        }
+        Some((pending, left)) => {
+            state.pending_commit = Some((pending, left - pushed));
+            false
+        }
+        None => false,
+    }
 }
 
 /// Outcome of admitting one audio frame to the provider connection.
@@ -1539,6 +1577,10 @@ async fn handle_audio_frame(
     // never waits on the network.
     let transition = state.vad.process(&resampled, now_us);
     let speech_ended = matches!(transition, crate::vad::VadTransition::SpeechEnded { .. });
+    if matches!(transition, crate::vad::VadTransition::SpeechStarted { .. }) {
+        // Speech resumed before the trailing audio ran out: it is the same utterance.
+        state.pending_commit = None;
+    }
 
     let event = match transition {
         crate::vad::VadTransition::SpeechStarted { probability } => {
@@ -1577,11 +1619,12 @@ async fn handle_audio_frame(
             true
         };
     }
+    let pushed = resampled.len();
     let outcome = match &mut link.state {
         AsrLinkState::Ready(connection) => {
             match connection.input.try_push_audio(resampled) {
                 Ok(AsrAudioPush::Accepted) => {
-                    if speech_ended && state.manual_commit {
+                    if commit_due(state, speech_ended, link.generation, pushed) {
                         // The commit follows its audio in the same generation;
                         // a failed audio admission never commits onto a fresh
                         // connection.
@@ -1603,7 +1646,10 @@ async fn handle_audio_frame(
                 }
             }
         }
-        _ => AdmitOutcome::NoConnection,
+        _ => {
+            state.pending_commit = None;
+            AdmitOutcome::NoConnection
+        }
     };
 
     match outcome {

@@ -519,8 +519,7 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
 pub struct RuntimeSemanticBrain {
     provider: Arc<dyn LLMProvider>,
     system_prompt: String,
-    /// Set while requests keep failing, so a broken model or key is logged
-    /// once instead of on every utterance.
+    /// Set while requests keep failing, so a broken model or key is logged once instead of on every utterance.
     failing: std::sync::atomic::AtomicBool,
 }
 
@@ -584,6 +583,16 @@ impl InteractionBrain for RuntimeSemanticBrain {
             }
         };
         let assessment = crate::interaction::SemanticAssessment::parse(&response.content);
+        // Labels only, never the transcript: enough to see why a turn was committed, resumed, or discarded.
+        if let Some(value) = &assessment {
+            tracing::debug!(
+                state = ?value.state,
+                complete = ?value.complete,
+                stop = value.stop,
+                confidence = value.confidence,
+                "semantic assessment"
+            );
+        }
         self.report(
             assessment
                 .is_none()

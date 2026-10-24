@@ -54,8 +54,7 @@ impl ExecutionKey {
 pub struct VoiceAgentHooks {
     origins: Mutex<HashMap<String, Origin>>,
     calls: Mutex<HashMap<ExecutionKey, Option<String>>>,
-    /// Tool IDs wrapped by ind_tool; their start and completion come from
-    /// these hooks, so the stream's copies of those events are duplicates.
+    /// Tool IDs wrapped by `bind_tool`; their start and completion come from these hooks, so the stream's copies of those events are duplicates.
     bound: Mutex<HashSet<String>>,
 }
 impl VoiceAgentHooks {
@@ -99,7 +98,7 @@ impl VoiceAgentHooks {
         })
     }
 
-    /// Whether ind_tool wrapped this tool ID.
+    /// Whether `bind_tool` wrapped this tool ID.
     pub fn is_bound(&self, tool: &str) -> bool {
         self.bound.lock().contains(tool)
     }

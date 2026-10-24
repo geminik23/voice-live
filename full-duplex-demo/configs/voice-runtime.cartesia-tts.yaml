@@ -35,15 +35,14 @@ turn_control:
   slot_fallback: neutral
 
 speech:
-  # Reply of the keyless mock task agent. This and the other spoken texts
-  # below are in the sample's session language (tts.language); the task agent
-  # writes its own replies in that language.
+  # Reply of the keyless mock task agent.
+  # This and the other spoken texts below are in the sample's session language (tts.language); the task agent writes its own replies in that language.
   mock_reply: "예약할 날짜와 시간, 인원을 알려 주세요."
   hard_stop_ack_text: "네, 멈췄어요."
   backchannel_text: "네"
   failure_text: "죄송합니다. 응답을 준비하지 못했어요. 다시 말씀해 주세요."
-  # Outcomes a reply may name. The model writes the words; the runtime checks
-  # the named outcome against the tools executed in that turn.
+  # Outcomes a reply may name.
+  # The model writes the words; the runtime checks the named outcome against the tools executed in that turn.
   outcomes:
     availability_checked:
       operation: search_availability

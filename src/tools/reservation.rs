@@ -101,8 +101,7 @@ impl Tool for SearchAvailabilityTool {
     }
 
     fn input_schema(&self) -> Value {
-        // Without the list, models invent placeholder areas ("", "general")
-        // that match nothing and then report that nothing is available.
+        // Without the list, models invent placeholder areas ("", "general") that match nothing and then report that nothing is available.
         let mut areas: Vec<String> = Vec::new();
         for restaurant in &self.store.lock().restaurants {
             if !areas.contains(&restaurant.area) {
@@ -128,8 +127,7 @@ impl Tool for SearchAvailabilityTool {
     }
 
     async fn execute(&self, args: Value, _ctx: ToolExecutionContext) -> ToolResult {
-        // Models often send an empty area when the user named none; that
-        // means "any area", not an area called "".
+        // Models often send an empty area when the user named none; that means "any area", not an area called "".
         let area = args
             .get("area")
             .and_then(Value::as_str)

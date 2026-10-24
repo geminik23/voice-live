@@ -46,6 +46,7 @@ system_prompt: |
   - Set "outcome" only when the reply reports a tool result from this turn:
     "availability_checked" after search_availability succeeded, or
     "reserved" after reserve_restaurant committed. Otherwise use null.
+  - When you repeat or summarize a result from an earlier turn without calling the tool again, use null.
   - Set "question" when the reply ends with a question, to its expected answer.
   The runtime checks a named outcome against the tools actually executed in
   this turn. If they do not confirm it, or a reservation tool failed in this
@@ -107,10 +108,8 @@ memory:
   type: in-memory
   max_messages: 40
 
-# `timing: parallel` judges a transition beside the reply instead of after it,
-# so a turn without a transition costs one model call, not a reply plus a
-# judgement plus a regenerated reply. The judge sees only the current user
-# message and the runtime context, not the conversation history.
+# `timing: parallel` judges a transition beside the reply instead of after it, so a turn without a transition costs one model call, not a reply plus a judgement plus a regenerated reply.
+# The judge sees only the current user message and the runtime context, not the conversation history.
 states:
   initial: collecting
 
@@ -165,8 +164,7 @@ states:
             The transactional tool returns a confirmed success.
 
     completed:
-      # The executing reply already reports the result; regenerating it here
-      # only adds a model call.
+      # The executing reply already reports the result; regenerating it here only adds a model call.
       regenerate_on_enter: false
       prompt: |
         Report the verified result and any confirmation identifier.

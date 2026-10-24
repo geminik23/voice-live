@@ -817,7 +817,8 @@ async fn pcm_to_two_cartesia_providers_reaches_authorized_playback() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(40)).await;
-    for sequence in 0..30 {
+    // Enough trailing silence for the VAD offset plus the default commit delay.
+    for sequence in 0..50 {
         let sample = if sequence < 10 { 12000 } else { 0 };
         session
             .input_tx
@@ -1058,4 +1059,145 @@ async fn legacy_synthesize_owns_native_workers_until_drop() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// A recognizer asked to finalize right after a short word can return nothing, and a pause shorter than the commit delay is not the end of the utterance.
+/// The commit therefore waits for trailing audio, and speech that resumes inside that window stays one utterance with one finalize.
+#[tokio::test]
+async fn manual_commit_waits_for_trailing_audio_and_keeps_a_short_pause_in_one_utterance() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/stt/websocket", listener.local_addr().unwrap());
+    let asr_server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        // Silent samples received since the last message with speech in it, sampled at each finalize.
+        let mut silent_since_speech = 0usize;
+        let mut finalizes = Vec::new();
+        while let Some(Ok(message)) = socket.next().await {
+            match message {
+                tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                    let loud = bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .any(|pair| i16::from_le_bytes(*pair).unsigned_abs() > 1000);
+                    silent_since_speech = if loud {
+                        0
+                    } else {
+                        silent_since_speech + bytes.len() / 2
+                    };
+                }
+                tokio_tungstenite::tungstenite::Message::Text(text) if text == "finalize" => {
+                    finalizes.push(silent_since_speech);
+                    for value in [
+                        json!({"type":"transcript","request_id":"asr-connection","is_final":true,"text":"stop"}),
+                        json!({"type":"flush_done","request_id":"asr-connection"}),
+                    ] {
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                value.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+                tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        finalizes
+    });
+    let asr_config = voice_live::config::AsrConfig {
+        endpoint,
+        provider: "cartesia".into(),
+        model: "ink-whisper".into(),
+        manual_commit: true,
+        locale: "ko-KR".into(),
+        ..voice_live::config::AsrConfig::default()
+    };
+    let asr = voice_live::asr::cartesia::CartesiaStreamingAsr::with_api_key(
+        &asr_config,
+        "test-secret".into(),
+    )
+    .unwrap();
+    let runtime_config = VoiceRuntimeConfig::from_yaml_str(
+        "speech:
+  mock_reply: Ready.
+asr:
+  manual_commit: true
+  locale: ko-KR
+tts:
+  language: ko
+  voice: test-voice
+observability:
+  event_log: false",
+    )
+    .unwrap();
+    let runtime = VoiceRuntime::build_with_providers(
+        runtime_config,
+        SpeechProviders {
+            asr: Arc::new(asr),
+            tts: Arc::new(voice_live::tts::fake::FakeTts::new(24000, 60, 1)),
+        },
+    )
+    .await
+    .unwrap();
+    let (client_tx, mut client) = tokio::sync::mpsc::channel(256);
+    let session = runtime.create_session(client_tx).await.unwrap();
+    tokio::spawn(async move { while client.recv().await.is_some() {} });
+    session
+        .input_tx
+        .send(voice_live::ClientInput::Control(
+            voice_live::ClientControlMessage::SessionStart {
+                input_sample_rate: 16000,
+                channels: 1,
+            },
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Speech, a pause long enough to end local speech (15 frames > 12-frame VAD offset) but shorter than the 300 ms commit delay, speech again, then silence.
+    let pattern = [(10, 12000i16), (15, 0), (10, 12000), (45, 0)];
+    let mut sequence = 0;
+    for (frames, sample) in pattern {
+        for _ in 0..frames {
+            session
+                .input_tx
+                .send(voice_live::ClientInput::Audio(
+                    voice_live::media::AudioFrame {
+                        sequence,
+                        pcm: vec![sample; 320],
+                    },
+                ))
+                .await
+                .unwrap();
+            sequence += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session
+        .input_tx
+        .send(voice_live::ClientInput::Control(
+            voice_live::ClientControlMessage::SessionStop,
+        ))
+        .await
+        .unwrap();
+    drop(session);
+    drop(runtime);
+    let finalizes = tokio::time::timeout(Duration::from_secs(5), asr_server)
+        .await
+        .expect("recognizer closed")
+        .unwrap();
+    assert_eq!(
+        finalizes.len(),
+        1,
+        "one utterance, one finalize: {finalizes:?}"
+    );
+    // 12 offset frames end local speech and 15 more (300 ms) follow before the commit: 27 frames of 320 samples, less up to one 100 ms message that also held the end of the speech.
+    assert!(
+        finalizes[0] >= 27 * 320 - 1600,
+        "finalize after {} silent samples",
+        finalizes[0]
+    );
 }

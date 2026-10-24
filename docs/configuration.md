@@ -19,8 +19,8 @@ asr:
   endpoint: wss://api.together.ai/v1/realtime
   api_key_env: TOGETHER_API_KEY
   chunk_ms: 160
-  manual_commit: false     # when true, server VAD controls endpointing and
-                           # admits a FIFO provider commit after the frame's PCM
+  manual_commit: false     # when true, server VAD controls endpointing and admits a FIFO provider commit after trailing PCM
+  commit_delay_ms: 300     # with manual_commit, audio sent after local speech ends before the commit
   locale: ko-KR            # no default; required by the together and cartesia providers
   open_timeout_ms: 10000
   write_timeout_ms: 2000
@@ -160,6 +160,8 @@ Validate each real provider with its individual ignored contract only after cred
 
 ## Cartesia STT
 
+With `manual_commit: true`, the runtime does not commit the moment local speech ends. It keeps sending audio for `asr.commit_delay_ms` (default 300) and then commits. In a live check, Ink Whisper returned an empty transcript for a short Korean word when the finalize arrived 240 ms after the word ended, and the correct word at 340 ms or later. If speech resumes inside the window, it stays in the same utterance and gets one finalize instead of two. Set `0` to commit immediately. The delay does not hold the turn: turn commit still follows `turn_control`.
+
 Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together. Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, locale `ko-KR`, and `audio.input_sample_rate_hz: 16000`. The session selector is normalized to a primary language code, for example `fr-CA → fr`, `zh-Hant-TW → zh`, and `yue → yue`. There is no runtime language-membership allowlist. Unsupported model, rate, or automatic commit settings are still rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
 
 | Key | Default | Validation and use |
@@ -171,7 +173,7 @@ Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for Cartesia STT and 
 
 The factory validates its own settings and credentials; unused Cartesia settings do not reject a host-injected provider. Empty nested settings use serde defaults. Endpoints must omit userinfo and query parameters; the adapter owns the model/encoding/sample-rate/language query. WSS is required outside loopback. Authentication and successful WebSocket upgrade establish send-readiness; no application-level ready event is invented.
 
-PCM is binary mono signed little-endian PCM16. `asr.chunk_ms` bounds wire splitting and is capped at 100 ms; the adapter does not insert silent audio or drop supplied silence. It paces sends at approximately real time, rebasing after substantial lateness rather than replaying a large backlog as a burst. Input samples remain budgeted throughout writer ownership, conversion, and pacing. At most 64 command slots (or the smaller host limit) cover queued/writer-held audio and outstanding finalize markers. Pending markers retain their slots until acknowledgement. Finish is reserved independently of queue saturation. The event queue holds at most 16 transcript events, each limited by `max_transcript_bytes`; control and terminal storage are separate and bounded. WebSocket frames/messages are limited to 262144 bytes.
+PCM is binary mono signed little-endian PCM16. `asr.chunk_ms` sets the wire message size and is capped at 100 ms: the 20 ms frames the runtime receives are batched into messages of that size, a commit first sends whatever audio is still held, and a partial message is sent after waiting one chunk duration, so audio is never held longer than that. In a live check, Ink Whisper returned an empty transcript for a short Korean word sent as 20 ms messages and the right word for the same audio sent as 100 ms messages. The adapter does not insert silent audio or drop supplied silence. It paces sends at approximately real time, rebasing after substantial lateness rather than replaying a large backlog as a burst. Input samples remain budgeted throughout writer ownership, conversion, and pacing. At most 64 command slots (or the smaller host limit) cover queued/writer-held audio and outstanding finalize markers. Pending markers retain their slots until acknowledgement. Finish is reserved independently of queue saturation. The event queue holds at most 16 transcript events, each limited by `max_transcript_bytes`; control and terminal storage are separate and bounded. WebSocket frames/messages are limited to 262144 bytes.
 
 Confirmed transcript deltas append verbatim; mutable tails replace, never append. No delta trimming or inserted spaces occur inside the adapter. Full replacement Partial snapshots have connection-monotonic revisions, and one full confirmed Final is emitted per `flush_done`, including an empty boundary when necessary. `request_id` identifies the connection, not an utterance. Local utterance IDs advance only at boundaries; runtime remapping keeps identities monotonic across reconnects. Silence auto-finalization confirms prefix text without independently ending the runtime utterance. Already selected partial-based turns are not rewritten by a late Final.
 
@@ -224,6 +226,10 @@ At most 256 text rules are accepted, each 1–1024 bytes; regexes are checked ag
 When `agents.interaction.enabled` is true, a successfully configured semantic provider receives bounded current transcript, recent committed user turns, and confirmed heard assistant text. The runtime permits one request in flight and follows with the latest changed snapshot. A missing, failed, or timed-out provider yields neutral timing behavior rather than silently installing the Korean example heuristic. The first failure of a streak is logged as a warning (`semantic interpretation unavailable`) and recovery as info; timeouts are logged once and counted in `voice_semantic_timeout_total`. The shipped specs use `gpt-5.4-mini`. In a live check, hosted small models (`gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-4.1-mini`, `gpt-4o-mini`) took about 1.1–2 s per assessment, so the library default of 900 ms timed out on every turn and turns used neutral timing. The samples set `agents.interaction.timeout_ms: 1500`; an overlap without a semantic result now waits up to 3 s before the conservative abort. Choose the model and this timeout together. Explicit host `TextAnalyzer` or legacy decision-brain overrides select the compatibility path; an explicit host slot-extractor factory overrides model slot updates. In semantic mode the configured `slot_fallback` is not used, including when the model is unavailable. With interaction disabled, configured compatibility rules and `slot_fallback` retain their existing purpose.
 
 The interaction spec now describes semantic interpretation and must return `state`, optional `complete`, `stop`, `negated`, `intent`, `updates`, and `confidence`; the earlier `user_state`/`action` JSON is not accepted by this semantic path. The configured adapter calls the spec's default LLM provider directly with its plain system prompt and current snapshot, without retaining prior partials in agent memory. Agent state machines, tools, templated system prompts, and model routing in an old controller spec are not executed by this adapter. Update custom specs or explicitly supply a legacy `InteractionBrain` when retaining the old contract.
+
+While the assistant is speaking, a `backchannel` or `noise_or_echo` label discards the overlapping speech, so a wrong label silently drops the user's words. The shipped interaction spec therefore defines each overlap label and sets `temperature: 0` on its model. With the ai-agents default of 0.7, a live check labeled the same overlapping question as a backchannel in 2 of 3 runs before an interruption label won; with the definitions and temperature 0 it was an interruption in 5 of 5. Set `RUST_LOG=voice_live=debug` to log each label (never the transcript) and every discarded overlap.
+
+A `stop` label is matched to the user's words (the same candidate text, utterance, and connection generation), not to the assistant's playback state, so it still applies when the reply has moved to its next clause or ducked while the model was judging. Once a stop is applied, the stop words are consumed: they do not become a task turn, and later labels for the same words cannot cut off the stop acknowledgement. Words that combine a stop with a new request (for example "stop, and book the other one") are consumed too; the user has to repeat the request.
 
 Host composition uses `VoiceRuntime::build_with_policies(config, optional_providers, RuntimePolicies)` or the direct builder. `RuntimePolicies::interaction_brain` and `slot_extractor` are per-session factories; existing exhaustive struct literals must add the new field or use `..Default::default()`. `InteractionSnapshot` now includes `heard_assistant` and `recent_user_turns`, and `SemanticFrame` includes `negated`; exhaustive struct literals require migration. `VoiceSessionBuilder::try_build` reports invalid configuration; the compatible `build` convenience method panics on invalid configuration.
 
@@ -342,10 +348,7 @@ system_prompt: |
   {{ context.voice.brief }}
 ```
 
-`brief` contains `transcript_revision`, `idempotency_key`, `speech_language`
-(the configured `tts.language`; omitted when unset), `semantic_frame`, and any speculative/deep
-results. You can also use
-`{{ context.voice.idempotency_key }}` separately.
+`brief` contains `transcript_revision`, `idempotency_key`, `speech_language` (the configured `tts.language`; omitted when unset), `semantic_frame`, and any speculative/deep results. You can also use `{{ context.voice.idempotency_key }}` separately.
 
 Who guarantees what:
 

@@ -1896,18 +1896,12 @@ impl VoiceSession {
     }
 
     async fn apply_semantic_stop(&mut self, key: &SemanticKey) -> Result<()> {
+        // A stop request belongs to the user's words, not to the assistant's playback: it stays valid while the reply moves between clauses, ducks, or resumes.
+        // Only the same words from the same utterance and connection may still stop it.
         if !self.semantic_snapshot().is_some_and(|(current, _, _)| {
-            current == *key
-                || (key.vad_active
-                    && !current.vad_active
-                    && current.activity == key.activity.wrapping_add(1)
-                    && current.candidate == key.candidate
-                    && current.origin == key.origin
-                    && current.generation == key.generation
-                    && current.interaction_epoch == key.interaction_epoch
-                    && current.thought_epoch == key.thought_epoch
-                    && current.speech_epoch == key.speech_epoch
-                    && current.frame_revision == key.frame_revision)
+            current.candidate == key.candidate
+                && current.origin == key.origin
+                && current.generation == key.generation
         }) {
             return Ok(());
         }
@@ -1939,6 +1933,8 @@ impl VoiceSession {
             }
             self.abort_current_speech(InterruptionReason::HardStop)
                 .await?;
+            // The stop words are consumed: they do not become a task turn, and later labels for the same words cannot cut off the stop acknowledgement.
+            self.discard_semantic_backchannel(false).await?;
         }
         Ok(())
     }
@@ -2254,10 +2250,8 @@ impl VoiceSession {
 
     /// Applies slot updates with their provenance.
     ///
-    /// Candidate-derived work from an abandoned or closed generation is
-    /// discarded before it can touch the frame. Candidate writes journal the
-    /// authoritative baseline they overwrite, so a stream reset can restore
-    /// it; host-issued writes retire the journal entry instead.
+    /// Candidate-derived work from an abandoned or closed generation is discarded before it can touch the frame.
+    /// Candidate writes journal the authoritative baseline they overwrite, so a stream reset can restore it; host-issued writes retire the journal entry instead.
     async fn apply_slot_updates(
         &mut self,
         updates: Vec<SlotUpdate>,
@@ -2358,8 +2352,7 @@ impl VoiceSession {
         Ok(())
     }
 
-    /// Closes the candidates of one utterance: its writes become
-    /// authoritative, and later resets never roll them back.
+    /// Closes the candidates of one utterance: its writes become authoritative, and later resets never roll them back.
     fn close_candidates_for(&mut self, source_utterance_id: u64, source: AsrSource) {
         if source == AsrSource::Injection {
             self.slot_journal.retain(|_, entry| {
@@ -3157,9 +3150,8 @@ impl VoiceSession {
         }
     }
 
-    /// Drops progress lines still queued for a task that has ended. Their
-    /// tool-started evidence can outlive the task, so the claim gate alone
-    /// would still admit them after the reply or failure text.
+    /// Drops progress lines still queued for a task that has ended.
+    /// Their tool-started evidence can outlive the task, so the claim gate alone would still admit them after the reply or failure text.
     fn retire_task_progress(&mut self, task_id: TaskId) {
         let started = format!("tool_started:{task_id}:");
         self.pending_speech
@@ -3174,8 +3166,7 @@ impl VoiceSession {
         let rendered = if conflict {
             Err(anyhow::anyhow!("conflicting invocation records"))
         } else if self.write_unconfirmed(task_id, &proofs) {
-            // The reply may still say the write succeeded, in any language;
-            // nothing in the turn can check it, so none of it is spoken.
+            // The reply may still say the write succeeded, in any language; nothing in the turn can check it, so none of it is spoken.
             Err(anyhow::anyhow!("unconfirmed write in this turn"))
         } else {
             self.speech_renderer.render(&original, &proofs)
@@ -3260,20 +3251,16 @@ impl VoiceSession {
         );
         self.state.task = crate::interaction::TaskState::Completed;
         if rejected {
-            // The turn keeps its tool history and records the reply as
-            // undelivered; the user hears the configured failure text instead
-            // of silence.
+            // The turn keeps its tool history and records the reply as undelivered; the user hears the configured failure text instead of silence.
             self.metrics.inc("voice_claim_rejected_total");
             self.speak_failure_text().await?;
         }
         Ok(())
     }
 
-    /// A tool declared as a write, or an undeclared tool that actually ran,
-    /// may have written. If any such call in this turn failed, was never
-    /// completed, or left an unusable record, the reply cannot be checked
-    /// against what actually happened. A call to a tool that never ran (for
-    /// example a name the model made up) cannot have written anything.
+    /// A tool declared as a write, or an undeclared tool that actually ran, may have written.
+    /// If any such call in this turn failed, was never completed, or left an unusable record, the reply cannot be checked against what actually happened.
+    /// A call to a tool that never ran (for example a name the model made up) cannot have written anything.
     fn write_unconfirmed(
         &self,
         task_id: TaskId,
@@ -3867,7 +3854,8 @@ impl VoiceSession {
                 return Ok(false);
             }
             match assessment.as_ref().map(|value| value.state) {
-                Some(UserSpeechState::Backchannel | UserSpeechState::NoiseOrEcho) => {
+                Some(state @ (UserSpeechState::Backchannel | UserSpeechState::NoiseOrEcho)) => {
+                    tracing::debug!(?state, playing, "overlapping speech discarded");
                     self.discard_semantic_backchannel(playing).await?;
                     return Ok(false);
                 }
@@ -4634,12 +4622,10 @@ fn split_clauses(text: &str) -> Vec<String> {
     clauses
 }
 
-/// Renders the turn environment that reaches the model through the system
-/// prompt rather than the user message.
+/// Renders the turn environment that reaches the model through the system prompt rather than the user message.
 ///
-/// None of this is conversation: it describes the state the turn runs in, and
-/// is replaced on every turn. What the user heard is not here at all; it lives
-/// in the agent's memory, where resolved turns hold only audible text.
+/// None of this is conversation: it describes the state the turn runs in, and is replaced on every turn.
+/// What the user heard is not here at all; it lives in the agent's memory, where resolved turns hold only audible text.
 fn render_turn_context(
     turn_id: TurnId,
     revision: Revision,
@@ -4654,9 +4640,8 @@ fn render_turn_context(
     let dependencies: Vec<String> = semantic_frame.slots.keys().cloned().collect();
     let fingerprint = semantic_frame.dependency_fingerprint(&dependencies);
 
-    // The synthesis language is configuration, and the reply must be in it to
-    // be pronounced correctly. The runtime does not detect languages; with no
-    // configured language the line is omitted rather than defaulted.
+    // The synthesis language is configuration, and the reply must be in it to be pronounced correctly.
+    // The runtime does not detect languages; with no configured language the line is omitted rather than defaulted.
     let mut brief = format!(
         "transcript_revision: {revision}\n\
          idempotency_key: {idempotency_key}\n"
@@ -5975,6 +5960,49 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn semantic_stop_survives_assistant_playback_changes_while_it_is_judged() {
+        let (mut session, _, sink) = harness();
+        session.semantic_mode = true;
+        let mut stop = assessment(UserSpeechState::Interruption, Some(true));
+        stop.stop = true;
+        session.interaction_brain = semantic_brain(vec![stop]);
+        track(&mut session, true, None);
+        session
+            .handle_event(VoiceEvent::LocalSpeechStarted {
+                meta: session.new_meta(),
+                vad_probability: 1.0,
+            })
+            .await
+            .unwrap();
+        session
+            .handle_event(VoiceEvent::AsrPartial {
+                meta: session.new_meta(),
+                utterance_id: 0,
+                revision: Revision(1),
+                hypothesis: "stop".into(),
+            })
+            .await
+            .unwrap();
+        session.maybe_spawn_semantic();
+        let key = session.semantic_stop_rx.recv().await.unwrap();
+        // While the model judged the words, the reply moved to its next clause and the floor changed.
+        session.state.speech = SpeechState::Synthesizing;
+        session.state.epochs.interaction += 1;
+        session.apply_semantic_stop(&key).await.unwrap();
+        assert!(sink.0.lock().iter().any(|command| matches!(
+            command,
+            PlaybackCommand::Abort {
+                reason: InterruptionReason::HardStop,
+                ..
+            }
+        )));
+        // The stop words are consumed rather than committed as a turn.
+        assert!(session.transcript.current_text().is_empty());
+        assert!(session.turn_buffer.is_empty());
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn semantic_stop_does_not_wait_for_host_extractor() {
         let (mut session, _, sink) = harness();
         session.semantic_mode = true;
@@ -6035,13 +6063,14 @@ mod tests {
             })
             .await
             .unwrap();
+        // The first stop consumes the words, so the repeat arrives with the same key.
+        let (key, _, utterance_id) = session.semantic_snapshot().unwrap();
         for _ in 0..2 {
-            let (key, _, utterance_id) = session.semantic_snapshot().unwrap();
             let mut stop = assessment(UserSpeechState::Interruption, Some(true));
             stop.stop = true;
             session
                 .apply_semantic_result(SemanticResult {
-                    key,
+                    key: key.clone(),
                     revision: Revision(1),
                     utterance_id,
                     assessment: Some(stop),

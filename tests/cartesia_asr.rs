@@ -220,6 +220,43 @@ async fn english_session_locale_is_sent_on_wire_without_changing_defaults() {
     cleanup(session, worker).await;
 }
 
+/// Ink Whisper returned an empty transcript for a short word sent as 20 ms messages and the right word for the same audio in 100 ms messages.
+/// Frames are therefore batched to `chunk_ms`, and a commit first sends whatever audio is still held.
+#[tokio::test]
+async fn frames_are_sent_as_chunk_sized_messages_and_flushed_before_finalize() {
+    let (config, worker) = server(|mut socket| async move {
+        assert!(
+            matches!(receive(&mut socket).await, Message::Binary(bytes) if bytes.len() == 1600 * 2)
+        );
+        assert!(
+            matches!(receive(&mut socket).await, Message::Binary(bytes) if bytes.len() == 640 * 2)
+        );
+        assert_eq!(receive(&mut socket).await, Message::Text("finalize".into()));
+        json_send(&mut socket, ack()).await;
+        assert_eq!(receive(&mut socket).await, Message::Text("close".into()));
+        json_send(&mut socket, done()).await;
+        wait_close(&mut socket).await;
+    })
+    .await;
+    let mut session = open(&config, limits(16000, 64)).await;
+    for _ in 0..7 {
+        session.input.push_audio(vec![0; 320]).await.unwrap();
+    }
+    session.input.commit_utterance().await.unwrap();
+    assert!(matches!(
+        next(&mut session).await,
+        Some(AsrEvent::Final { .. })
+    ));
+    session.input.finish_input().unwrap();
+    drop(session.input);
+    assert!(session.events.next_event().await.unwrap().is_none());
+    session.control.close().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn delta_accumulation_preserves_bytes_and_monotonic_identity() {
     let (config, worker) = server(|mut socket| async move {
