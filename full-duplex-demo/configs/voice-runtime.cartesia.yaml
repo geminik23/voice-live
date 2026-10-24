@@ -18,6 +18,8 @@ asr:
   manual_commit: true
   # Ink Whisper returned an empty transcript for a short word finalized 240 ms after it ended; 300 ms of extra audio keeps it.
   commit_delay_ms: 300
+  # After a long silence Ink Whisper split the next utterance and returned nothing for its end; a commit every 2 s of silence prevents it.
+  idle_commit_ms: 2000
   locale: ko-KR
   open_timeout_ms: 10000
   write_timeout_ms: 2000

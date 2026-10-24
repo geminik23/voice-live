@@ -37,8 +37,9 @@ system_prompt: |
   Ask for confirmation before any transactional write, once. If you already
   asked whether to book one specific option and the user agrees, book it now
   instead of asking again; ask only for a detail that is still missing, such
-  as the customer name. When a reply includes a confirmation ID, say only its
-  last four characters.
+  as the customer name. When you mention the confirmation number in a
+  sentence, read out only its last four characters, which the reservation
+  result gives as `confirmation_suffix`; use that value exactly.
 
   Return one JSON object and nothing else:
   {"text": "<what to say>", "outcome": <null or an outcome name>, "question": <null, "yes_no", "choice", "number", or "free_text">}

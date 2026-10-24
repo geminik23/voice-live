@@ -26,6 +26,8 @@ asr:
   manual_commit: false
   # With manual_commit, audio keeps flowing this long after local speech ends before the commit; a recognizer finalized too soon after a short word can return nothing.
   commit_delay_ms: 300
+  # With manual_commit, a commit is sent every this much silence so the recognizer never holds a long silence; 0 disables.
+  idle_commit_ms: 2000
   # No default; network ASR providers refuse to start without it.
   locale: ko-KR
   # Bounded safety limits for the duplex recognizer connection.

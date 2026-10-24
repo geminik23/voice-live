@@ -3706,6 +3706,7 @@ impl VoiceSession {
             // remaining clauses do not.
             self.discard_reply_clauses(owner);
             self.retag_pending_speech(new_epoch);
+            self.apologize_for_lost_reply(owner).await?;
 
             if self.state.active_speech_id == Some(speech_id) {
                 self.state.active_speech_id = None;
@@ -3716,6 +3717,7 @@ impl VoiceSession {
             // settles as undelivered immediately.
             self.settle_speech_record(speech_id);
             self.discard_reply_clauses(owner);
+            self.apologize_for_lost_reply(owner).await?;
 
             if self.state.active_speech_id == Some(speech_id) {
                 self.state.active_speech_id = None;
@@ -3725,6 +3727,15 @@ impl VoiceSession {
             self.start_next_speech_if_possible().await?;
         }
 
+        Ok(())
+    }
+
+    /// A task reply lost to a synthesis failure would otherwise end in silence, so the user hears the failure text once instead.
+    /// The failure text has no owner, so its own synthesis failure cannot repeat it.
+    async fn apologize_for_lost_reply(&mut self, owner: Option<TaskId>) -> Result<()> {
+        if owner.is_some() {
+            self.speak_failure_text().await?;
+        }
         Ok(())
     }
 
@@ -8104,6 +8115,47 @@ mod tests {
         );
         session.on_asr_stream_reset().await.unwrap();
         assert!(session.state.semantic_frame.slot_value("date").is_none());
+        session.shutdown_active_work().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_lost_to_synthesis_failure_is_followed_by_the_failure_text_once() {
+        let (mut session, _, _) = harness();
+        Arc::make_mut(&mut session.config).speech.failure_text = "failure text".into();
+        let owner = TaskId::new();
+        let id = track(&mut session, false, Some(owner));
+        session.speech_records.get_mut(&id).unwrap().playback = PlaybackLifecycle::NotStarted;
+        session
+            .on_tts_failed(id, "connection lost".into())
+            .await
+            .unwrap();
+        session
+            .on_tts_failed(id, "connection lost".into())
+            .await
+            .unwrap();
+        let apologies = |session: &VoiceSession| {
+            session
+                .pending_speech
+                .iter()
+                .filter(|act| act.text == "failure text")
+                .count()
+                + usize::from(
+                    session
+                        .state
+                        .active_speech_id
+                        .and_then(|id| session.speech_records.get(&id))
+                        .is_some_and(|record| record.text == "failure text"),
+                )
+        };
+        assert_eq!(apologies(&session), 1);
+        // The failure text has no owner, so its own failure does not queue another.
+        if let Some(active) = session.state.active_speech_id {
+            session
+                .on_tts_failed(active, "still down".into())
+                .await
+                .unwrap();
+        }
+        assert!(apologies(&session) <= 1);
         session.shutdown_active_work().await;
     }
 

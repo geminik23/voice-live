@@ -148,6 +148,10 @@ pub struct AsrConfig {
     /// A recognizer asked to finalize too soon after a short word can return an empty transcript; speech that resumes inside this window stays in the same utterance.
     #[serde(default = "default_asr_commit_delay_ms")]
     pub commit_delay_ms: u64,
+    /// With `manual_commit`, how often a commit is sent while nobody is speaking, so the recognizer never holds a long stretch of silence.
+    /// Ink Whisper split an utterance that followed a long silence and returned an empty transcript for its end; `0` disables.
+    #[serde(default = "default_asr_idle_commit_ms")]
+    pub idle_commit_ms: u64,
     #[serde(default = "default_asr_locale")]
     pub locale: String,
     /// Deadline for one provider connect/auth/ready attempt.
@@ -205,6 +209,10 @@ fn default_asr_api_key_env() -> String {
 
 fn default_asr_commit_delay_ms() -> u64 {
     300
+}
+
+fn default_asr_idle_commit_ms() -> u64 {
+    2_000
 }
 
 fn default_chunk_ms() -> u64 {

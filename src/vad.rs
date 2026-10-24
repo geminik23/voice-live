@@ -51,6 +51,11 @@ impl EnergyVad {
         self.speaking
     }
 
+    /// A frame above the onset threshold arrived but speech is not confirmed yet.
+    pub fn onset_pending(&self) -> bool {
+        !self.speaking && self.onset_count > 0
+    }
+
     pub fn last_voice_us(&self) -> Option<u64> {
         self.last_voice_us
     }

@@ -21,6 +21,7 @@ asr:
   chunk_ms: 160
   manual_commit: false     # when true, server VAD controls endpointing and admits a FIFO provider commit after trailing PCM
   commit_delay_ms: 300     # with manual_commit, audio sent after local speech ends before the commit
+  idle_commit_ms: 2000     # with manual_commit, a commit every this much silence; 0 disables
   locale: ko-KR            # no default; required by the together and cartesia providers
   open_timeout_ms: 10000
   write_timeout_ms: 2000
@@ -162,6 +163,8 @@ Validate each real provider with its individual ignored contract only after cred
 
 With `manual_commit: true`, the runtime does not commit the moment local speech ends. It keeps sending audio for `asr.commit_delay_ms` (default 300) and then commits. In a live check, Ink Whisper returned an empty transcript for a short Korean word when the finalize arrived 240 ms after the word ended, and the correct word at 340 ms or later. If speech resumes inside the window, it stays in the same utterance and gets one finalize instead of two. Set `0` to commit immediately. The delay does not hold the turn: turn commit still follows `turn_control`.
 
+While nobody speaks, the runtime also commits every `asr.idle_commit_ms` (default 2000), so the recognizer never holds a long stretch of silence. In a live check, after about 14 s of silence Ink Whisper split the next utterance at a short pause and returned an empty transcript for its end ("...강남에서" without "두 명이요") in 4 of 6 utterances; with idle commits every 2 s, 9 of 10 were complete, and 1 s was not better. An idle commit is not sent while local speech is on, while an onset is being confirmed, or while a speech commit is pending, and its empty Final is not forwarded as an utterance. Set `0` to disable.
+
 Use `full-duplex-demo/configs/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together. Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, locale `ko-KR`, and `audio.input_sample_rate_hz: 16000`. The session selector is normalized to a primary language code, for example `fr-CA → fr`, `zh-Hant-TW → zh`, and `yue → yue`. There is no runtime language-membership allowlist. Unsupported model, rate, or automatic commit settings are still rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
 
 | Key | Default | Validation and use |
@@ -217,7 +220,7 @@ Library text-rule collections are empty by default. Configure `turn_control.hard
 | `turn_control.slot_fallback` | `neutral` | `neutral` yields no slot updates; `korean_example` explicitly enables the reservation heuristic |
 | `speech.backchannel_text` | `""` | Trusted automatic backchannel text; empty disables the act, not floor control |
 | `speech.hard_stop_ack_text` | `""` | Empty suppresses only the spoken ACK; hard-stop Abort and epoch/queue recovery remain active |
-| `speech.failure_text` | `""` | Optional trusted failure/repeat prompt; empty does not skip failure resolution |
+| `speech.failure_text` | `""` | Optional trusted failure/repeat prompt, spoken when a task reply is rejected, fails, or is lost to a TTS failure; empty does not skip failure resolution |
 | `speech.outcomes` | `{}` | Outcome rules a strict reply may name, described below |
 | `speech.mock_reply` | absent | Reply text of the keyless mock task agent; 1–4096 bytes |
 

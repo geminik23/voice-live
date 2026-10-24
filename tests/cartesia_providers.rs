@@ -1201,3 +1201,144 @@ observability:
         finalizes[0]
     );
 }
+
+/// Ink Whisper split an utterance that followed a long silence and returned nothing for its end.
+/// While nobody speaks, a commit is therefore sent every `idle_commit_ms`, so the recognizer never holds more than that much silence.
+#[tokio::test]
+async fn silence_is_committed_periodically_so_the_recognizer_buffer_stays_short() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/stt/websocket", listener.local_addr().unwrap());
+    let asr_server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        // Silent samples received since the last message with speech in it, sampled at each finalize.
+        let mut silent_since_speech = 0usize;
+        let mut finalizes = Vec::new();
+        while let Some(Ok(message)) = socket.next().await {
+            match message {
+                tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                    let loud = bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .any(|pair| i16::from_le_bytes(*pair).unsigned_abs() > 1000);
+                    silent_since_speech = if loud {
+                        0
+                    } else {
+                        silent_since_speech + bytes.len() / 2
+                    };
+                }
+                tokio_tungstenite::tungstenite::Message::Text(text) if text == "finalize" => {
+                    finalizes.push(silent_since_speech);
+                    for value in [
+                        json!({"type":"transcript","request_id":"asr-connection","is_final":true,"text":"stop"}),
+                        json!({"type":"flush_done","request_id":"asr-connection"}),
+                    ] {
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                value.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+                tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        finalizes
+    });
+    let asr_config = voice_live::config::AsrConfig {
+        endpoint,
+        provider: "cartesia".into(),
+        model: "ink-whisper".into(),
+        manual_commit: true,
+        locale: "ko-KR".into(),
+        ..voice_live::config::AsrConfig::default()
+    };
+    let asr = voice_live::asr::cartesia::CartesiaStreamingAsr::with_api_key(
+        &asr_config,
+        "test-secret".into(),
+    )
+    .unwrap();
+    let runtime_config = VoiceRuntimeConfig::from_yaml_str(
+        "speech:
+  mock_reply: Ready.
+asr:
+  manual_commit: true
+  locale: ko-KR
+tts:
+  language: ko
+  voice: test-voice
+observability:
+  event_log: false",
+    )
+    .unwrap();
+    let runtime = VoiceRuntime::build_with_providers(
+        runtime_config,
+        SpeechProviders {
+            asr: Arc::new(asr),
+            tts: Arc::new(voice_live::tts::fake::FakeTts::new(24000, 60, 1)),
+        },
+    )
+    .await
+    .unwrap();
+    let (client_tx, mut client) = tokio::sync::mpsc::channel(256);
+    let session = runtime.create_session(client_tx).await.unwrap();
+    tokio::spawn(async move { while client.recv().await.is_some() {} });
+    session
+        .input_tx
+        .send(voice_live::ClientInput::Control(
+            voice_live::ClientControlMessage::SessionStart {
+                input_sample_rate: 16000,
+                channels: 1,
+            },
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // 2.6 s of silence, then speech and enough silence for its own commit.
+    let pattern = [(130, 0i16), (10, 12000), (45, 0)];
+    let mut sequence = 0;
+    for (frames, sample) in pattern {
+        for _ in 0..frames {
+            session
+                .input_tx
+                .send(voice_live::ClientInput::Audio(
+                    voice_live::media::AudioFrame {
+                        sequence,
+                        pcm: vec![sample; 320],
+                    },
+                ))
+                .await
+                .unwrap();
+            sequence += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session
+        .input_tx
+        .send(voice_live::ClientInput::Control(
+            voice_live::ClientControlMessage::SessionStop,
+        ))
+        .await
+        .unwrap();
+    drop(session);
+    drop(runtime);
+    let finalizes = tokio::time::timeout(Duration::from_secs(5), asr_server)
+        .await
+        .expect("recognizer closed")
+        .unwrap();
+    // One idle commit after 2 s (100 frames) of silence, then the speech commit.
+    assert_eq!(
+        finalizes.len(),
+        2,
+        "idle commit then speech commit: {finalizes:?}"
+    );
+    assert!(
+        finalizes[0] >= 100 * 320 - 1600,
+        "idle commit after {} silent samples",
+        finalizes[0]
+    );
+}

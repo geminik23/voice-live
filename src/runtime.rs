@@ -855,6 +855,12 @@ struct MediaState {
     commit_delay_samples: usize,
     /// A manual commit waiting for its trailing audio: the connection generation it belongs to and the samples still to send.
     pending_commit: Option<(u64, usize)>,
+    /// Silent samples after which an idle commit is sent; zero disables idle commits.
+    idle_commit_samples: usize,
+    /// Samples sent since the last commit while nobody was speaking.
+    idle_samples: usize,
+    /// One entry per commit not yet answered by a Final, in order: true for an idle commit, whose empty Final is not forwarded.
+    commit_kinds: std::collections::VecDeque<bool>,
     identity: AsrIdentity,
 }
 
@@ -1111,6 +1117,11 @@ async fn run_media_worker(args: MediaWorkerArgs) {
             * u64::from(config.audio.input_sample_rate_hz)
             / 1_000) as usize,
         pending_commit: None,
+        idle_commit_samples: (config.asr.idle_commit_ms
+            * u64::from(config.audio.input_sample_rate_hz)
+            / 1_000) as usize,
+        idle_samples: 0,
+        commit_kinds: std::collections::VecDeque::new(),
         identity: AsrIdentity::default(),
     };
     let mut link = AsrLink::new();
@@ -1353,10 +1364,15 @@ async fn handle_asr_event(
             )
         }
         AsrEvent::Final { utterance_id, text } => {
+            let idle_commit = state.commit_kinds.pop_front().unwrap_or(false);
             let Some((utterance_id, transcript)) = state.identity.map_final(utterance_id, text)
             else {
                 return true;
             };
+            // An idle commit only keeps the recognizer's buffer short; its empty Final is not an utterance.
+            if idle_commit && transcript.trim().is_empty() {
+                return true;
+            }
             emit(
                 event_tx,
                 VoiceEvent::AsrUtteranceFinal {
@@ -1464,6 +1480,8 @@ async fn handle_connection_loss(
 
     state.identity.reset_generation();
     state.pending_commit = None;
+    state.idle_samples = 0;
+    state.commit_kinds.clear();
     link.drop_connection().await;
     true
 }
@@ -1496,6 +1514,19 @@ fn commit_due(state: &mut MediaState, speech_ended: bool, generation: u64, pushe
         }
         None => false,
     }
+}
+
+/// Whether an idle commit is due: nobody is speaking or about to, no speech commit is pending, and enough silence has been sent since the last commit.
+fn idle_commit_due(state: &mut MediaState, pushed: usize) -> bool {
+    if !state.manual_commit || state.idle_commit_samples == 0 {
+        return false;
+    }
+    if state.vad.is_speaking() || state.vad.onset_pending() || state.pending_commit.is_some() {
+        state.idle_samples = 0;
+        return false;
+    }
+    state.idle_samples = state.idle_samples.saturating_add(pushed);
+    state.idle_samples >= state.idle_commit_samples
 }
 
 /// Outcome of admitting one audio frame to the provider connection.
@@ -1624,7 +1655,11 @@ async fn handle_audio_frame(
         AsrLinkState::Ready(connection) => {
             match connection.input.try_push_audio(resampled) {
                 Ok(AsrAudioPush::Accepted) => {
-                    if commit_due(state, speech_ended, link.generation, pushed) {
+                    let speech_commit = commit_due(state, speech_ended, link.generation, pushed);
+                    let idle_commit = !speech_commit && idle_commit_due(state, pushed);
+                    if speech_commit || idle_commit {
+                        state.idle_samples = 0;
+                        state.commit_kinds.push_back(idle_commit);
                         // The commit follows its audio in the same generation;
                         // a failed audio admission never commits onto a fresh
                         // connection.
@@ -1648,6 +1683,7 @@ async fn handle_audio_frame(
         }
         _ => {
             state.pending_commit = None;
+            state.idle_samples = 0;
             AdmitOutcome::NoConnection
         }
     };
@@ -1669,6 +1705,8 @@ async fn handle_audio_frame(
             .await
         }
         AdmitOutcome::ConnectionLost => {
+            state.commit_kinds.clear();
+            state.idle_samples = 0;
             if let AsrLinkState::Ready(connection) =
                 std::mem::replace(&mut link.state, AsrLinkState::Stopped)
             {

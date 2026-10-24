@@ -25,6 +25,8 @@ pub struct RestaurantOption {
 pub struct ReservationRecord {
     pub status: String,
     pub confirmation_id: String,
+    /// The last four characters of `confirmation_id`, ready to read aloud; a model asked to cut them itself read the wrong four in a live check.
+    pub confirmation_suffix: String,
     pub restaurant_id: String,
     pub date: String,
     pub time: String,
@@ -285,9 +287,12 @@ impl Tool for ReserveRestaurantTool {
             return ToolResult::error("party size exceeds restaurant capacity");
         }
 
+        let confirmation_id = format!("DEMO-{}", uuid::Uuid::new_v4().simple());
+        let confirmation_suffix = confirmation_id[confirmation_id.len() - 4..].to_string();
         let record = ReservationRecord {
             status: "committed".into(),
-            confirmation_id: format!("DEMO-{}", uuid::Uuid::new_v4().simple()),
+            confirmation_id,
+            confirmation_suffix,
             restaurant_id,
             date,
             time,
@@ -406,6 +411,13 @@ mod tests {
 
         assert!(first.success);
         assert_eq!(first.output, second.output);
+        let record: ReservationRecord = serde_json::from_str(&first.output).unwrap();
+        assert!(
+            record
+                .confirmation_id
+                .ends_with(&record.confirmation_suffix)
+        );
+        assert_eq!(record.confirmation_suffix.len(), 4);
 
         let rejected = tool
             .execute(
