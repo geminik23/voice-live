@@ -29,4 +29,4 @@ jobs:
       - name: Test framework-free core
         run: cargo test --no-default-features
       - name: Check browser playback
-        run: node --test full-duplex-demo/tests/web_playback.test.cjs
+        run: node --test examples/browser/tests/web_playback.test.cjs
