@@ -219,6 +219,27 @@ impl TurnAssemblyBuffer {
         self.committed_finals.is_empty()
     }
 
+    pub fn final_count(&self) -> usize {
+        self.committed_finals.len()
+    }
+
+    pub fn discard_from(&mut self, index: usize) {
+        self.committed_finals.truncate(index);
+    }
+
+    pub fn discard_last_if(&mut self, text: &str) -> bool {
+        if self
+            .committed_finals
+            .last()
+            .is_some_and(|last| last == text.trim())
+        {
+            self.committed_finals.pop();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn take(&mut self) -> String {
         let joined = self.committed_finals.join(" ");
         self.committed_finals.clear();

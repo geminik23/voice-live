@@ -89,6 +89,9 @@ pub struct AudibleLedger {
     /// Speeches whose synthesis has finished, so `enqueued_samples` is their
     /// true length rather than a lower bound.
     synthesis_done: HashSet<SpeechId>,
+    /// Reply clauses whose turn has not been resolved yet, with their settled result once known.
+    /// Kept outside the bounded history so a reply longer than the history still resolves with what was actually heard.
+    held: HashMap<SpeechId, Option<Heard>>,
 }
 
 impl Default for AudibleLedger {
@@ -106,7 +109,17 @@ impl AudibleLedger {
             max_clauses: max_clauses.max(1),
             enqueued_samples: HashMap::new(),
             synthesis_done: HashSet::new(),
+            held: HashMap::new(),
         }
+    }
+
+    /// Keeps this speech's settled result until [`AudibleLedger::release`], even after it leaves the bounded history.
+    pub fn hold(&mut self, speech_id: SpeechId) {
+        self.held.entry(speech_id).or_insert(None);
+    }
+
+    pub fn release(&mut self, speech_id: SpeechId) {
+        self.held.remove(&speech_id);
     }
 
     pub fn speech_started(&mut self, speech_id: SpeechId, text: &str, sample_rate: u32) {
@@ -195,6 +208,9 @@ impl AudibleLedger {
     }
 
     fn push(&mut self, clause: AudibleClause) {
+        if let Some(slot) = self.held.get_mut(&clause.speech_id) {
+            *slot = Some(clause.heard);
+        }
         self.history.push(clause);
         if self.history.len() > self.max_clauses {
             let excess = self.history.len() - self.max_clauses;
@@ -210,6 +226,9 @@ impl AudibleLedger {
     /// or, if it is still playing, a partial estimate from progress so far.
     /// `None` means the ledger has never seen it play.
     pub fn heard_so_far(&self, speech_id: SpeechId) -> Option<Heard> {
+        if let Some(heard) = self.held.get(&speech_id).copied().flatten() {
+            return Some(heard);
+        }
         if let Some(clause) = self.history.iter().rev().find(|c| c.speech_id == speech_id) {
             return Some(clause.heard);
         }
@@ -227,7 +246,8 @@ impl AudibleLedger {
     }
 
     pub fn is_settled(&self, speech_id: SpeechId) -> bool {
-        self.history.iter().any(|c| c.speech_id == speech_id)
+        matches!(self.held.get(&speech_id), Some(Some(_)))
+            || self.history.iter().any(|c| c.speech_id == speech_id)
     }
 
     pub fn in_flight_id(&self) -> Option<SpeechId> {
@@ -308,12 +328,15 @@ fn heard_prefix(text: &str, heard: Heard) -> String {
     }
 }
 
+// Memory annotations for the model, never spoken.
+// They are fixed tokens rather than phrases in any one language; agent instructions explain them.
+
 /// Marker appended where the user cut the assistant off mid-clause.
-pub const MARKER_INTERRUPTED: &str = "… [중단됨]";
+pub const MARKER_INTERRUPTED: &str = "… [voice-live:interrupted]";
 /// Marker appended when later clauses of a reply never played.
-pub const MARKER_REST_UNDELIVERED: &str = "[중단됨: 이후 내용은 전달되지 않음]";
+pub const MARKER_REST_UNDELIVERED: &str = "[voice-live:rest-undelivered]";
 /// Stored in place of a reply that never reached the user at all.
-pub const MARKER_UNDELIVERED: &str = "[응답이 전달되지 않음]";
+pub const MARKER_UNDELIVERED: &str = "[voice-live:undelivered]";
 
 /// Renders one reply, clause by clause, into what the user actually heard.
 ///
@@ -499,6 +522,26 @@ mod tests {
     }
 
     #[test]
+    fn held_clause_outlives_the_capped_history_until_released() {
+        let mut ledger = AudibleLedger::with_capacity(1);
+        let held = SpeechId::new();
+        ledger.hold(held);
+        ledger.speech_started(held, "first", 24_000);
+        ledger.mark_completed(held);
+        let later = SpeechId::new();
+        ledger.speech_started(later, "second", 24_000);
+        ledger.mark_completed(later);
+
+        assert!(ledger.history().iter().all(|c| c.speech_id != held));
+        assert!(ledger.is_settled(held));
+        assert_eq!(ledger.heard_so_far(held), Some(Heard::Full));
+
+        ledger.release(held);
+        assert!(!ledger.is_settled(held));
+        assert_eq!(ledger.heard_so_far(held), None);
+    }
+
+    #[test]
     fn heard_so_far_sees_settled_and_in_flight_acts() {
         let mut ledger = AudibleLedger::default();
         let done = SpeechId::new();
@@ -543,7 +586,10 @@ mod tests {
             ("홍대 키친도 가능합니다.", Heard::Full),
         ]);
 
-        assert_eq!(rendered, "확인했습니다. 토요일 7시… [중단됨]");
+        assert_eq!(
+            rendered,
+            format!("확인했습니다. 토요일 7시{MARKER_INTERRUPTED}")
+        );
         assert!(
             !rendered.contains("홍대"),
             "nothing after an interruption was heard"

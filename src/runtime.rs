@@ -1,3 +1,5 @@
+//! The host entry point: [`VoiceRuntime`] builds speech providers and agents once and creates a pipeline per client session.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -6,9 +8,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::CognitiveAgent;
-use crate::agent::mock::MockReservationAgent;
+use crate::agent::mock::FakeAgent;
+#[cfg(feature = "cartesia")]
+use crate::asr::cartesia::CartesiaStreamingAsr;
 use crate::asr::fake::MockAsr;
 use crate::asr::inject::InjectionQueue;
+#[cfg(feature = "together")]
 use crate::asr::together::TogetherNemotronAsr;
 use crate::asr::{
     AsrAudioInput, AsrAudioPush, AsrDuplexLimits, AsrDuplexSession, AsrEvent, AsrEventStream,
@@ -30,20 +35,29 @@ use crate::semantics::extractor::SlotExtractor;
 use crate::session::VoiceSessionBuilder;
 use crate::session::deep_worker::DeepWorker;
 use crate::tts::buffered::BufferedTtsAdapter;
+#[cfg(feature = "cartesia")]
+use crate::tts::cartesia::CartesiaStreamingTts;
 use crate::tts::fake::FakeTts;
 use crate::tts::premade::PremadeTts;
+#[cfg(feature = "qwen")]
 use crate::tts::qwen::QwenRealtimeTts;
 use crate::tts::{StreamingTts, TextInputMode};
 use crate::vad::EnergyVad;
 
+/// One item from the client, sent through [`GatewaySession::input_tx`].
 #[derive(Debug)]
 pub enum ClientInput {
     Audio(AudioFrame),
     Control(ClientControlMessage),
 }
 
+/// A live session returned by [`VoiceRuntime::create_session`].
+///
+/// The host forwards its client's microphone frames and control messages into `input_tx`, and forwards everything the runtime writes to the `client_tx` it passed in back to the client.
 pub struct GatewaySession {
+    /// Identifies the session for [`VoiceRuntime::inject_user_text`] and [`VoiceRuntime::close_session`].
     pub session_id: crate::ids::SessionId,
+    /// Client audio and control input; closing it ends the session's input.
     pub input_tx: mpsc::Sender<ClientInput>,
 }
 
@@ -76,6 +90,10 @@ struct SessionBrains {
     deep_worker: Option<Arc<dyn DeepWorker>>,
 }
 
+/// The process-wide runtime: speech factories, agent specs, and host policies, from which per-session pipelines are created.
+///
+/// Build it once with [`VoiceRuntime::build`], [`VoiceRuntime::build_with_policies`], or [`VoiceRuntime::build_with_providers`], then call [`VoiceRuntime::create_session`] for each client.
+/// Each session gets its own agents and memory; only speech factories and host tools are shared.
 pub struct VoiceRuntime {
     config: Arc<VoiceRuntimeConfig>,
     /// Source provider. `StreamingAsr` is a factory, so sharing it is safe;
@@ -83,45 +101,164 @@ pub struct VoiceRuntime {
     asr: Arc<dyn StreamingAsr>,
     tts: Arc<dyn StreamingTts>,
     brains: BrainProvider,
+    policies: RuntimePolicies,
     metrics: Arc<crate::metrics::Metrics>,
     sessions: Mutex<HashMap<crate::ids::SessionId, SessionEntry>>,
 }
 
-/// Externally supplied speech factories for
-/// [`VoiceRuntime::build_with_providers`].
+/// Host overrides are independent of provider names and applied before configured fallbacks.
 ///
-/// This carries only speech providers; agents, transport, and tool backends
-/// keep their own wiring, so it never grows into a general dependency
-/// container.
+/// Build it with [`RuntimePolicies::default`] and the `with_*` methods; new policies may be added without breaking callers.
+#[derive(Default)]
+#[non_exhaustive]
+pub struct RuntimePolicies {
+    pub interaction_brain: Option<Arc<dyn Fn() -> Arc<dyn InteractionBrain> + Send + Sync>>,
+    pub text_analyzer: Option<Arc<dyn crate::semantics::text::TextAnalyzer>>,
+    pub slot_extractor: Option<Arc<dyn Fn() -> Arc<dyn SlotExtractor> + Send + Sync>>,
+    pub speech_renderer: Option<Arc<dyn crate::speech::render::SpeechRenderer>>,
+    /// Tools the framework task agent may call, bound per session through [`crate::agent::framework::VoiceAgentHooks`].
+    /// The tool objects are shared by every session, so any backend state behind them is shared too.
+    #[cfg(feature = "framework")]
+    pub task_tools: Vec<Arc<dyn ai_agents::tools::Tool>>,
+    /// Tools for the speculative read-only agent; config validation still requires each to be declared `pure_read`.
+    #[cfg(feature = "framework")]
+    pub speculative_tools: Vec<Arc<dyn ai_agents::tools::Tool>>,
+}
+
+impl RuntimePolicies {
+    /// A per-session factory for the interaction brain, replacing the configured semantic brain.
+    pub fn with_interaction_brain(
+        mut self,
+        factory: impl Fn() -> Arc<dyn InteractionBrain> + Send + Sync + 'static,
+    ) -> Self {
+        self.interaction_brain = Some(Arc::new(factory));
+        self
+    }
+
+    /// A host text analyzer, which selects the compatibility interaction path.
+    pub fn with_text_analyzer(
+        mut self,
+        analyzer: Arc<dyn crate::semantics::text::TextAnalyzer>,
+    ) -> Self {
+        self.text_analyzer = Some(analyzer);
+        self
+    }
+
+    /// A per-session factory for the slot extractor, replacing `turn_control.slot_fallback`.
+    pub fn with_slot_extractor(
+        mut self,
+        factory: impl Fn() -> Arc<dyn SlotExtractor> + Send + Sync + 'static,
+    ) -> Self {
+        self.slot_extractor = Some(Arc::new(factory));
+        self
+    }
+
+    /// A host renderer that checks task replies instead of the configured outcome rules.
+    pub fn with_speech_renderer(
+        mut self,
+        renderer: Arc<dyn crate::speech::render::SpeechRenderer>,
+    ) -> Self {
+        self.speech_renderer = Some(renderer);
+        self
+    }
+
+    /// Tools the framework task agent may call.
+    #[cfg(feature = "framework")]
+    pub fn with_task_tools(mut self, tools: Vec<Arc<dyn ai_agents::tools::Tool>>) -> Self {
+        self.task_tools = tools;
+        self
+    }
+
+    /// Read-only tools for the speculative agent.
+    #[cfg(feature = "framework")]
+    pub fn with_speculative_tools(mut self, tools: Vec<Arc<dyn ai_agents::tools::Tool>>) -> Self {
+        self.speculative_tools = tools;
+        self
+    }
+}
+
+/// Externally supplied speech factories for [`VoiceRuntime::build_with_providers`].
+/// Agents, linguistic policies, transport, and tool backends keep their own wiring.
 pub struct SpeechProviders {
     pub asr: Arc<dyn StreamingAsr>,
     pub tts: Arc<dyn StreamingTts>,
 }
 
 impl VoiceRuntime {
+    /// Applies explicit host policies before any session is created, with built-in or injected speech factories.
+    pub async fn build_with_policies(
+        config: VoiceRuntimeConfig,
+        providers: Option<SpeechProviders>,
+        policies: RuntimePolicies,
+    ) -> anyhow::Result<Arc<Self>> {
+        let mut runtime = match providers {
+            Some(providers) => Self::build_with_providers(config, providers).await?,
+            None => Self::build(config).await?,
+        };
+        Arc::get_mut(&mut runtime)
+            .expect("unpublished runtime")
+            .policies = policies;
+        Ok(runtime)
+    }
+
+    /// Builds a runtime with the built-in speech providers named in the config and default policies.
     pub async fn build(config: VoiceRuntimeConfig) -> anyhow::Result<Arc<Self>> {
         Self::build_from_arc(Arc::new(config)).await
     }
 
+    /// Like [`VoiceRuntime::build`], for a config the host already shares.
     pub async fn build_from_arc(config: Arc<VoiceRuntimeConfig>) -> anyhow::Result<Arc<Self>> {
+        // Built-in network providers get the configured language verbatim; there is no default language to fall back on.
+        if matches!(config.asr.provider.as_str(), "together" | "cartesia") {
+            anyhow::ensure!(
+                !config.asr.locale.trim().is_empty(),
+                "asr.locale must be set for asr.provider '{}'",
+                config.asr.provider
+            );
+        }
+        if matches!(config.tts.provider.as_str(), "qwen" | "cartesia") {
+            anyhow::ensure!(
+                !config.tts.language.trim().is_empty(),
+                "tts.language must be set for tts.provider '{}'",
+                config.tts.provider
+            );
+        }
         let asr: Arc<dyn StreamingAsr> = match config.asr.provider.as_str() {
+            #[cfg(feature = "together")]
             "together" => Arc::new(TogetherNemotronAsr::from_config(&config.asr)?),
+            #[cfg(feature = "cartesia")]
+            "cartesia" => Arc::new(CartesiaStreamingAsr::from_config(&config.asr)?),
+            #[cfg(not(feature = "together"))]
+            "together" => anyhow::bail!("asr.provider 'together' needs the `together` feature"),
+            #[cfg(not(feature = "cartesia"))]
+            "cartesia" => anyhow::bail!("asr.provider 'cartesia' needs the `cartesia` feature"),
             // `inject` is `mock` plus a text channel; the media worker drains
             // the queue itself so every provider can be driven by typed text.
             "inject" | "mock" => Arc::new(MockAsr::quiet()),
             other => {
-                anyhow::bail!("unknown asr.provider '{other}' (expected together, inject, or mock)")
+                anyhow::bail!(
+                    "unknown asr.provider '{other}' (expected together, cartesia, inject, or mock)"
+                )
             }
         };
 
         let raw_tts: Arc<dyn StreamingTts> = match config.tts.provider.as_str() {
+            #[cfg(feature = "qwen")]
             "qwen" => Arc::new(QwenRealtimeTts::from_config(&config.tts)?),
+            #[cfg(feature = "cartesia")]
+            "cartesia" => Arc::new(CartesiaStreamingTts::from_config(&config.tts)?),
+            #[cfg(not(feature = "qwen"))]
+            "qwen" => anyhow::bail!("tts.provider 'qwen' needs the `qwen` feature"),
+            #[cfg(not(feature = "cartesia"))]
+            "cartesia" => anyhow::bail!("tts.provider 'cartesia' needs the `cartesia` feature"),
             "mock" => Arc::new(FakeTts::new(
                 config.tts.sample_rate_hz,
                 config.tts.chunk_ms,
                 3,
             )),
-            other => anyhow::bail!("unknown tts.provider '{other}' (expected qwen or mock)"),
+            other => {
+                anyhow::bail!("unknown tts.provider '{other}' (expected qwen, cartesia, or mock)")
+            }
         };
 
         Self::assemble(config, asr, raw_tts, false).await
@@ -157,6 +294,7 @@ impl VoiceRuntime {
         Self::build_with_providers_from_arc(Arc::new(config), providers).await
     }
 
+    /// Like [`VoiceRuntime::build_with_providers`], for a config the host already shares.
     pub async fn build_with_providers_from_arc(
         config: Arc<VoiceRuntimeConfig>,
         providers: SpeechProviders,
@@ -215,16 +353,19 @@ impl VoiceRuntime {
             asr,
             tts,
             brains,
+            policies: RuntimePolicies::default(),
             metrics: Metrics::new(),
             sessions: Mutex::new(HashMap::new()),
             config,
         }))
     }
 
+    /// The validated configuration this runtime was built from.
     pub fn config(&self) -> &VoiceRuntimeConfig {
         &self.config
     }
 
+    /// Process-wide counters shared by every session.
     pub fn metrics(&self) -> &crate::metrics::Metrics {
         &self.metrics
     }
@@ -253,11 +394,14 @@ impl VoiceRuntime {
         }
     }
 
+    /// Creates a session whose output goes to `client_tx` and returns its input channel.
+    ///
+    /// The session starts processing audio after the client sends [`ClientControlMessage::SessionStart`].
     pub async fn create_session(
         self: &Arc<Self>,
         client_tx: mpsc::Sender<ServerMessage>,
     ) -> anyhow::Result<GatewaySession> {
-        let brains = self.brains.create().await?;
+        let brains = self.brains.create(&self.policies).await?;
         let session_id = crate::ids::SessionId::new();
         let shutdown = CancellationToken::new();
         let clock: crate::clock::ClockRef = Arc::new(TokioClock::new());
@@ -290,6 +434,15 @@ impl VoiceRuntime {
             shutdown.clone(),
         ));
 
+        let interaction_brain = self
+            .policies
+            .interaction_brain
+            .as_ref()
+            .map(|factory| factory())
+            .unwrap_or(brains.interaction_brain);
+        let semantic_mode = self.policies.text_analyzer.is_none()
+            && (interaction_brain.supports_semantics()
+                || (self.config.agents.interaction.enabled && interaction_brain.is_noop()));
         let mut builder = VoiceSessionBuilder::new(
             Arc::clone(&self.config),
             playback,
@@ -298,11 +451,22 @@ impl VoiceRuntime {
         )
         .with_session_id(session_id)
         .with_clock(clock)
-        .with_interaction_brain(brains.interaction_brain)
-        .with_slot_extractor(brains.slot_extractor)
+        .with_interaction_brain(interaction_brain)
         .with_metrics(Arc::clone(&self.metrics))
         .with_trace(trace_tx)
         .with_shutdown(shutdown.clone());
+
+        if let Some(analyzer) = &self.policies.text_analyzer {
+            builder = builder.with_text_analyzer(Arc::clone(analyzer));
+        }
+        if let Some(factory) = &self.policies.slot_extractor {
+            builder = builder.with_slot_extractor(factory());
+        } else if !semantic_mode {
+            builder = builder.with_slot_extractor(brains.slot_extractor);
+        }
+        if let Some(renderer) = &self.policies.speech_renderer {
+            builder = builder.with_speech_renderer(Arc::clone(renderer));
+        }
 
         if let Some(speculative_agent) = brains.speculative_agent {
             builder = builder.with_speculative_agent(speculative_agent);
@@ -312,7 +476,7 @@ impl VoiceRuntime {
             builder = builder.with_deep_worker(deep_worker);
         }
 
-        let (session, session_handle_internal) = builder.build();
+        let (session, session_handle_internal) = builder.try_build()?;
 
         let event_tx_for_media = session_handle_internal.event_tx.clone();
 
@@ -354,6 +518,7 @@ impl VoiceRuntime {
         })
     }
 
+    /// Stops a session's workers and releases its providers; unknown ids are ignored.
     pub async fn close_session(&self, session_id: crate::ids::SessionId) {
         let entry = self.sessions.lock().remove(&session_id);
         if let Some(mut entry) = entry {
@@ -371,6 +536,7 @@ impl VoiceRuntime {
         }
     }
 
+    /// The number of sessions currently open.
     pub fn session_count(&self) -> usize {
         self.sessions.lock().len()
     }
@@ -506,12 +672,9 @@ async fn send_client(
 enum BrainMode {
     /// Deterministic offline brains. Stateless, so construction is trivial.
     Mock,
+    /// Framework agents built from the configured specs with the host's tools from [`RuntimePolicies`].
     #[cfg(feature = "framework")]
-    Framework {
-        /// The demo booking backend. Shared on purpose: it models an external
-        /// system of record, not per-conversation state.
-        store: Arc<Mutex<crate::tools::reservation::ReservationStore>>,
-    },
+    Framework,
 }
 
 struct BrainProvider {
@@ -539,9 +702,7 @@ impl BrainProvider {
                 Ok(()) => {
                     return Ok(Self {
                         config: Arc::clone(config),
-                        mode: BrainMode::Framework {
-                            store: crate::tools::reservation::ReservationStore::demo(),
-                        },
+                        mode: BrainMode::Framework,
                     });
                 }
                 Err(error) if !injected && uses_only_development_providers(config) => {
@@ -557,18 +718,24 @@ impl BrainProvider {
         })
     }
 
-    async fn create(&self) -> anyhow::Result<SessionBrains> {
+    async fn create(&self, policies: &RuntimePolicies) -> anyhow::Result<SessionBrains> {
+        #[cfg(not(feature = "framework"))]
+        let _ = policies;
         match &self.mode {
             BrainMode::Mock => Ok(SessionBrains {
-                task_agent: Arc::new(MockReservationAgent),
+                task_agent: Arc::new(FakeAgent::finalizing(
+                    self.config.speech.mock_reply.clone().unwrap_or_default(),
+                )),
                 speculative_agent: None,
-                interaction_brain: Arc::new(NoopInteractionBrain),
-                slot_extractor: Arc::new(crate::semantics::extractor::HeuristicKoreanSlotExtractor),
+                interaction_brain: configured_semantic_brain(&self.config),
+                slot_extractor: crate::semantics::extractor::configured_fallback(
+                    &self.config.turn_control,
+                ),
                 deep_worker: None,
             }),
 
             #[cfg(feature = "framework")]
-            BrainMode::Framework { store } => {
+            BrainMode::Framework => {
                 let spec = self
                     .config
                     .agents
@@ -576,10 +743,46 @@ impl BrainProvider {
                     .spec
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("missing task agent spec"))?;
-                build_framework_brains(&self.config, spec, store).await
+                build_framework_brains(&self.config, spec, policies).await
             }
         }
     }
+}
+
+fn configured_semantic_brain(config: &VoiceRuntimeConfig) -> Arc<dyn InteractionBrain> {
+    #[cfg(feature = "framework")]
+    if config.agents.interaction.enabled
+        && let Some(spec) = &config.agents.interaction.spec
+    {
+        let build = || -> anyhow::Result<Arc<dyn InteractionBrain>> {
+            let raw = std::fs::read_to_string(spec)?;
+            let value: serde_yaml::Value = serde_yaml::from_str(&raw)?;
+            let system = value
+                .get("system_prompt")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                system.len() <= 16_384 && !system.contains("{{"),
+                "invalid semantic system prompt"
+            );
+            let runtime = ai_agents::agent::AgentBuilder::from_yaml_file(spec)?
+                .auto_configure_llms()?
+                .build()?;
+            let provider = runtime.llm_registry().default()?;
+            Ok(Arc::new(
+                crate::agent::framework::RuntimeSemanticBrain::new(provider, system.to_string()),
+            ))
+        };
+        match build() {
+            Ok(brain) => return brain,
+            Err(error) => {
+                tracing::warn!(%error, "semantic brain unavailable; using neutral fallback")
+            }
+        }
+    }
+    #[cfg(not(feature = "framework"))]
+    let _ = config;
+    Arc::new(NoopInteractionBrain)
 }
 
 #[cfg(feature = "framework")]
@@ -591,14 +794,13 @@ fn uses_only_development_providers(config: &VoiceRuntimeConfig) -> bool {
 async fn build_framework_brains(
     config: &Arc<VoiceRuntimeConfig>,
     task_spec: &std::path::Path,
-    reservation_store: &Arc<Mutex<crate::tools::reservation::ReservationStore>>,
+    policies: &RuntimePolicies,
 ) -> anyhow::Result<SessionBrains> {
     use crate::agent::framework::{
-        AiAgentsCognitiveAgent, RuntimeDeepWorker, RuntimeInteractionBrain, RuntimeSlotExtractor,
-        VoiceAgentHooks, build_runtime_agent, build_runtime_agent_with_memory,
-        build_runtime_agent_with_tools, conversation_memory_for_spec,
+        AiAgentsCognitiveAgent, RuntimeDeepWorker, VoiceAgentHooks, build_runtime_agent,
+        build_runtime_agent_with_memory, build_runtime_agent_with_tools,
+        conversation_memory_for_spec,
     };
-    use crate::tools::reservation::{speculative_tools, task_tools};
 
     // voice-live owns the task agent's conversation memory so each turn can
     // be rewritten to what the user heard, or rolled back. The same handle
@@ -608,7 +810,7 @@ async fn build_framework_brains(
     let runtime = build_runtime_agent_with_memory(
         task_spec,
         Arc::clone(&hooks),
-        task_tools(Arc::clone(reservation_store)),
+        policies.task_tools.clone(),
         Some(Arc::clone(&memory)),
     )
     .await?;
@@ -631,7 +833,7 @@ async fn build_framework_brains(
         let speculative_runtime = build_runtime_agent_with_tools(
             speculative_spec,
             Arc::clone(&speculative_hooks),
-            speculative_tools(Arc::clone(reservation_store)),
+            policies.speculative_tools.clone(),
         )
         .await?;
         Some(Arc::new(AiAgentsCognitiveAgent::new(
@@ -642,41 +844,8 @@ async fn build_framework_brains(
         None
     };
 
-    // The controller spec backs both the floor brain and the slot extractor,
-    // but they must not share a runtime: root turns serialize per runtime, and
-    // a slot extraction running during a floor decision would deadlock the tick.
-    let (interaction_brain, slot_extractor): (Arc<dyn InteractionBrain>, Arc<dyn SlotExtractor>) =
-        match &config.agents.interaction.spec {
-            Some(spec) if config.agents.interaction.enabled => {
-                let brain_runtime = build_runtime_agent(spec, VoiceAgentHooks::new()).await;
-                let extractor_runtime = build_runtime_agent(spec, VoiceAgentHooks::new()).await;
-
-                let brain: Arc<dyn InteractionBrain> = match brain_runtime {
-                    Ok(runtime) => Arc::new(RuntimeInteractionBrain::new(
-                        runtime,
-                        config.agents.interaction.timeout_ms,
-                    )),
-                    Err(error) => {
-                        tracing::warn!(%error, "interaction brain unavailable; reflex policy only");
-                        Arc::new(NoopInteractionBrain)
-                    }
-                };
-
-                let extractor: Arc<dyn SlotExtractor> = match extractor_runtime {
-                    Ok(runtime) => Arc::new(RuntimeSlotExtractor::new(runtime)),
-                    Err(error) => {
-                        tracing::warn!(%error, "slot extractor unavailable; using heuristics");
-                        Arc::new(crate::semantics::extractor::HeuristicKoreanSlotExtractor)
-                    }
-                };
-
-                (brain, extractor)
-            }
-            _ => (
-                Arc::new(NoopInteractionBrain),
-                Arc::new(crate::semantics::extractor::HeuristicKoreanSlotExtractor),
-            ),
-        };
+    let interaction_brain = configured_semantic_brain(config);
+    let slot_extractor = crate::semantics::extractor::configured_fallback(&config.turn_control);
 
     let deep_worker: Option<Arc<dyn DeepWorker>> = match &config.agents.deep.spec {
         Some(spec) if config.agents.deep.enabled => {
@@ -778,6 +947,16 @@ struct MediaState {
     vad: EnergyVad,
     channels: u16,
     manual_commit: bool,
+    /// Samples at the ASR rate to keep sending after speech ends before a manual commit.
+    commit_delay_samples: usize,
+    /// A manual commit waiting for its trailing audio: the connection generation it belongs to and the samples still to send.
+    pending_commit: Option<(u64, usize)>,
+    /// Silent samples after which an idle commit is sent; zero disables idle commits.
+    idle_commit_samples: usize,
+    /// Samples sent since the last commit while nobody was speaking.
+    idle_samples: usize,
+    /// One entry per commit not yet answered by a Final, in order: true for an idle commit, whose empty Final is not forwarded.
+    commit_kinds: std::collections::VecDeque<bool>,
     identity: AsrIdentity,
 }
 
@@ -797,6 +976,11 @@ enum AsrLinkState {
         token: CancellationToken,
     },
     Ready(AsrConnection),
+    // Input may close before the queued terminal is polled; preserve its retry classification.
+    Draining {
+        connection: AsrConnection,
+        due: tokio::time::Instant,
+    },
     RetryWaiting {
         due: tokio::time::Instant,
     },
@@ -846,7 +1030,7 @@ impl AsrLink {
                     attempt.abort();
                 }
             }
-            AsrLinkState::Ready(mut connection) => {
+            AsrLinkState::Ready(mut connection) | AsrLinkState::Draining { mut connection, .. } => {
                 connection.control.cancel();
                 self.cleanup.spawn(async move {
                     let _ = tokio::time::timeout(
@@ -873,7 +1057,7 @@ impl AsrLink {
     /// Cancels a ready connection and schedules a fresh reconnect. The queued
     /// audio dies with the connection; it is never replayed.
     async fn drop_connection(&mut self) {
-        if let AsrLinkState::Ready(mut connection) =
+        if let AsrLinkState::Ready(mut connection) | AsrLinkState::Draining { mut connection, .. } =
             std::mem::replace(&mut self.state, AsrLinkState::Stopped)
         {
             connection.control.cancel();
@@ -901,7 +1085,9 @@ impl Drop for AsrLink {
                 token.cancel();
                 attempt.abort();
             }
-            AsrLinkState::Ready(connection) => connection.control.cancel(),
+            AsrLinkState::Ready(connection) | AsrLinkState::Draining { connection, .. } => {
+                connection.control.cancel()
+            }
             _ => {}
         }
     }
@@ -933,6 +1119,17 @@ async fn poll_link(link: &mut AsrLink) -> LinkPoll {
             Ok(None) => LinkPoll::ConnectionClosed,
             Err(error) => LinkPoll::ConnectionError(error.to_string()),
         },
+        AsrLinkState::Draining { connection, due } => {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(*due) => LinkPoll::ConnectionError("ASR input closed without terminal within 1s".into()),
+                event = connection.events.next_event() => match event {
+                    Ok(Some(event)) => LinkPoll::Event(event),
+                    Ok(None) => LinkPoll::ConnectionClosed,
+                    Err(error) => LinkPoll::ConnectionError(error.to_string()),
+                }
+            }
+        }
         AsrLinkState::RetryWaiting { due } => {
             tokio::time::sleep_until(*due).await;
             LinkPoll::RetryDue
@@ -1012,6 +1209,15 @@ async fn run_media_worker(args: MediaWorkerArgs) {
         vad: EnergyVad::new(config.vad.clone()),
         channels: 1,
         manual_commit: config.asr.manual_commit,
+        commit_delay_samples: (config.asr.commit_delay_ms
+            * u64::from(config.audio.input_sample_rate_hz)
+            / 1_000) as usize,
+        pending_commit: None,
+        idle_commit_samples: (config.asr.idle_commit_ms
+            * u64::from(config.audio.input_sample_rate_hz)
+            / 1_000) as usize,
+        idle_samples: 0,
+        commit_kinds: std::collections::VecDeque::new(),
         identity: AsrIdentity::default(),
     };
     let mut link = AsrLink::new();
@@ -1254,10 +1460,15 @@ async fn handle_asr_event(
             )
         }
         AsrEvent::Final { utterance_id, text } => {
+            let idle_commit = state.commit_kinds.pop_front().unwrap_or(false);
             let Some((utterance_id, transcript)) = state.identity.map_final(utterance_id, text)
             else {
                 return true;
             };
+            // An idle commit only keeps the recognizer's buffer short; its empty Final is not an utterance.
+            if idle_commit && transcript.trim().is_empty() {
+                return true;
+            }
             emit(
                 event_tx,
                 VoiceEvent::AsrUtteranceFinal {
@@ -1364,8 +1575,54 @@ async fn handle_connection_loss(
     }
 
     state.identity.reset_generation();
+    state.pending_commit = None;
+    state.idle_samples = 0;
+    state.commit_kinds.clear();
     link.drop_connection().await;
     true
+}
+
+/// Whether the manual commit is due after `pushed` more samples were admitted.
+/// Speech ending starts the countdown; a commit never crosses into another connection generation.
+fn commit_due(state: &mut MediaState, speech_ended: bool, generation: u64, pushed: usize) -> bool {
+    if !state.manual_commit {
+        return false;
+    }
+    if speech_ended {
+        if state.commit_delay_samples == 0 {
+            return true;
+        }
+        state.pending_commit = Some((generation, state.commit_delay_samples));
+        return false;
+    }
+    match state.pending_commit {
+        Some((pending, _)) if pending != generation => {
+            state.pending_commit = None;
+            false
+        }
+        Some((_, left)) if left <= pushed => {
+            state.pending_commit = None;
+            true
+        }
+        Some((pending, left)) => {
+            state.pending_commit = Some((pending, left - pushed));
+            false
+        }
+        None => false,
+    }
+}
+
+/// Whether an idle commit is due: nobody is speaking or about to, no speech commit is pending, and enough silence has been sent since the last commit.
+fn idle_commit_due(state: &mut MediaState, pushed: usize) -> bool {
+    if !state.manual_commit || state.idle_commit_samples == 0 {
+        return false;
+    }
+    if state.vad.is_speaking() || state.vad.onset_pending() || state.pending_commit.is_some() {
+        state.idle_samples = 0;
+        return false;
+    }
+    state.idle_samples = state.idle_samples.saturating_add(pushed);
+    state.idle_samples >= state.idle_commit_samples
 }
 
 /// Outcome of admitting one audio frame to the provider connection.
@@ -1447,6 +1704,10 @@ async fn handle_audio_frame(
     // never waits on the network.
     let transition = state.vad.process(&resampled, now_us);
     let speech_ended = matches!(transition, crate::vad::VadTransition::SpeechEnded { .. });
+    if matches!(transition, crate::vad::VadTransition::SpeechStarted { .. }) {
+        // Speech resumed before the trailing audio ran out: it is the same utterance.
+        state.pending_commit = None;
+    }
 
     let event = match transition {
         crate::vad::VadTransition::SpeechStarted { probability } => {
@@ -1485,11 +1746,16 @@ async fn handle_audio_frame(
             true
         };
     }
+    let pushed = resampled.len();
     let outcome = match &mut link.state {
         AsrLinkState::Ready(connection) => {
             match connection.input.try_push_audio(resampled) {
                 Ok(AsrAudioPush::Accepted) => {
-                    if speech_ended && state.manual_commit {
+                    let speech_commit = commit_due(state, speech_ended, link.generation, pushed);
+                    let idle_commit = !speech_commit && idle_commit_due(state, pushed);
+                    if speech_commit || idle_commit {
+                        state.idle_samples = 0;
+                        state.commit_kinds.push_back(idle_commit);
                         // The commit follows its audio in the same generation;
                         // a failed audio admission never commits onto a fresh
                         // connection.
@@ -1511,7 +1777,11 @@ async fn handle_audio_frame(
                 }
             }
         }
-        _ => AdmitOutcome::NoConnection,
+        _ => {
+            state.pending_commit = None;
+            state.idle_samples = 0;
+            AdmitOutcome::NoConnection
+        }
     };
 
     match outcome {
@@ -1531,15 +1801,17 @@ async fn handle_audio_frame(
             .await
         }
         AdmitOutcome::ConnectionLost => {
-            handle_connection_loss(
-                state,
-                link,
-                event_tx,
-                meta_factory,
-                metrics,
-                "asr connection lost during input".to_string(),
-            )
-            .await
+            state.commit_kinds.clear();
+            state.idle_samples = 0;
+            if let AsrLinkState::Ready(connection) =
+                std::mem::replace(&mut link.state, AsrLinkState::Stopped)
+            {
+                link.state = AsrLinkState::Draining {
+                    connection,
+                    due: tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                };
+            }
+            true
         }
     }
 }

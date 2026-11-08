@@ -29,6 +29,7 @@ pub enum ServerMessage {
 /// heard, so a client that under-reports corrupts the agent's context.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ClientControlMessage {
     /// Sent once before the first audio frame.
     ///

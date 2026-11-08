@@ -1,0 +1,74 @@
+# Cartesia TTS with typed input, not Cartesia STT.
+# Requires CARTESIA_API_KEY, CARTESIA_VOICE_ID, and OPENAI_API_KEY.
+# The task agent and Cartesia send data externally and may incur charges.
+version: 1
+
+audio:
+  input_sample_rate_hz: 16000
+  output_sample_rate_hz: 24000
+  frame_ms: 20
+
+asr:
+  provider: inject
+  locale: ko-KR
+  manual_commit: false
+
+tts:
+  provider: cartesia
+  endpoint: wss://api.cartesia.ai/tts/websocket
+  model: sonic-3.6
+  api_key_env: CARTESIA_API_KEY
+  voice: ""
+  voice_env: CARTESIA_VOICE_ID
+  language: ko
+  sample_rate_hz: 24000
+  open_timeout_ms: 10000
+  request_timeout_ms: 30000
+  max_input_bytes: 65536
+  cartesia:
+    api_version: "2026-08-14"
+    max_buffer_delay_ms: 0
+  premade:
+    enabled: false
+
+turn_control:
+  slot_fallback: neutral
+
+speech:
+  # Reply of the keyless mock task agent.
+  # This and the other spoken texts below are in the sample's session language (tts.language); the task agent writes its own replies in that language.
+  mock_reply: "예약할 날짜와 시간, 인원을 알려 주세요."
+  hard_stop_ack_text: "네, 멈췄어요."
+  backchannel_text: "네"
+  failure_text: "죄송합니다. 응답을 준비하지 못했어요. 다시 말씀해 주세요."
+  # Outcomes a reply may name.
+  # The model writes the words; the runtime checks the named outcome against the tools executed in that turn.
+  outcomes:
+    availability_checked:
+      operation: search_availability
+      class: factual
+      receipt_fields: {status: searched}
+      bindings: [date, time, party_size]
+    reserved:
+      operation: reserve_restaurant
+      class: transactional
+      receipt_fields: {status: committed}
+      bindings: [restaurant_id, date, time, party_size, customer_name, window_seat_requested]
+      argument_defaults: {window_seat_requested: false}
+
+agents:
+  interaction:
+    enabled: true
+    spec: ../../agents/voice-interaction.yaml
+    timeout_ms: 1500
+  task:
+    spec: ../../agents/reservation.yaml
+    timeout_ms: 30000
+
+observability:
+  event_log: true
+  event_log_dir: target/voice-traces
+  include_sensitive_payloads: false
+
+dev:
+  allow_text_injection: true

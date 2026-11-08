@@ -16,6 +16,8 @@ pub struct InteractionSnapshot {
     pub latest_partial: String,
     pub stable_prefix: String,
     pub turn_candidate: String,
+    pub heard_assistant: String,
+    pub recent_user_turns: Vec<String>,
 
     pub floor_state: FloorState,
     pub task_state: TaskState,
@@ -37,6 +39,17 @@ impl InteractionSnapshot {
             latest_partial: view.current_hypothesis.clone(),
             stable_prefix: view.stable_prefix.clone(),
             turn_candidate: turn_candidate.to_string(),
+            heard_assistant: String::new(),
+            recent_user_turns: view
+                .committed_user_turns
+                .iter()
+                .rev()
+                .take(2)
+                .map(|turn| turn.transcript.chars().take(512).collect())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
             floor_state: view.floor,
             task_state: view.task,
             speech_state: view.speech,
@@ -60,6 +73,8 @@ impl Default for InteractionSnapshot {
             latest_partial: String::new(),
             stable_prefix: String::new(),
             turn_candidate: String::new(),
+            heard_assistant: String::new(),
+            recent_user_turns: Vec::new(),
             floor_state: FloorState::Idle,
             task_state: TaskState::None,
             speech_state: SpeechState::Silent,

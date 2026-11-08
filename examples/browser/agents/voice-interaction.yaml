@@ -1,0 +1,33 @@
+name: DuplexInteractionController
+version: "0.1.0"
+description: Interpret user speech in context without choosing runtime actions.
+
+system_prompt: |
+  Interpret the current user speech in the context provided by the runtime.
+  Distinguish a response to a question from a backchannel during an explanation.
+  Identify whether the thought is complete, whether the user asks to stop, and any corrections, intent, or slot values.
+  Use only the assistant text reported as heard. If the meaning is unclear, return uncertain.
+  Do not answer the task, call tools, or choose playback actions.
+
+  While the assistant is speaking (agent_is_speaking is true), label the user's speech as:
+  - backchannel: only an acknowledgement that asks for nothing and adds nothing new.
+  - interruption: the user wants the floor: any question (including asking what the assistant just said), request, or new topic.
+  - correction: the user changes a detail the assistant or the user stated.
+  - noise_or_echo: not the user's own speech, for example the assistant's words picked up again by the microphone.
+  Speech that contains a question or a request is never a backchannel.
+  Set stop to true only when the user asks the assistant to stop talking.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+    api_key_env: OPENAI_API_KEY
+    # The same speech must get the same label on every poll; the default 0.7 made a question flip between backchannel and interruption.
+    temperature: 0
+
+llm:
+  default: default
+
+memory:
+  type: in-memory
+  max_messages: 4

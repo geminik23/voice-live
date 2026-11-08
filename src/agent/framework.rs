@@ -8,13 +8,11 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, mpsc, watch};
 
-use ai_agents::agent::{
-    Agent, AgentBuilder, AgentResponse, AgentStreamEvent, RuntimeAgent, StreamChunk,
-};
+use ai_agents::agent::{Agent, AgentBuilder, AgentStreamEvent, RuntimeAgent, StreamChunk};
 use ai_agents::hooks::AgentHooks;
-use ai_agents::llm::Role;
+use ai_agents::llm::{ChatMessage, LLMProvider, Role};
 use ai_agents::memory::{InMemoryStore, Memory, MemoryConfig, MemorySnapshot};
-use ai_agents::tools::{Tool, ToolExecutionRecord, ToolResult};
+use ai_agents::tools::Tool;
 
 use crate::agent::{
     AgentTurnRequest, AgentTurnStream, ChannelAgentTurnStream, CognitiveAgent, CognitiveEvent,
@@ -30,86 +28,7 @@ use crate::interaction::{
 use crate::semantics::frame::SemanticFrame;
 use crate::semantics::{SlotOperation, SlotUpdate};
 
-/// Hooks bridge that forwards authoritative tool execution evidence into the
-/// active turn's event channel. A runtime serializes root turns, so a single
-/// bridge slot per agent instance is safe.
-pub struct VoiceAgentHooks {
-    bridge: Mutex<HooksBridge>,
-}
-
-#[derive(Default)]
-struct HooksBridge {
-    tx: Option<mpsc::Sender<CognitiveEvent>>,
-    task_id: Option<TaskId>,
-    thought_epoch: u64,
-}
-
-impl VoiceAgentHooks {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            bridge: Mutex::new(HooksBridge::default()),
-        })
-    }
-
-    fn snapshot(&self) -> (Option<mpsc::Sender<CognitiveEvent>>, Option<TaskId>, u64) {
-        let bridge = self.bridge.lock();
-        (bridge.tx.clone(), bridge.task_id, bridge.thought_epoch)
-    }
-
-    /// Clears the bridge only if it still belongs to `task_id`.
-    ///
-    /// A cancelled turn's spawned task can finish *after* the next turn has
-    /// already installed its own sender. An unconditional reset would then
-    /// silence the live turn's `ToolExecuted` evidence, and a transactional
-    /// claim with no execution record is rejected by the claim gate: a
-    /// reservation that really happened would never be spoken.
-    fn release(&self, task_id: TaskId) {
-        let mut bridge = self.bridge.lock();
-        if bridge.task_id == Some(task_id) {
-            *bridge = HooksBridge::default();
-        }
-    }
-}
-
-impl Default for VoiceAgentHooks {
-    fn default() -> Self {
-        Self {
-            bridge: Mutex::new(HooksBridge::default()),
-        }
-    }
-}
-
-#[async_trait]
-impl AgentHooks for VoiceAgentHooks {
-    async fn on_tool_start(&self, tool: &str, args: &Value) {
-        let (tx, _, _) = self.snapshot();
-        if let Some(tx) = tx {
-            let _ = tx
-                .send(CognitiveEvent::ToolStarted {
-                    tool: tool.to_string(),
-                    args: args.clone(),
-                })
-                .await;
-        }
-    }
-
-    async fn on_tool_complete(&self, _tool: &str, _result: &ToolResult, _duration_ms: u64) {}
-
-    async fn on_tool_execution_record(&self, record: &ToolExecutionRecord) {
-        let (tx, _, _) = self.snapshot();
-        if let Some(tx) = tx {
-            let _ = tx
-                .send(CognitiveEvent::ToolExecuted {
-                    tool: record.canonical_id.clone(),
-                    call_id: record.call_id.clone(),
-                    executed: record.executed,
-                })
-                .await;
-        }
-    }
-
-    async fn on_response(&self, _response: &AgentResponse) {}
-}
+pub use super::proof::VoiceAgentHooks;
 
 /// Runtime context key the adapter sets before every turn. Agent specs render
 /// it as `{{ context.voice.brief }}` and `{{ context.voice.idempotency_key }}`.
@@ -296,13 +215,18 @@ pub struct AiAgentsCognitiveAgent {
     runtime: Arc<RuntimeAgent>,
     hooks: Arc<VoiceAgentHooks>,
     turn_memory: Option<Arc<TurnMemory>>,
+    actor_id: String,
 }
 
 impl AiAgentsCognitiveAgent {
     /// Memory is left entirely to the framework. For side agents whose output
     /// never reaches the user, such as speculative reads.
     pub fn new(runtime: Arc<RuntimeAgent>, hooks: Arc<VoiceAgentHooks>) -> Self {
+        let actor_id = runtime
+            .actor_id()
+            .unwrap_or_else(|| format!("voice-session-{}", uuid::Uuid::new_v4()));
         Self {
+            actor_id,
             runtime,
             hooks,
             turn_memory: None,
@@ -317,7 +241,11 @@ impl AiAgentsCognitiveAgent {
         hooks: Arc<VoiceAgentHooks>,
         memory: Arc<dyn Memory>,
     ) -> Self {
+        let actor_id = runtime
+            .actor_id()
+            .unwrap_or_else(|| format!("voice-session-{}", uuid::Uuid::new_v4()));
         Self {
+            actor_id,
             runtime,
             hooks,
             turn_memory: Some(Arc::new(TurnMemory {
@@ -388,10 +316,10 @@ pub async fn build_runtime_agent_with_memory(
         .await?
         .auto_configure_spawner()
         .await?
-        .hooks(hooks as Arc<dyn AgentHooks>);
+        .hooks(Arc::clone(&hooks) as Arc<dyn AgentHooks>);
 
     for tool in tools {
-        builder = builder.tool(tool);
+        builder = builder.tool(hooks.bind_tool(tool));
     }
 
     if let Some(memory) = memory {
@@ -422,12 +350,12 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
         let (tx, rx) = mpsc::channel::<CognitiveEvent>(256);
         let (finished_tx, finished_rx) = watch::channel(false);
 
-        {
-            let mut bridge = self.hooks.bridge.lock();
-            bridge.tx = Some(tx.clone());
-            bridge.task_id = Some(request.task_id);
-            bridge.thought_epoch = request.thought_epoch;
-        }
+        let origin_token = self
+            .hooks
+            .admit(request.task_id, request.thought_epoch, tx.clone())?;
+        let actor_context = ai_agents::TurnActorContext::new()
+            .with_origin_actor(self.actor_id.clone())
+            .with_sender_agent(origin_token);
 
         let task_id = request.task_id;
 
@@ -447,7 +375,9 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
         let input = request.input;
 
         tokio::spawn(async move {
-            let stream = runtime.chat_stream_events(&input).await;
+            let stream = runtime
+                .chat_stream_events_with_actor_context(&input, actor_context)
+                .await;
 
             let mut stream = match stream {
                 Ok(stream) => stream,
@@ -484,6 +414,8 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
                             // ToolStarted is forwarded by the hook with its
                             // complete argument object, so this chunk is a duplicate.
                             StreamChunk::ToolCallStart { .. } => None,
+                            // A bound tool's completion also comes from the hook.
+                            StreamChunk::ToolResult { name, .. } if hooks.is_bound(&name) => None,
                             StreamChunk::ToolResult {
                                 name,
                                 output,
@@ -583,6 +515,93 @@ impl CognitiveAgent for AiAgentsCognitiveAgent {
     }
 }
 
+/// Stateless semantic inference using the configured provider without conversation memory.
+pub struct RuntimeSemanticBrain {
+    provider: Arc<dyn LLMProvider>,
+    system_prompt: String,
+    /// Set while requests keep failing, so a broken model or key is logged once instead of on every utterance.
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl RuntimeSemanticBrain {
+    pub fn new(provider: Arc<dyn LLMProvider>, system_prompt: String) -> Self {
+        Self {
+            provider,
+            system_prompt,
+            failing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Callers fall back to neutral timing on None; this keeps the reason visible.
+    fn report(&self, failure: Option<String>) {
+        use std::sync::atomic::Ordering;
+        match failure {
+            Some(reason) if !self.failing.swap(true, Ordering::Relaxed) => {
+                tracing::warn!(%reason, "semantic interpretation unavailable; using neutral timing")
+            }
+            Some(reason) => tracing::debug!(%reason, "semantic interpretation still unavailable"),
+            None if self.failing.swap(false, Ordering::Relaxed) => {
+                tracing::info!("semantic interpretation recovered")
+            }
+            None => {}
+        }
+    }
+}
+
+#[async_trait]
+impl InteractionBrain for RuntimeSemanticBrain {
+    async fn decide(&self, _: InteractionSnapshot) -> Option<InteractionDecisionEnvelope> {
+        None
+    }
+
+    fn supports_semantics(&self) -> bool {
+        true
+    }
+
+    async fn assess(
+        &self,
+        snapshot: InteractionSnapshot,
+    ) -> Option<crate::interaction::SemanticAssessment> {
+        let input = serde_json::to_string(&snapshot).ok()?;
+        if input.len() > 16_384 || self.system_prompt.len() > 16_384 {
+            return None;
+        }
+        let system = format!(
+            "{}\nInterpret the user's speech in context. Return only JSON with state \
+             (uncertain, incomplete, complete, backchannel, interruption, correction, answer, side_speech, noise_or_echo), \
+             complete (boolean or null), stop (boolean), negated (boolean), intent (string or null), updates (array of slot, operation set/replace/clear, \
+             old_value, new_value, confidence), and confidence (0 to 1). \
+             Do not select playback actions or assume unheard assistant words were delivered.",
+            self.system_prompt
+        );
+        let messages = [ChatMessage::system(&system), ChatMessage::user(&input)];
+        let response = match self.provider.complete(&messages, None).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.report(Some(error.to_string()));
+                return None;
+            }
+        };
+        let assessment = crate::interaction::SemanticAssessment::parse(&response.content);
+        // Labels only, never the transcript: enough to see why a turn was committed, resumed, or discarded.
+        if let Some(value) = &assessment {
+            tracing::debug!(
+                state = ?value.state,
+                complete = ?value.complete,
+                stop = value.stop,
+                confidence = value.confidence,
+                "semantic assessment"
+            );
+        }
+        self.report(
+            assessment
+                .is_none()
+                .then(|| "model reply is not a valid assessment".to_string()),
+        );
+        assessment
+    }
+}
+
 /// Interaction brain backed by a fast controller RuntimeAgent. Output is JSON
 /// and validated by the host before it becomes a decision.
 pub struct RuntimeInteractionBrain {
@@ -603,7 +622,7 @@ impl RuntimeInteractionBrain {
 impl InteractionBrain for RuntimeInteractionBrain {
     async fn decide(&self, snapshot: InteractionSnapshot) -> Option<InteractionDecisionEnvelope> {
         let prompt = format!(
-            "Classify the current Korean user speech state and choose one action.\n\
+            "Classify the current user speech state and choose one action.\n\
              Return JSON only: {{\"user_state\": \"...\", \"action\": \"...\", \"confidence\": 0.0}}\n\
              user_state: incomplete, complete, backchannel, interruption, correction, answer, side_speech, noise_or_echo, uncertain\n\
              action: keep_listening, hold_floor, duck, resume, emit_backchannel, take_floor, abort_speech, commit_turn\n\n\
@@ -681,7 +700,7 @@ impl crate::semantics::SlotExtractor for RuntimeSlotExtractor {
         source_revision: Revision,
     ) -> Vec<SlotUpdate> {
         let prompt = format!(
-            "Extract slot updates from Korean speech. Return JSON only:\n\
+            "Extract slot updates from the supplied speech without assuming its language. Return JSON only:\n\
              {{\"updates\": [{{\"slot\": \"date|time|party_size|...\", \"operation\": \"set|replace|clear\", \
              \"old_value\": <optional>, \"new_value\": <value>, \"confidence\": 0.0}}]}}\n\n\
              Previous frame:\n{}\n\nStable transcript:\n{}",
@@ -695,41 +714,55 @@ impl crate::semantics::SlotExtractor for RuntimeSlotExtractor {
             return Vec::new();
         };
 
-        let Ok(value) = serde_json::from_str::<Value>(response.content.trim()) else {
-            return Vec::new();
-        };
-
-        let Some(updates) = value.get("updates").and_then(|u| u.as_array()) else {
-            return Vec::new();
-        };
-
-        updates
-            .iter()
-            .filter_map(|update| {
-                let slot = update.get("slot")?.as_str()?.to_string();
-                let operation = match update.get("operation")?.as_str()? {
-                    "replace" => SlotOperation::Replace,
-                    "clear" => SlotOperation::Clear,
-                    _ => SlotOperation::Set,
-                };
-                let new_value = update.get("new_value")?.clone();
-                let old_value = update.get("old_value").cloned();
-                let confidence = update
-                    .get("confidence")
-                    .and_then(|c| c.as_f64())
-                    .unwrap_or(0.8) as f32;
-
-                Some(SlotUpdate {
-                    slot,
-                    operation,
-                    old_value,
-                    new_value,
-                    confidence,
-                    source_revision,
-                })
-            })
-            .collect()
+        parse_slot_updates(&response.content, source_revision)
     }
+}
+
+fn parse_slot_updates(raw: &str, source_revision: Revision) -> Vec<SlotUpdate> {
+    if raw.len() > 16_384 {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<Value>(raw.trim()) else {
+        return Vec::new();
+    };
+    let Some(updates) = value.get("updates").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if updates.len() > 32 {
+        return Vec::new();
+    }
+
+    updates
+        .iter()
+        .map(|update| {
+            let slot = update.get("slot")?.as_str()?;
+            if slot.trim().is_empty() || slot.len() > 128 {
+                return None;
+            }
+            let operation = match update.get("operation")?.as_str()? {
+                "set" => SlotOperation::Set,
+                "replace" => SlotOperation::Replace,
+                "clear" => SlotOperation::Clear,
+                _ => return None,
+            };
+            let confidence = match update.get("confidence") {
+                Some(value) => value.as_f64()?,
+                None => 0.8,
+            };
+            if !(0.0..=1.0).contains(&confidence) {
+                return None;
+            }
+            Some(SlotUpdate {
+                slot: slot.to_string(),
+                operation,
+                old_value: update.get("old_value").cloned(),
+                new_value: update.get("new_value")?.clone(),
+                confidence: confidence as f32,
+                source_revision,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 /// Deep worker backed by a separate RuntimeAgent so long work never blocks
@@ -764,5 +797,52 @@ impl crate::session::deep_worker::DeepWorker for RuntimeDeepWorker {
             summary: response.content,
             dependencies: request.dependencies,
         })
+    }
+}
+
+#[cfg(test)]
+mod slot_response_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_or_oversized_slot_responses() {
+        let unknown = r#"{"updates":[{"slot":"date","operation":"delete","new_value":"Friday"}]}"#;
+        assert!(parse_slot_updates(unknown, Revision(1)).is_empty());
+        let invalid_confidence = r#"{"updates":[{"slot":"date","operation":"set","new_value":"Friday","confidence":2}]}"#;
+        assert!(parse_slot_updates(invalid_confidence, Revision(1)).is_empty());
+        let oversized = "x".repeat(16_385);
+        assert!(parse_slot_updates(&oversized, Revision(1)).is_empty());
+        let mixed = r#"{"updates":[{"slot":"date","operation":"set","new_value":"Saturday"},{"slot":"time","operation":"delete","new_value":"19:00"}]}"#;
+        assert!(parse_slot_updates(mixed, Revision(1)).is_empty());
+        let too_many = serde_json::json!({
+            "updates": vec![serde_json::json!({"slot":"date","operation":"set","new_value":"Saturday"}); 33]
+        })
+        .to_string();
+        assert!(parse_slot_updates(&too_many, Revision(1)).is_empty());
+        let valid = r#"{"updates":[{"slot":"date","operation":"set","new_value":"Saturday","confidence":0.9}]}"#;
+        let updates = parse_slot_updates(valid, Revision(2));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].operation, SlotOperation::Set);
+        assert_eq!(updates[0].old_value, None);
+        assert_eq!(updates[0].new_value, serde_json::json!("Saturday"));
+        assert_eq!(updates[0].source_revision, Revision(2));
+    }
+}
+
+#[cfg(test)]
+mod semantic_brain_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn a_failing_model_is_reported_and_its_recovery_clears_the_state() {
+        let mut broken = ai_agents_llm::mock::MockLLMProvider::new("broken");
+        broken.set_error("model_not_found");
+        let brain = RuntimeSemanticBrain::new(Arc::new(broken), String::new());
+        assert!(brain.assess(InteractionSnapshot::default()).await.is_none());
+        assert!(brain.failing.load(Ordering::Relaxed));
+
+        brain.report(None);
+        assert!(!brain.failing.load(Ordering::Relaxed));
     }
 }

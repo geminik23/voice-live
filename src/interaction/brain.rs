@@ -13,6 +13,21 @@ use crate::interaction::{
 #[async_trait]
 pub trait InteractionBrain: Send + Sync {
     async fn decide(&self, snapshot: InteractionSnapshot) -> Option<InteractionDecisionEnvelope>;
+
+    fn supports_semantics(&self) -> bool {
+        false
+    }
+
+    fn is_noop(&self) -> bool {
+        false
+    }
+
+    async fn assess(
+        &self,
+        _snapshot: InteractionSnapshot,
+    ) -> Option<crate::interaction::SemanticAssessment> {
+        None
+    }
 }
 
 /// Production fallback when no interaction agent is configured: the
@@ -23,6 +38,10 @@ pub struct NoopInteractionBrain;
 impl InteractionBrain for NoopInteractionBrain {
     async fn decide(&self, _snapshot: InteractionSnapshot) -> Option<InteractionDecisionEnvelope> {
         None
+    }
+
+    fn is_noop(&self) -> bool {
+        true
     }
 }
 

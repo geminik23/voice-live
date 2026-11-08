@@ -1,0 +1,22 @@
+# Example restaurants for the Korean configuration. The search tool lists these areas in its schema.
+- id: gangnam-table
+  name: 강남 테이블
+  area: 강남
+  available_times: ["18:30", "19:00", "20:00"]
+  parking: true
+  window_seat: true
+  maximum_party_size: 8
+- id: hongdae-kitchen
+  name: 홍대 키친
+  area: 홍대
+  available_times: ["19:00", "19:30"]
+  parking: false
+  window_seat: true
+  maximum_party_size: 6
+- id: seongsu-dining
+  name: 성수 다이닝
+  area: 성수
+  available_times: ["18:00", "19:00", "20:30"]
+  parking: true
+  window_seat: false
+  maximum_party_size: 10

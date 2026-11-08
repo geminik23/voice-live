@@ -19,6 +19,9 @@ turn_control:
   soft_silence_ms: 300
   hard_silence_ms: 700
 
+speech:
+  mock_reply: "Ready."
+
 observability:
   event_log: false
 
@@ -74,4 +77,35 @@ async fn runtime_pipeline_without_gateway() {
     assert!(saw_speech_started, "client must receive speech_started");
     assert!(audio_frames > 0, "client must receive audio chunks");
     assert!(saw_speech_done, "client must receive speech_done");
+}
+
+#[tokio::test]
+async fn network_providers_need_an_explicit_language() {
+    // There is no default language; a network provider must not silently get one.
+    for (yaml, key) in [
+        (
+            "asr:\n  provider: cartesia\nobservability:\n  event_log: false",
+            "asr.locale",
+        ),
+        (
+            "tts:\n  provider: qwen\nobservability:\n  event_log: false",
+            "tts.language",
+        ),
+    ] {
+        let config = VoiceRuntimeConfig::from_yaml_str(yaml).unwrap();
+        let error = VoiceRuntime::build(config).await.err().expect("rejected");
+        assert!(error.to_string().contains(key), "{error}");
+    }
+}
+
+/// A provider whose feature is disabled is named in the error instead of being reported as unknown.
+#[cfg(not(feature = "cartesia"))]
+#[tokio::test]
+async fn a_provider_without_its_feature_names_the_feature() {
+    let config = VoiceRuntimeConfig::from_yaml_str(
+        "asr:\n  provider: cartesia\n  locale: ko-KR\nobservability:\n  event_log: false",
+    )
+    .unwrap();
+    let error = VoiceRuntime::build(config).await.err().expect("rejected");
+    assert!(error.to_string().contains("`cartesia` feature"), "{error}");
 }

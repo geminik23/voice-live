@@ -1,10 +1,10 @@
 # WebSocket protocol
 
-Transport contract between the browser client (`full-duplex-demo/web/index.html`)
+Transport contract between the browser client (`examples/browser/web/index.html`)
 and the Rust gateway.
 
 The message types live in the library (`src/protocol.rs`), while the WebSocket
-adapter lives in the demo (`full-duplex-demo/src/gateway.rs`). The library is
+adapter lives in the browser example (`examples/browser/src/gateway.rs`). The library is
 transport-agnostic.
 
 ## Overview
@@ -15,6 +15,10 @@ transport-agnostic.
 - Audio input: the microphone's **actual** sample rate, 20 ms frames, mono
 - Audio output: mono PCM16 at the response's actual `speech_started.sample_rate` (built-in default 24 kHz)
 - All API keys stay on the server and are never sent to the browser.
+
+Cartesia STT and TTS use this same browser protocol; provider finalize/close commands, connection/context IDs, continuations, and credentials stay server-side. There are no new client messages. Local server VAD controls manual STT finalization. General answers still follow authoritative AgentFinal, every SpeechAct passes the Claim Gate, and playback ACKs retain their existing heard-only meaning. Provider replacement does not establish real microphone or playback verification.
+
+Language-neutral text policies, structured agent replies, invocation proofs, and strict outcome rules are server-side contracts. They add no browser messages or locale negotiation. Existing PCM framing and playback ACKs are unchanged; a rejected strict reply produces no synthesized reply text, only the configured failure text if any. Configure outcome rules or consult the explicit legacy migration rather than changing client wire fields.
 
 ## Client → server
 

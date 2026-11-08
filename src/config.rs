@@ -1,8 +1,13 @@
+//! The `voice-runtime.yaml` configuration types, loaded and validated by [`VoiceRuntimeConfig::from_file`].
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// The `voice-runtime.yaml` configuration.
+///
+/// Every key and its default is documented in the repository's `docs/configuration.md`; unknown keys are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VoiceRuntimeConfig {
@@ -144,6 +149,14 @@ pub struct AsrConfig {
     pub chunk_ms: u64,
     #[serde(default)]
     pub manual_commit: bool,
+    /// With `manual_commit`, how long audio keeps flowing after local speech ends before the commit is sent.
+    /// A recognizer asked to finalize too soon after a short word can return an empty transcript; speech that resumes inside this window stays in the same utterance.
+    #[serde(default = "default_asr_commit_delay_ms")]
+    pub commit_delay_ms: u64,
+    /// With `manual_commit`, how often a commit is sent while nobody is speaking, so the recognizer never holds a long stretch of silence.
+    /// Ink Whisper split an utterance that followed a long silence and returned an empty transcript for its end; `0` disables.
+    #[serde(default = "default_asr_idle_commit_ms")]
+    pub idle_commit_ms: u64,
     #[serde(default = "default_asr_locale")]
     pub locale: String,
     /// Deadline for one provider connect/auth/ready attempt.
@@ -157,7 +170,30 @@ pub struct AsrConfig {
     #[serde(default = "default_asr_input_buffer_ms")]
     pub input_buffer_ms: u64,
     #[serde(default)]
+    pub cartesia: CartesiaAsrConfig,
+    #[serde(default)]
     pub partials: AsrPartialsConfig,
+}
+
+/// Cartesia manual STT limits, validated by its factory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CartesiaAsrConfig {
+    pub api_version: String,
+    pub finalize_timeout_ms: u64,
+    pub finish_timeout_ms: u64,
+    pub max_transcript_bytes: usize,
+}
+
+impl Default for CartesiaAsrConfig {
+    fn default() -> Self {
+        Self {
+            api_version: "2026-08-14".into(),
+            finalize_timeout_ms: 2_000,
+            finish_timeout_ms: 5_000,
+            max_transcript_bytes: 65_536,
+        }
+    }
 }
 
 fn default_asr_provider() -> String {
@@ -176,12 +212,21 @@ fn default_asr_api_key_env() -> String {
     "TOGETHER_API_KEY".into()
 }
 
+fn default_asr_commit_delay_ms() -> u64 {
+    300
+}
+
+fn default_asr_idle_commit_ms() -> u64 {
+    2_000
+}
+
 fn default_chunk_ms() -> u64 {
     160
 }
 
+/// No built-in language: providers that need one must be configured with it.
 fn default_asr_locale() -> String {
-    "ko-KR".into()
+    String::new()
 }
 
 fn default_asr_open_timeout_ms() -> u64 {
@@ -253,7 +298,26 @@ pub struct TtsConfig {
     #[serde(default = "default_tts_max_input_bytes")]
     pub max_input_bytes: usize,
     #[serde(default)]
+    pub cartesia: CartesiaTtsConfig,
+    #[serde(default)]
     pub premade: PremadeConfig,
+}
+
+/// Cartesia-specific options, validated only by its factory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CartesiaTtsConfig {
+    pub api_version: String,
+    pub max_buffer_delay_ms: u64,
+}
+
+impl Default for CartesiaTtsConfig {
+    fn default() -> Self {
+        Self {
+            api_version: "2026-08-14".into(),
+            max_buffer_delay_ms: 0,
+        }
+    }
 }
 
 fn default_tts_provider() -> String {
@@ -284,8 +348,9 @@ fn default_tts_chunk_ms() -> u64 {
     60
 }
 
+/// No built-in language; it is also the reply language given to the task agent.
 fn default_tts_language() -> String {
-    "Korean".into()
+    String::new()
 }
 
 fn default_tts_open_timeout_ms() -> u64 {
@@ -310,6 +375,10 @@ pub struct PremadeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnControlConfig {
+    #[serde(default)]
+    pub text_rules: crate::semantics::text::TextRules,
+    #[serde(default)]
+    pub slot_fallback: SlotFallback,
     #[serde(default = "default_soft_silence_ms")]
     pub soft_silence_ms: u64,
     #[serde(default = "default_hard_silence_ms")]
@@ -320,16 +389,58 @@ pub struct TurnControlConfig {
     pub barge_in: BargeInConfig,
     #[serde(default)]
     pub backchannel: BackchannelConfig,
-    #[serde(default = "default_hard_stop_phrases")]
+    #[serde(default)]
     pub hard_stop_phrases: Vec<String>,
-    #[serde(default = "default_incomplete_endings")]
+    #[serde(default)]
     pub incomplete_endings: Vec<String>,
-    #[serde(default = "default_complete_endings")]
+    #[serde(default)]
     pub complete_endings: Vec<String>,
-    #[serde(default = "default_backchannel_words")]
+    #[serde(default)]
     pub backchannel_words: Vec<String>,
     #[serde(default = "default_answer_min_silence_ms")]
     pub answer_min_silence_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SlotFallback {
+    #[default]
+    Neutral,
+    KoreanExample,
+}
+
+impl TurnControlConfig {
+    /// Explicit compatibility resources for the Korean reservation example.
+    pub fn korean_example() -> Self {
+        Self {
+            hard_stop_phrases: default_hard_stop_phrases(),
+            incomplete_endings: default_incomplete_endings(),
+            complete_endings: default_complete_endings(),
+            backchannel_words: default_backchannel_words(),
+            slot_fallback: SlotFallback::KoreanExample,
+            text_rules: crate::semantics::text::TextRules {
+                correction: vec!["말고|아니|바꿔|변경|다시|정정".into()],
+                negation: vec![r"하지\s*마|싫어|필요\s*없|안\s*(돼|되|해)".into()],
+                intents: [
+                    ("reservation".into(), vec!["예약|booking".into()]),
+                    ("search".into(), vec!["찾아|검색".into()]),
+                    ("cancellation".into(), vec!["취소".into()]),
+                ]
+                .into(),
+                entities: [
+                    ("party_size".into(), r"\d{1,2}\s*(명|사람|인분)".into()),
+                    ("time".into(), r"\d{1,2}\s*시|\d{1,2}:\d{2}".into()),
+                    (
+                        "date".into(),
+                        "오늘|내일|모레|주말|[월화수목금토일]요일".into(),
+                    ),
+                ]
+                .into(),
+            },
+            ..Self::default()
+        }
+    }
 }
 
 fn default_soft_silence_ms() -> u64 {
@@ -582,12 +693,25 @@ impl Default for SpeculativeConfig {
     }
 }
 
+/// Unknown keys are rejected so removed or renamed keys (`mode`, `responses`, `mock_response`) fail at load instead of being ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeechConfig {
     #[serde(default)]
     pub progress_templates: HashMap<String, ProgressTemplate>,
-    #[serde(default = "default_hard_stop_ack")]
+    #[serde(default)]
     pub hard_stop_ack_text: String,
+    #[serde(default)]
+    pub backchannel_text: String,
+    #[serde(default)]
+    pub failure_text: String,
+    /// Business outcomes a strict reply may name, checked against the turn's executed tool records.
+    /// The spoken words come from the model.
+    #[serde(default)]
+    pub outcomes: std::collections::BTreeMap<String, crate::speech::render::OutcomeRule>,
+    /// Reply text emitted by the keyless mock task agent.
+    #[serde(default)]
+    pub mock_reply: Option<String>,
     /// How long to wait for a playback acknowledgement before releasing the
     /// speech queue. Speech state only advances on a client ACK, so a
     /// disconnected client would otherwise pin the queue forever. `0` disables.
@@ -601,10 +725,6 @@ pub struct SpeechConfig {
     /// the session summary. Durable history lives in the agent's memory.
     #[serde(default = "default_audible_history_max_clauses")]
     pub audible_history_max_clauses: usize,
-}
-
-fn default_hard_stop_ack() -> String {
-    "네, 멈췄어요.".into()
 }
 
 fn default_playback_ack_timeout_ms() -> u64 {
@@ -652,6 +772,7 @@ impl Default for ToolsConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ToolEffect {
     PureRead,
     IdempotentWrite,
@@ -765,6 +886,7 @@ impl TtsConfig {
 }
 
 impl VoiceRuntimeConfig {
+    /// Loads and validates a YAML file, resolving relative paths such as agent specs against the file's directory.
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)?;
@@ -776,6 +898,7 @@ impl VoiceRuntimeConfig {
         Ok(config)
     }
 
+    /// Parses and validates YAML text; relative paths stay relative to the current directory.
     pub fn from_yaml_str(raw: &str) -> anyhow::Result<Self> {
         let config: VoiceRuntimeConfig = serde_yaml::from_str(raw)?;
         config.validate()?;
@@ -823,15 +946,35 @@ impl VoiceRuntimeConfig {
             anyhow::bail!("turn_control.soft_silence_ms must be below hard_silence_ms");
         }
 
-        if self
-            .turn_control
-            .hard_stop_phrases
-            .iter()
-            .any(|p| p.trim() == "아니")
-        {
-            anyhow::bail!(
-                "turn_control.hard_stop_phrases must not contain '아니'; it is a common \
-                 discourse marker and is handled as a correction cue instead"
+        crate::semantics::text::validate_rules(&self.turn_control)?;
+        crate::speech::render::ConfiguredRenderer::new(&self.speech.outcomes)?;
+        if let Some(reply) = &self.speech.mock_reply {
+            anyhow::ensure!(
+                !reply.trim().is_empty() && reply.len() <= 4096,
+                "speech.mock_reply must contain 1 to 4096 bytes"
+            );
+        }
+        for text in [
+            &self.speech.hard_stop_ack_text,
+            &self.speech.backchannel_text,
+            &self.speech.failure_text,
+        ] {
+            anyhow::ensure!(
+                text.len() <= 4096,
+                "automatic speech resource exceeds 4096 bytes"
+            );
+        }
+        anyhow::ensure!(
+            self.speech.progress_templates.len() <= 128,
+            "too many progress templates"
+        );
+        for template in self.speech.progress_templates.values() {
+            anyhow::ensure!(
+                !template.text.trim().is_empty()
+                    && template.text.len() <= 4096
+                    && template.expire_after_ms > 0
+                    && template.expire_after_ms <= u64::MAX / 1000,
+                "invalid progress resource or expiry"
             );
         }
 
@@ -916,17 +1059,23 @@ agents:
     }
 
     #[test]
-    fn rejects_common_discourse_marker_as_hard_stop() {
-        let error = VoiceRuntimeConfig::from_yaml_str(
+    fn core_accepts_host_owned_stop_vocabulary() {
+        let config = VoiceRuntimeConfig::from_yaml_str(
             r#"
 version: 1
 turn_control:
   hard_stop_phrases: ["아니"]
 "#,
         )
-        .expect_err("아니 must not be an immediate abort phrase");
+        .expect("the host owns stop vocabulary");
 
-        assert!(error.to_string().contains("아니"));
+        assert_eq!(config.turn_control.hard_stop_phrases, ["아니"]);
+        assert!(
+            !TurnControlConfig::korean_example()
+                .hard_stop_phrases
+                .iter()
+                .any(|p| p == "아니")
+        );
     }
 
     #[test]

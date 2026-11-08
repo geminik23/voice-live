@@ -10,6 +10,7 @@ pub const PRIORITY_BACKCHANNEL: u8 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ClaimClass {
     Phatic,
     Process,
@@ -33,6 +34,7 @@ pub enum EvidenceKind {
     ToolExecuted,
     AgentFinal,
     ActionCommit,
+    AuthorizedSpeech,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

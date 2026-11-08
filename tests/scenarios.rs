@@ -8,7 +8,18 @@ macro_rules! scenario_test {
     ($name:ident, $yaml:expr) => {
         #[tokio::test(start_paused = true)]
         async fn $name() {
-            let scenario: Scenario = ScenarioRunner::load_yaml($yaml).expect("scenario parses");
+            let mut scenario: Scenario = ScenarioRunner::load_yaml($yaml).expect("scenario parses");
+            let mut config = scenario.config.take().unwrap_or_default();
+            let korean = voice_live::config::TurnControlConfig::korean_example();
+            config.turn_control.text_rules = korean.text_rules;
+            config.turn_control.slot_fallback = korean.slot_fallback;
+            config.turn_control.hard_stop_phrases = korean.hard_stop_phrases;
+            config.turn_control.complete_endings = korean.complete_endings;
+            config.turn_control.incomplete_endings = korean.incomplete_endings;
+            config.turn_control.backchannel_words = korean.backchannel_words;
+            config.speech.hard_stop_ack_text = "네, 멈췄어요.".into();
+            config.speech.backchannel_text = "네".into();
+            scenario.config = Some(config);
             let report = ScenarioRunner::run(&scenario).await;
 
             if !report.passed {
@@ -43,6 +54,26 @@ macro_rules! scenario_test {
         }
     };
 }
+
+scenario_test!(
+    partial_commit_does_not_repeat_on_late_audio_final,
+    r#"
+name: partial_commit_does_not_repeat_on_late_audio_final
+timeline:
+  - at_ms: 0
+    event: { type: local_speech_started }
+  - at_ms: 100
+    event: { type: asr_partial, utterance_id: 0, revision: 1, text: "첫 요청입니다" }
+  - at_ms: 200
+    event: { type: local_speech_ended }
+  - at_ms: 1600
+    event: { type: asr_final, utterance_id: 0, text: "첫 요청입니다" }
+expect:
+  - type: committed_turn_count
+    exactly: 1
+settle_ms: 3000
+"#
+);
 
 scenario_test!(
     backchannel_ducks_then_resumes,
@@ -280,7 +311,7 @@ timeline:
     event:
       type: asr_partial
       revision: 1
-      text: "토요일 저녁 7시로 예약해줘"
+      text: "금요일 저녁 7시로 예약해줘"
   - at_ms: 300
     event:
       type: local_speech_ended
@@ -302,17 +333,18 @@ agent_script:
 expect:
   - type: audible_excludes
     text: "금요일 기준"
-  - type: metric_at_least
-    name: voice_task_stale_result_dropped_total
-    value: 1
+  - type: turn_resolved
+    resolution: discard
+  - type: turn_resolution_count
+    exactly: 1
 settle_ms: 1000
 "#
 );
 
 scenario_test!(
-    transactional_claim_requires_action_commit,
+    executed_write_records_an_action_commit,
     r#"
-name: transactional_claim_requires_action_commit
+name: executed_write_records_an_action_commit
 config:
   tools:
     effects:
@@ -409,6 +441,13 @@ config:
   tools:
     effects:
       reserve_restaurant: transactional_write
+  speech:
+    outcomes:
+      reserved:
+        operation: reserve_restaurant
+        class: transactional
+        receipt_fields: {status: committed}
+        bindings: [date]
 timeline:
   - at_ms: 0
     event:
@@ -431,7 +470,8 @@ agent_script:
     success: true
   - after_ms: 400
     type: final
-    text: "예약이 완료되었습니다."
+    # Names a business outcome, but no execution record backs it.
+    text: '{"text":"예약이 완료되었습니다.","outcome":"reserved"}'
 expect:
   - type: audible_excludes
     text: "예약이 완료되었습니다"
@@ -535,7 +575,7 @@ expect:
     exactly: 2
   - type: turn_resolved
     resolution: audible
-    heard_equals: "[응답이 전달되지 않음]"
+    heard_equals: "[voice-live:undelivered]"
   - type: never_event
     event: playback_completed
 settle_ms: 6000
@@ -733,12 +773,42 @@ expect:
   - type: turn_resolved
     resolution: audible
     heard_contains: "확인했습니다."
-  # The cut is recorded, and the unheard end of the second clause is gone.
+  # The cut is recorded (mid-clause or before the second clause, depending on how far playback got), and the unheard end of the second clause is gone.
   - type: turn_resolved
     resolution: audible
-    heard_contains: "[중단됨"
+    heard_contains: "[voice-live:"
     heard_excludes: "가능합니다"
 settle_ms: 2000
+"#
+);
+
+scenario_test!(
+    reply_longer_than_the_audible_history_resolves_as_heard,
+    r#"
+name: reply_longer_than_the_audible_history_resolves_as_heard
+config:
+  speech:
+    audible_history_max_clauses: 2
+agent_final: "One. Two. Three. Four. Five."
+timeline:
+  - at_ms: 0
+    event:
+      type: local_speech_started
+  - at_ms: 100
+    event:
+      type: asr_final
+      text: "read me the list"
+  - at_ms: 400
+    event:
+      type: local_speech_ended
+expect:
+  # Every clause played in full; the bounded history must not turn the early ones into undelivered markers.
+  - type: turn_resolved
+    resolution: audible
+    heard_equals_final: true
+  - type: turn_resolution_count
+    exactly: 1
+settle_ms: 4000
 "#
 );
 
@@ -754,7 +824,7 @@ timeline:
     event:
       type: asr_partial
       revision: 1
-      text: "토요일 저녁 7시로 예약해줘"
+      text: "금요일 저녁 7시로 예약해줘"
   - at_ms: 300
     event:
       type: local_speech_ended
@@ -807,7 +877,7 @@ expect:
   # Keeps the user/assistant pairing, but says the reply never arrived.
   - type: turn_resolved
     resolution: audible
-    heard_equals: "[응답이 전달되지 않음]"
+    heard_equals: "[voice-live:undelivered]"
 settle_ms: 4000
 "#
 );
@@ -820,6 +890,13 @@ config:
   tools:
     effects:
       reserve_restaurant: transactional_write
+  speech:
+    outcomes:
+      reserved:
+        operation: reserve_restaurant
+        class: transactional
+        receipt_fields: {status: committed}
+        bindings: [date]
 timeline:
   - at_ms: 0
     event:
@@ -842,7 +919,8 @@ agent_script:
     success: true
   - after_ms: 400
     type: final
-    text: "예약이 완료되었습니다."
+    # Names a business outcome, but no execution record backs it.
+    text: '{"text":"예약이 완료되었습니다.","outcome":"reserved"}'
 expect:
   # The claim gate refused to speak an unverified reservation. Memory must not
   # keep it as though the user was told the booking succeeded.
@@ -851,7 +929,7 @@ expect:
     value: 1
   - type: turn_resolved
     resolution: audible
-    heard_equals: "[응답이 전달되지 않음]"
+    heard_equals: "[voice-live:undelivered]"
     heard_excludes: "예약이 완료"
 settle_ms: 3500
 "#

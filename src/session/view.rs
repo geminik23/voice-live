@@ -46,6 +46,13 @@ pub struct CommittedUserTurn {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvidence {
+    AuthorizedSpeech {
+        task_id: TaskId,
+        speech_id: SpeechId,
+        speech_epoch: u64,
+        text: String,
+        class: crate::speech::ClaimClass,
+    },
     ToolStarted {
         task_id: TaskId,
         tool: String,
@@ -164,6 +171,8 @@ impl SessionView {
                     committed_at_us: meta.monotonic_us,
                 });
                 self.task = TaskState::Committed;
+                self.assistant_asked_question = false;
+                self.expected_answer_type = None;
                 self.floor = FloorState::Idle;
                 self.current_hypothesis.clear();
                 self.stable_prefix.clear();
@@ -254,8 +263,6 @@ impl SessionView {
                     if !self.local_vad_active && self.floor == FloorState::AgentHolding {
                         self.floor = FloorState::Idle;
                     }
-                    self.assistant_asked_question = false;
-                    self.expected_answer_type = None;
                 }
             }
 

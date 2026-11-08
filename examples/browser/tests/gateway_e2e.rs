@@ -8,9 +8,7 @@ use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use voice_live::{VoiceRuntime, VoiceRuntimeConfig};
 
-#[path = "../src/gateway.rs"]
-mod gateway;
-use gateway::{AppState, build_router};
+use browser_example::gateway::{AppState, build_router};
 
 const CONFIG: &str = r#"
 version: 1
@@ -23,6 +21,9 @@ tts:
 turn_control:
   soft_silence_ms: 300
   hard_silence_ms: 700
+
+speech:
+  mock_reply: "Ready."
 
 observability:
   event_log: false

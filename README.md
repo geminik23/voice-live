@@ -1,96 +1,53 @@
 # voice-live
 
-A full-duplex voice interaction runtime and browser demo. It combines existing streaming STT, an LLM, and streaming TTS to support simultaneous listening and speaking, barge-in, backchannels, asynchronous tools, and progress speech while reasoning.
+A Rust runtime for full-duplex voice interaction, inspired by GPT-Live and built as a use case for `ai-agents`. It combines streaming speech recognition, an LLM agent, and streaming speech synthesis so an assistant can listen while speaking. [ai-agents on GitHub](https://github.com/geminik23/ai-agents) · [OpenAI's GPT-Live engineering write-up](https://openai.com/index/continuous-voice-interaction-with-gpt-live/)
 
-Reasoning is delegated to [`ai-agents`](https://crates.io/crates/ai-agents), an **optional dependency** behind the default `framework` feature. The deterministic core builds and runs tests without it using `--no-default-features`.
-
-## Supported platforms
-
-The library and demo server target **native Linux, Windows, and macOS**. Docker and WSL are not required for native execution. A supported target is not the same as a verified target: passing Rust tests does not establish browser audio, physical microphone, or paid-provider behavior. See the [platform validation guide](docs/testing.md#platform-validation) for evidence and the [deployment guide](docs/deployment.md) for build requirements and browser limitations.
-
-## Layout
-
-```text
-voice-live/                   root package: runtime library
-├── src/                      runtime core (events, epochs, claim gate, scenarios)
-│   └── protocol.rs           client message types (transport-agnostic)
-├── tests/                    virtual-time scenarios and provider contract tests
-├── full-duplex-demo/         demo application (workspace member)
-│   ├── src/main.rs           entry point
-│   ├── src/gateway.rs        axum WebSocket transport adapter
-│   ├── configs/              voice-runtime.yaml
-│   ├── agents/               task and interaction agent YAML specs
-│   └── web/                  browser client (WebSocket PCM)
-├── docs/                     committed documentation and source of truth
-├── AGENTS.md                 contribution, documentation, and architecture rules
-└── Dockerfile
-```
+**Experimental (0.1).** Planned work includes reducing response latency, improving interruption handling, and validating longer sessions. The public API may change between minor releases. [Known limitations](#known-limitations)
 
 ## Quick start
 
-Run these commands from the repository root:
+Run both examples from the repository root with Rust 1.88 or later.
+
+### Terminal
 
 ```sh
-# Test the library only; no external API required.
-cargo test
-
-# Include the demo's tests.
-cargo test --workspace
-
-# Start the keyless demo (text injection + mock ASR/TTS/agent).
-cargo run -p full-duplex-demo -- --config full-duplex-demo/configs/voice-runtime.yaml
-# Open http://localhost:8080 and click Start session.
-# Enter text in the input field to submit a user utterance.
+cargo run --example quickstart
 ```
 
-The mock TTS produces **silent PCM**. To verify audio chunks and playback ACKs without API keys, follow the [manual browser check](docs/deployment.md#manual-browser-playback-ack-check).
+The terminal example sends a line of text and acknowledges a silent reply. It runs without API keys. [Quickstart source](examples/quickstart.rs)
 
-To use real providers, configure environment variables without committing secrets. For Linux/macOS Bash or Zsh, or Windows Git Bash:
+### Browser demo
 
-```bash
-export TOGETHER_API_KEY=...      # Nemotron streaming ASR
-export DASHSCOPE_API_KEY=...      # Qwen realtime TTS
-export QWEN_VOICE_ID=...         # TTS voice, as named by tts.voice_env
-export OPENAI_API_KEY=...        # Task/Interaction LLM
+```sh
+cargo run -p browser-example -- --config examples/browser/configs/en/voice-runtime.yaml
 ```
 
-For Windows PowerShell:
+Open `http://localhost:8080`, select **Start session**, and allow microphone access. The in-memory restaurant booking demo uses typed input and silent audio in this configuration. Use a shell without `OPENAI_API_KEY` for a mock-only run. With the key set, the demo can send conversation text to OpenAI. [Korean configuration](examples/browser/configs/ko/voice-runtime.yaml)
 
-```powershell
-$env:TOGETHER_API_KEY = "..."
-$env:DASHSCOPE_API_KEY = "..."
-$env:QWEN_VOICE_ID = "..."
-$env:OPENAI_API_KEY = "..."
-```
+The Cartesia configs enable live microphone input and speech output. They send audio and text to external providers and can incur charges. [Live audio setup](docs/deployment.md#cartesia-streaming-stt-and-tts)
 
-Then set `asr.provider: together` and `tts.provider: qwen` in `full-duplex-demo/configs/voice-runtime.yaml` and run the same `cargo run` command. The provider adapters still need paid contract testing before relying on their wire formats.
+## Runtime behavior
 
-Other environment variables: `VOICE_BIND_ADDR` (default `0.0.0.0:8080`), `VOICE_WEB_DIR` (web root override), `RUST_LOG` (log filter), and `VOICE_KOREAN_FIXTURE` (path to a 16 kHz mono PCM16 WAV for the Together contract test). See the [environment variable reference](docs/deployment.md#environment-variables) for details and path rules.
+- **Barge-in.** The runtime lowers playback volume as soon as it detects user speech, then decides whether to resume or stop playback.
+- **Playback-based memory.** Client playback reports determine how much of the final assistant reply is kept in memory.
+- **Business outcome checks.** The default renderer checks named outcomes against the current turn's tool records. An unconfirmed write blocks the reply.
 
-## Replace speech providers
+## Known limitations
 
-Hosts can pass `SpeechProviders { asr, tts }` to `VoiceRuntime::build_with_providers` without changing provider-name branches or adding transport dependencies. STT has independent PCM input and transcript output; TTS exposes buffered or native incremental text input with independent audio output. Legacy whole-text TTS can use the bounded buffered bridge. General agent replies still wait for authoritative Final and pass the Claim Gate; this API is not provisional-token speech. See [provider settings and migration](docs/configuration.md#injected-provider-settings-and-migration), [host integration](docs/deployment.md#host-supplied-speech-providers), and [deterministic provider tests](docs/testing.md#duplex-provider-regressions).
+- Replies can take several seconds. In one live test, playback stopped 1.5–2.7 seconds after the recognizer picked up a question spoken over the assistant.
+- In Korean tests, Cartesia Ink Whisper sometimes missed short replies such as "네" or "응".
+- A reply without an `outcome` can claim a business result even when no tool ran.
+- The browser example relies on browser echo cancellation. The runtime currently has no server-side echo cancellation, WebRTC, or Opus support.
+- Live microphone and speaker testing has covered Windows with Edge. HTTPS deployments still need live validation. [Platform validation](docs/testing.md#platform-validation)
+
+## Integration
+
+Hosts connect `VoiceRuntime` session channels to their own transport. The default `framework` feature enables `ai-agents` integration. [Agent configuration](docs/configuration.md#framework-integration) · [Host tools](docs/deployment.md#host-language-and-response-policies) · [Speech providers](docs/configuration.md#choosing-a-provider)
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) - runtime design and invariants
-- [Modules](docs/modules.md) - library module reference
-- [Configuration](docs/configuration.md) - `voice-runtime.yaml` reference
-- [Protocol](docs/protocol.md) - browser WebSocket contract
-- [Testing](docs/testing.md) - test layers and scenario DSL
-- [Deployment](docs/deployment.md) - demo startup, environment, and Docker
+[Architecture](docs/architecture.md) · [Modules](docs/modules.md) · [Configuration](docs/configuration.md) · [Protocol](docs/protocol.md) · [Testing](docs/testing.md) · [Deployment](docs/deployment.md)
 
 ## License
 
-Copyright 2026 Jaemin Kim.
-
-The `voice-live` library and `full-duplex-demo` are licensed under the [Apache License, Version 2.0](LICENSE). Third-party dependencies retain their respective licenses.
-
-## Core principles
-
-1. An STT partial is a revision, not an append.
-2. Do not enqueue partial requests on the same `RuntimeAgent`; the interaction and task agents use separate runtimes.
-3. Keep transcript, action, and audible commit boundaries separate.
-4. Never speak results from stale epochs.
-5. Block factual and transactional claims without authoritative evidence.
-6. Start barge-in with reversible ducking instead of immediate cancellation.
+Copyright 2026 Jaemin Kim. Licensed under the [Apache License, Version 2.0](LICENSE).

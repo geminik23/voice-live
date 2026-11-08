@@ -146,6 +146,9 @@ pub async fn run_task_turn(
                 };
 
                 let forwarded = match event {
+                    CognitiveEvent::InvocationProof { task_id: origin, thought_epoch: epoch, proof } => {
+                        if origin == task_id && epoch == thought_epoch { Some(VoiceEvent::InvocationProof { meta: meta_factory.new_meta(), task_id, thought_epoch, proof }) } else { None }
+                    }
                     CognitiveEvent::Started => None,
                     CognitiveEvent::Content { text } => Some(VoiceEvent::AgentChunk {
                         meta: meta_factory.new_meta(),

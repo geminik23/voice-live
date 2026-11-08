@@ -1,3 +1,7 @@
+//! Streaming speech synthesis: the [`StreamingTts`] factory trait, stream events, and the built-in providers.
+//!
+//! The `fake` module backs the `mock` config provider and is always available; `cartesia` and `qwen` need their crate features.
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,7 +22,9 @@ pub struct TtsRequest {
     pub claim_class: ClaimClass,
 }
 
+/// An event from a speech synthesis stream.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum TtsEvent {
     Audio {
         response_id: String,
@@ -46,6 +52,7 @@ pub enum TextInputMode {
 
 /// Typed duplex open errors, so retry policy never string-matches messages.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TtsOpenError {
     /// The factory does not implement text streaming sessions.
     #[error("tts text streaming is unsupported")]
@@ -87,6 +94,7 @@ pub struct TtsInputLimits {
 
 /// Typed text admission failures.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TtsInputError {
     /// The accumulated text exceeded the byte budget; the fragment returns.
     #[error("tts input exceeded the byte budget")]
@@ -125,8 +133,12 @@ pub struct TtsDuplexSession {
     pub control: Box<dyn ProviderSessionControl>,
 }
 
+/// A streaming speech synthesizer factory, shared across sessions.
+///
+/// [`StreamingTts::synthesize`] takes a whole text; providers that accept text incrementally also implement [`StreamingTts::open_text_stream`].
 #[async_trait]
 pub trait StreamingTts: Send + Sync {
+    /// Synthesizes one complete text, stopping when `cancellation` fires.
     async fn synthesize(
         &self,
         request: TtsRequest,
@@ -325,8 +337,11 @@ impl AudioNormalizer {
 }
 
 pub mod buffered;
+#[cfg(feature = "cartesia")]
+pub mod cartesia;
 pub mod fake;
 pub mod premade;
+#[cfg(feature = "qwen")]
 pub mod qwen;
 
 #[cfg(test)]

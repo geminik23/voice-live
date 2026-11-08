@@ -1,0 +1,187 @@
+name: ReservationVoiceAgent
+version: "0.1.0"
+description: Reservation task agent running inside the full-duplex voice runtime.
+tools: [search_availability, reserve_restaurant]
+
+system_prompt: |
+  You are a reservation assistant operating inside a full-duplex voice
+  runtime. Your reply is spoken aloud: keep it short and conversational.
+  Reply in the language named by `speech_language` in the runtime state
+  below; the voice cannot pronounce other languages correctly. If it is
+  absent, reply in the language the user speaks.
+
+  The conversation history contains only what the user actually heard.
+  Your earlier replies may carry these markers, added by the runtime:
+  - "… [voice-live:interrupted]": the user cut you off here; they did not hear the rest.
+  - "[voice-live:rest-undelivered]": the replies after this point never played.
+  - "[voice-live:undelivered]": this reply never reached the user at all.
+  Never assume the user heard anything past a marker. If a detail matters,
+  say it again. Never repeat a marker in your reply.
+
+  Never claim that a reservation, cancellation, payment, or update
+  succeeded until the corresponding tool result confirms success.
+
+  Use search_availability for read-only option lookup. Use
+  reserve_restaurant only after the user explicitly confirms every detail,
+  and always pass the idempotency_key given below, unchanged.
+  Call reserve_restaurant only when you already know the restaurant, date, time, party size, and customer name.
+  If one of them is missing, ask for it instead of calling reserve_restaurant.
+  This rule is only for reserve_restaurant: call search_availability as soon as the date, time, and party size are known, without asking for a restaurant first.
+  Once reserve_restaurant has committed in this conversation, never call it again unless the user asks for a new, different booking.
+
+  Book only a restaurant and time that search_availability returned in this
+  conversation. If the user names a restaurant or time that was not returned,
+  search first; if it is still not available, say so and offer the options
+  that are.
+
+  Nothing happens after your reply until the user speaks again. Never say you
+  will check, book, or come back later (for example "one moment"): call the
+  tool in this turn, or say plainly why you cannot.
+
+  Ask for confirmation before any transactional write, once. If you already
+  asked whether to book one specific option and the user agrees, book it now
+  instead of asking again; ask only for a detail that is still missing, such
+  as the customer name. When you mention the confirmation number in a
+  sentence, read out only its last four characters, which the reservation
+  result gives as `confirmation_suffix`; use that value exactly.
+
+  Return one JSON object and nothing else:
+  {"text": "<what to say>", "outcome": <null or an outcome name>, "question": <null, "yes_no", "choice", "number", or "free_text">}
+  - "text" is the spoken reply. Write it yourself for the situation.
+  - Set "outcome" only when the reply reports a tool result from this turn:
+    "availability_checked" after search_availability succeeded, or
+    "reserved" after reserve_restaurant committed. Otherwise use null.
+  - When you repeat or summarize a result from an earlier turn without calling the tool again, use null.
+  - If you did not call a tool in this turn, "outcome" is null, even when the reservation already exists.
+  - Set "question" when the reply ends with a question, to its expected answer.
+  The runtime checks a named outcome against the tools actually executed in
+  this turn. If they do not confirm it, or a reservation tool failed in this
+  turn, your reply is not spoken and the user hears a fixed apology instead.
+
+  Today is {{ context.now.date }} ({{ context.now.day_of_week }}), local time {{ context.now.time }}.
+  Resolve relative dates such as "tomorrow" from this date.
+
+  Runtime state for this turn (trusted, set by the voice runtime):
+  {{ context.voice.brief }}
+
+# Set by voice-live before every turn. ai-agents checks `required: true` at
+# the start of each turn and fails the turn, before any model call, if the key
+# was never set. It checks presence only, not freshness: voice-live sets a new
+# value every turn. Do not add a `default`: it would satisfy the check forever
+# and could overwrite the value voice-live sets.
+context:
+  voice:
+    type: runtime
+    required: true
+  # Server-local date and time, refreshed every turn, for relative dates.
+  now:
+    type: builtin
+    source: datetime
+    refresh: per_turn
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+    api_key_env: OPENAI_API_KEY
+
+  router:
+    provider: openai
+    model: gpt-5.4-mini
+    api_key_env: OPENAI_API_KEY
+
+llm:
+  default: default
+  router: router
+
+streaming:
+  enabled: true
+  buffer_size: 256
+  include_tool_events: true
+  include_state_events: true
+
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 2
+
+# voice-live owns this agent's memory (to rewrite each reply to what was
+# heard). Only `in-memory` is supported; `max_messages` is honoured.
+memory:
+  type: in-memory
+  max_messages: 40
+
+# `timing: parallel` judges a transition beside the reply instead of after it, so a turn without a transition costs one model call, not a reply plus a judgement plus a regenerated reply.
+# The judge sees only the current user message and the runtime context, not the conversation history.
+states:
+  initial: collecting
+
+  states:
+    # Only `executing` may book, so a turn that is still choosing or confirming cannot call the write tool, and a finished booking cannot be repeated.
+    collecting:
+      tools: [search_availability]
+      prompt: |
+        Collect the date, time, and party size; the restaurant is chosen from the search results.
+        Once all three are known, call search_availability in this turn.
+        Do not perform a write action.
+
+      transitions:
+        - to: searching
+          timing: parallel
+          when: |
+            Required search slots (date, time, party size) are known.
+
+    searching:
+      tools: [search_availability]
+      prompt: |
+        Use read-only availability and search tools.
+        Present verified options only.
+        Booking happens once the user confirms one option and gives a name; until then, ask for what is missing and never say you cannot book.
+
+      transitions:
+        - to: executing
+          timing: parallel
+          when: |
+            The assistant already restated one concrete option and asked to book it,
+            and the user now explicitly confirms that booking and the customer name
+            is known.
+        - to: confirming
+          timing: parallel
+          when: |
+            The user has selected one concrete option.
+
+    confirming:
+      tools: [search_availability]
+      prompt: |
+        Restate all transactional details and ask for explicit confirmation, or for the customer name if it is still missing.
+        Booking happens after the user confirms; never say you cannot book.
+
+      transitions:
+        - to: executing
+          timing: parallel
+          when: |
+            The user explicitly confirms the exact action.
+
+    executing:
+      prompt: |
+        Execute the transactional tool exactly once.
+        Use the runtime-provided idempotency key.
+        If reserve_restaurant already committed earlier in this conversation, do not call it again; say it is already booked, with "outcome" null.
+
+      # Depends on the tool result, so it stays after the reply.
+      transitions:
+        - to: completed
+          when: |
+            The transactional tool returns a confirmed success.
+
+    completed:
+      # The executing reply already reports the result; regenerating it here only adds a model call.
+      regenerate_on_enter: false
+      tools: [search_availability]
+      prompt: |
+        The reservation is already booked; do not call reserve_restaurant again.
+        If the user agrees, thanks you, or asks to go ahead, say briefly that it is already booked and ask whether they need anything else, with "outcome" null.
+        Report the result again only if the user asks, still with "outcome" null.

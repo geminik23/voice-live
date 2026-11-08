@@ -17,8 +17,8 @@ pub enum ClaimRejection {
     Expired(u64),
 }
 
-/// Speech claims are verified before synthesis. Nothing is spoken without
-/// matching evidence, so "thinking out loud" can never become a lie.
+/// Checks evidence or exact trusted rendering bindings before synthesis.
+/// This gate does not infer natural-language meaning or prove arbitrary factuality.
 #[derive(Debug, Default)]
 pub struct ClaimGate;
 
@@ -33,6 +33,29 @@ impl ClaimGate {
             && now_us >= expires_at
         {
             return Err(ClaimRejection::Expired(expires_at));
+        }
+
+        if let Some(reference) = act
+            .evidence
+            .iter()
+            .find(|r| r.kind == EvidenceKind::AuthorizedSpeech)
+        {
+            return match view.evidence.get(&reference.id) {
+                Some(SessionEvidence::AuthorizedSpeech {
+                    speech_id,
+                    speech_epoch,
+                    text,
+                    class,
+                    ..
+                }) if *speech_id == act.id
+                    && *speech_epoch == act.speech_epoch
+                    && *text == act.text
+                    && *class == act.class =>
+                {
+                    Ok(())
+                }
+                _ => Err(ClaimRejection::MissingEvidence(reference.id.clone())),
+            };
         }
 
         match act.class {

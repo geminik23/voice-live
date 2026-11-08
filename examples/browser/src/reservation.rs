@@ -23,7 +23,10 @@ pub struct RestaurantOption {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReservationRecord {
+    pub status: String,
     pub confirmation_id: String,
+    /// The last four characters of `confirmation_id`, ready to read aloud; a model asked to cut them itself read the wrong four in a live check.
+    pub confirmation_suffix: String,
     pub restaurant_id: String,
     pub date: String,
     pub time: String,
@@ -39,39 +42,23 @@ pub struct ReservationStore {
 }
 
 impl ReservationStore {
-    pub fn demo() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            restaurants: vec![
-                RestaurantOption {
-                    id: "gangnam-table".into(),
-                    name: "강남 테이블".into(),
-                    area: "강남".into(),
-                    available_times: vec!["18:30".into(), "19:00".into(), "20:00".into()],
-                    parking: true,
-                    window_seat: true,
-                    maximum_party_size: 8,
-                },
-                RestaurantOption {
-                    id: "hongdae-kitchen".into(),
-                    name: "홍대 키친".into(),
-                    area: "홍대".into(),
-                    available_times: vec!["19:00".into(), "19:30".into()],
-                    parking: false,
-                    window_seat: true,
-                    maximum_party_size: 6,
-                },
-                RestaurantOption {
-                    id: "seongsu-dining".into(),
-                    name: "성수 다이닝".into(),
-                    area: "성수".into(),
-                    available_times: vec!["18:00".into(), "19:00".into(), "20:30".into()],
-                    parking: true,
-                    window_seat: false,
-                    maximum_party_size: 10,
-                },
-            ],
+    /// Loads the example restaurants from a YAML list, one file per example language.
+    pub fn from_yaml_file(path: &std::path::Path) -> anyhow::Result<Arc<Mutex<Self>>> {
+        Self::from_yaml_str(&std::fs::read_to_string(path)?)
+    }
+
+    pub fn from_yaml_str(raw: &str) -> anyhow::Result<Arc<Mutex<Self>>> {
+        let restaurants: Vec<RestaurantOption> = serde_yaml::from_str(raw)?;
+        anyhow::ensure!(!restaurants.is_empty(), "the restaurant list is empty");
+        Ok(Arc::new(Mutex::new(Self {
+            restaurants,
             reservations_by_key: HashMap::new(),
-        }))
+        })))
+    }
+
+    #[cfg(test)]
+    fn demo() -> Arc<Mutex<Self>> {
+        Self::from_yaml_str(include_str!("../configs/ko/restaurants.yaml")).unwrap()
     }
 }
 
@@ -100,12 +87,23 @@ impl Tool for SearchAvailabilityTool {
     }
 
     fn input_schema(&self) -> Value {
+        // Without the list, models invent placeholder areas ("", "general") that match nothing and then report that nothing is available.
+        let mut areas: Vec<String> = Vec::new();
+        for restaurant in &self.store.lock().restaurants {
+            if !areas.contains(&restaurant.area) {
+                areas.push(restaurant.area.clone());
+            }
+        }
         json!({
             "type": "object",
             "properties": {
-                "area": { "type": "string" },
+                "area": {
+                    "type": "string",
+                    "enum": areas,
+                    "description": "Only when the user named one of these areas; omit it to search every area."
+                },
                 "date": { "type": "string" },
-                "time": { "type": "string" },
+                "time": { "type": "string", "description": "24-hour HH:MM, for example 19:00." },
                 "party_size": { "type": "integer", "minimum": 1 },
                 "parking_required": { "type": "boolean", "default": false },
                 "window_seat_preferred": { "type": "boolean", "default": false }
@@ -115,7 +113,12 @@ impl Tool for SearchAvailabilityTool {
     }
 
     async fn execute(&self, args: Value, _ctx: ToolExecutionContext) -> ToolResult {
-        let area = args.get("area").and_then(Value::as_str);
+        // Models often send an empty area when the user named none; that means "any area", not an area called "".
+        let area = args
+            .get("area")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|area| !area.is_empty());
         let Some(time) = args.get("time").and_then(Value::as_str) else {
             return ToolResult::error("time is required");
         };
@@ -150,6 +153,7 @@ impl Tool for SearchAvailabilityTool {
 
         ToolResult::ok(
             serde_json::to_string(&json!({
+                "status": "searched",
                 "date": args.get("date").cloned().unwrap_or(Value::Null),
                 "time": time,
                 "party_size": party_size,
@@ -185,7 +189,7 @@ impl Tool for ReserveRestaurantTool {
     }
 
     fn description(&self) -> &str {
-        "Create one demo reservation after the user explicitly confirms every detail. An idempotency key is required and repeated calls return the original record."
+        "Create one demo reservation after the user explicitly confirms every detail. Call it only when the user has given the customer name; otherwise ask for the name instead. An idempotency key is required and repeated calls return the original record."
     }
 
     fn input_schema(&self) -> Value {
@@ -196,7 +200,7 @@ impl Tool for ReserveRestaurantTool {
                 "date": { "type": "string" },
                 "time": { "type": "string" },
                 "party_size": { "type": "integer", "minimum": 1 },
-                "customer_name": { "type": "string" },
+                "customer_name": { "type": "string", "minLength": 1, "description": "The name the user gave. Never guess it or leave it empty." },
                 "window_seat_requested": { "type": "boolean", "default": false },
                 "confirmed": { "type": "boolean", "description": "True only after explicit user confirmation" },
                 "idempotency_key": { "type": "string" }
@@ -267,8 +271,12 @@ impl Tool for ReserveRestaurantTool {
             return ToolResult::error("party size exceeds restaurant capacity");
         }
 
+        let confirmation_id = format!("DEMO-{}", uuid::Uuid::new_v4().simple());
+        let confirmation_suffix = confirmation_id[confirmation_id.len() - 4..].to_string();
         let record = ReservationRecord {
-            confirmation_id: format!("DEMO-{}", uuid::Uuid::new_v4().simple()),
+            status: "committed".into(),
+            confirmation_id,
+            confirmation_suffix,
             restaurant_id,
             date,
             time,
@@ -344,6 +352,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_area_searches_every_area() {
+        let tool = SearchAvailabilityTool::new(ReservationStore::demo());
+
+        let result = tool
+            .execute(
+                json!({ "area": "", "date": "2026-09-26", "time": "19:00", "party_size": 2 }),
+                context(),
+            )
+            .await;
+
+        assert!(result.success);
+        assert!(result.output.contains("gangnam-table"));
+        assert!(result.output.contains("hongdae-kitchen"));
+    }
+
+    #[test]
+    fn search_schema_lists_the_demo_areas() {
+        let tool = SearchAvailabilityTool::new(ReservationStore::demo());
+        assert_eq!(
+            tool.input_schema()["properties"]["area"]["enum"],
+            json!(["강남", "홍대", "성수"])
+        );
+    }
+
+    #[tokio::test]
     async fn reservation_requires_confirmation_and_is_idempotent() {
         let store = ReservationStore::demo();
         let tool = ReserveRestaurantTool::new(store);
@@ -362,6 +395,13 @@ mod tests {
 
         assert!(first.success);
         assert_eq!(first.output, second.output);
+        let record: ReservationRecord = serde_json::from_str(&first.output).unwrap();
+        assert!(
+            record
+                .confirmation_id
+                .ends_with(&record.confirmation_suffix)
+        );
+        assert_eq!(record.confirmation_suffix.len(), 4);
 
         let rejected = tool
             .execute(

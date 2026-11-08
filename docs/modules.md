@@ -1,6 +1,6 @@
 # Module reference
 
-Module layout of `.`. The `framework` feature (enabled by default) pulls in the optional crates.io `ai-agents` dependency at version `1.0.11`; building with `--no-default-features` leaves only the deterministic core for fast testing.
+Module layout of `.`. The `framework` feature (enabled by default) pulls in the optional crates.io `ai-agents` dependency at version `1.0.11`; the `cartesia`, `together`, and `qwen` features (also default) compile the matching network speech providers in `asr/` and `tts/` and pull in the WebSocket and TLS stack. Building with `--no-default-features` leaves only the deterministic core and the `mock`/`inject` development providers for fast testing.
 
 ## Foundations
 
@@ -11,14 +11,14 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `meta.rs` | `EventMeta { monotonic_us, wall_clock }` + `MetaFactory` |
 | `epochs.rs` | Four `Epochs` counters and invalidation operations |
 | `events.rs` | All `VoiceEvent` variants and `SessionSummary` |
-| `config.rs` | `VoiceRuntimeConfig` (`voice-runtime.yaml` schema, serde defaults for all fields, `validate()` rejecting “아니” as a hard stop, etc.) |
+| `config.rs` | `VoiceRuntimeConfig` with neutral linguistic defaults, bounded rule/resource validation, explicit `SlotFallback`, and `TurnControlConfig::korean_example()` compatibility resources |
 | `metrics.rs` | P50/P95/P99 snapshots of counters and latency series (up to 1024 samples) |
-| `logging.rs` | JSONL event log (`target/voice-traces/<date>/<session>/events.jsonl`) |
+| `logging.rs` | JSONL event log (`target/voice-traces/<date>/<session>/events.jsonl`); transcript, reply, and tool-result text is redacted to a character count unless `include_sensitive_payloads` is set |
 | `echo.rs` | Text-similarity self-echo filter (bigram Dice) |
 | `media.rs` | Audio frame codec, sequence tracker, and resampler. `build_resampler` chooses `DecimatingResampler` for integer ratios (windowed-sinc anti-alias; phase calculated from the absolute stream index), otherwise `LinearResampler` (low-pass then linear interpolation; carries over the last sample of the previous chunk to rebase phase, avoiding length-proportional drift). Failures are not silently ignored |
 | `replay.rs` | PCM16 WAV source + realtime replay API using actual 20ms timestamps |
 | `transcript.rs` | `TranscriptReconciler` (revisioned partials, stable-prefix computation), `TurnAssemblyBuffer` |
-| `vad.rs` | Energy VAD. The floor adapts only while idle (speech does not raise the floor); onset/offset hysteresis |
+| `vad.rs` | Energy VAD with onset/offset hysteresis. The floor adapts while idle and ignores digital silence; while speech is on, a one-second window whose quietest frame stays above the offset level raises the floor, so stationary noise cannot hold speech on |
 
 ## interaction/
 
@@ -26,16 +26,18 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 |---|---|
 | `state.rs` | `FloorState`, `TaskState`, `SpeechState`, `UserSpeechState`, `InteractionAction`, `InteractionDecision(Envelope)`, `InterruptionReason` |
 | `policy.rs` | `ReflexPolicy`. Sentence-ending decisions, backchannel words, hard stops, overlap classification, and tick decisions. Punctuation-only patterns ("...") use raw tail matching (avoids empty-pattern matches). Overlap classification lives only in `classify_overlap`; `decide_on_tick` merely converts its result into an action |
-| `snapshot.rs` | `InteractionSnapshot` - read-only state passed to the brain |
-| `brain.rs` | `InteractionBrain` trait, `NoopInteractionBrain` (default), `ScriptedInteractionBrain` (tests) |
+| `snapshot.rs` | `InteractionSnapshot` - bounded current candidate, recent committed user turns, confirmed-heard assistant context, and session state passed to the brain |
+| `brain.rs` | `InteractionBrain` trait with legacy decisions and optional semantic assessments, `NoopInteractionBrain` (default), `ScriptedInteractionBrain` (tests) |
+| `semantic.rs` | Bounded, validated semantic assessment and slot updates; no playback or tool execution authority |
 
 ## semantics/
 
 | Module | Description |
 |---|---|
-| `cue.rs` | `CueExtractor`. Regex-based extraction of HardStop/Correction/Negation/EntityCandidate/IntentCandidate |
-| `frame.rs` | `SemanticFrame`, `SemanticValue(status)`, slot operations, dependency fingerprint. `SlotOperation::Clear` actually removes the slot |
-| `extractor.rs` | `SlotExtractor` trait + `HeuristicKoreanSlotExtractor`. Extracts date/time/party size and detects `X 말고 Y` corrections for **all three slots** (only a correction emits `Replace`, and only `Replace` invalidates dependent tasks). Values are compared as `Value` values: `to_string()` adds JSON quotes, so the strings would never match. Can be replaced by `RuntimeSlotExtractor` (LLM) when the framework is enabled |
+| `cue.rs` | `CueExtractor`. Application-owned literal hard stops and configured correction/negation/intent/entity regexes; no implicit language grammar |
+| `text.rs` | Pure `TextAnalyzer`, `UserTextAnalysis`, bounded `TextRules`, and compiled `ConfiguredTextAnalyzer`; no clock, I/O, state mutation, or authorization |
+| `frame.rs` | `SemanticFrame`, turn-local negation, `SemanticValue(status)`, slot operations, dependency fingerprint. `SlotOperation::Clear` actually removes the slot |
+| `extractor.rs` | `SlotExtractor`, `NoopSlotExtractor`, explicit `configured_fallback`, and optional `HeuristicKoreanSlotExtractor` compatibility helper. Extracts date/time/party size and detects `X 말고 Y` corrections for **all three slots**. The supervisor invalidates dependencies when an accepted value changes, including Clear and absence-to-value; provisional cues do not cancel work. Values are compared as `Value` values. Can be replaced by `RuntimeSlotExtractor` (LLM) when the framework is enabled |
 | `partial_policy.rs` | Gate for partial controller calls. Urgent calls run immediately; semantic deltas have a minimum interval and a maximum flush interval. Injected clock |
 
 ## speech/
@@ -43,26 +45,28 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | Module | Description |
 |---|---|
 | `act.rs` | `SpeechAct`, `ClaimClass`, `Interruptibility`, `EvidenceRef`, priority constants. The abort path respects `Interruptibility::Never`, but hard stop takes precedence; `AfterClause` is already satisfied because acts are split by clause |
-| `claim_gate.rs` | Evidence checks by class. Process checks existence per ref (distinguishing MissingEvidence) |
-| `ledger.rs` | `AudibleLedger`. Records `Heard::{Full, Partial, None}` per clause. Interrupted clauses retain their original text, exposing only the heard portion through `heard_text()`. Keeps only the most recent `speech.audible_history_max_clauses` clauses (for self-echo detection and summaries; agent memory holds the long-term record). `render_heard_turn` renders a reply as text to retain in memory (`… [중단됨]`, etc.) |
+| `claim_gate.rs` | Exact reply-clause authorization binding plus class evidence checks for unbound acts; Process checks start-evidence existence, and queue/TTS admission rechecks expiry |
+| `render.rs` | Bounded invocation observations, trusted `SpeechRenderer` host contract, and `ConfiguredRenderer`: parses the `{text, outcome, question}` reply (or plain text) and checks a named outcome against the turn's executed records by operation, receipt, and target bindings |
+| `ledger.rs` | `AudibleLedger`. Records `Heard::{Full, Partial, None}` per clause. Interrupted clauses retain their original text, exposing only the heard portion through `heard_text()`. Keeps only the most recent `speech.audible_history_max_clauses` clauses (for self-echo detection and summaries; agent memory holds the long-term record); clauses of a reply whose turn is not yet resolved are held outside that window, so a long reply still resolves with what was heard. `render_heard_turn` renders a reply as text to retain in memory (`… [voice-live:interrupted]`, etc.) |
 
 ## session/
 
 | Module | Description |
 |---|---|
 | `view.rs` | Pure `SessionView` projection + `SessionEvidence` storage |
-| `supervisor.rs` | Pure-event orchestration with speech admission before projection/handling, separate synthesis/playback lifecycle, stopping ACK deadlines, failed-reply clause disposal, commit-time deferred Never context, candidate provenance/journal rollback, owned workers and exactly-once turn resolution on all exits |
+| `supervisor.rs` | Event orchestration with consumed-audio and speech admission, bounded semantic and compatibility extraction, candidate provenance/journal rollback, dependency-scoped work invalidation, deep-task admission, reply admission (unconfirmed-write check and failure text on rejection), retiring a task's queued progress when the task ends, `speech_language` in the turn brief when configured, playback recovery, and worker-finished turn resolution |
 | `task_runner.rs` | Manages `ActiveTask` and consumes agent turns. Dropping the stream releases the framework root-turn gate |
-| `tts_worker.rs` | Complete authorized act → cache hook or duplex text admission/audio drain, request/open deadlines, response/format/sequence validation, and pre-admission cancellation registry |
-| `deep_worker.rs` | `DeepWorker` trait, `DeepWorkRequest/Result`, `FakeDeepWorker` for scenarios. No automatic trigger; runs only via `VoiceSessionHandle::request_deep_work` (→ `VoiceEvent::DeepWorkRequested`) |
+| `tts_worker.rs` | Complete authorized act → cache hook or duplex text admission/audio drain, request/open deadlines, response/format/sequence validation, pre-admission provider error preservation, and cancellation registry |
+| `deep_worker.rs` | `DeepWorker` trait, `DeepWorkRequest/Result`, `FakeDeepWorker` for scenarios. No automatic trigger; `VoiceSessionHandle::request_deep_work` sends `DeepWorkRequested`. Results must match a pending task and its original epoch, and use the request's dependencies |
 
 ## agent/
 
 | Module | Description |
 |---|---|
 | `mod.rs` | `CognitiveAgent`/`AgentTurnStream` traits - boundary separating the runtime from the framework. `AgentTurnRequest` separates `input` (only committed utterances) from `context: TurnContext` (turn environment for the system prompt). `resolve_turn(task_id, TurnResolution::{Audible, Discard})` reconciles turn memory |
-| `mock.rs` | `FakeAgent` (scripted; `AgentRecorder` records received requests and resolutions), `MockReservationAgent` (demo mock, no memory) |
-| `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, `RuntimeInteractionBrain`, `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*` |
+| `mock.rs` | `FakeAgent` (scripted; `AgentRecorder` records received requests and resolutions) |
+| `proof.rs` | Framework-only `VoiceAgentHooks` and bound host tools (the hooks remember bound IDs so the adapter drops the SDK stream's duplicate completion; the hook's completion carries the bounded output); immutable SDK execution-scope origin, retry-safe turn tokens, bounded terminal proof projection, and no current-turn reassignment; canonical terminal retirement is independent of optional SDK stream chunks |
+| `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, `RuntimeSemanticBrain` (logs the first failure of a streak and its recovery), `RuntimeInteractionBrain` (legacy), stateless `RuntimeSemanticBrain`, `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*`. The slot extractor rejects a whole malformed response or a response over 16384 bytes, limits updates to 32 and slot names to 128 bytes, accepts only `set`, `replace`, and `clear`, and checks confidence in 0–1. As before, `old_value: null` is represented as a present JSON null |
 
 ## asr/ tts/
 
@@ -72,21 +76,22 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `asr/fake.rs` | Duplex `MockAsr`, PCM recorder, persistent virtual-time event deadlines, and legacy façade; quiet input parks until cancelled instead of reporting EOF |
 | `asr/inject.rs` | `InjectionQueue` (per session) + `InjectableAsr` decorator. Adds a text-injection channel to any inner provider |
 | `asr/together.rs` | Together realtime adapter. `ParseState` owns the session-monotonic revision and utterance ID. Wire format still needs validation by contract tests |
+| `asr/cartesia.rs` | `CartesiaStreamingAsr::from_config` or host-owned `with_api_key`; Ink Whisper manual STT with independent paced raw PCM input batched into `chunk_ms` messages and revisioned replacement output, verbatim delta accumulation, bounded pending FIFO flushes, absolute finalize/finish deadlines, confirmed-Final retention, terminal ownership, and native legacy facade. FIFO vendor flush attribution remains an explicitly unverified integration assumption |
 | `tts/mod.rs` | Legacy `synthesize`/`TtsStream`, additive `TextInputMode`, text-session input/output/control handles, capability/cache hooks, bounded PCM normalization, and `synthesize_via_text_stream` retaining native control ownership |
 | `tts/buffered.rs` | `BufferedTtsAdapter`: bounded text accumulation, finish-triggered synthesis, owner-enforced request deadline, normalized audio queue and separate terminal slot |
 | `tts/fake.rs` | `FakeTts` (guarantees chunk→done→None termination) |
 | `tts/premade.rs` | Success-only premade cache with matching text/language/voice and fixed factory settings; bounded warmup, complete-request cache hook, native capability forwarding, cancellable replay |
 | `tts/qwen.rs` | DashScope realtime adapter. Cancels by closing the socket if `response.cancel` is unsupported |
+| `tts/cartesia.rs` | `CartesiaStreamingTts::from_config` or host-owned `with_api_key`; native incremental Sonic WebSocket input, context-scoped raw PCM normalization, bounded I/O, absolute response deadline, separate terminal slot, typed/redacted errors, and owned legacy `synthesize` convenience. Syntax-bounded full region/script selectors and historical aliases; account/model/voice combinations still require validation |
 
 ## Remaining modules
 
 | Module | Description |
 |---|---|
 | `provider.rs` | `ProviderSessionControl` cancellation/close contract and private owned worker cleanup; custom providers must enforce Drop and bounded teardown themselves |
-| `playback.rs` | `PlaybackCommand`, `ClientPlaybackSink` (runtime nonblocking overload shutdown or legacy standalone admission), `SimulatedPlaybackSink` (simulates the actual playback ACK flow in virtual-time tests), `UnacknowledgedPlaybackSink` (for ACK timeout scenarios) |
-| `tools/reservation.rs` | Shared in-memory reservation backend, pure-read `search_availability`, and `reserve_restaurant` framework tool enforcing confirmation + idempotency |
+| `playback.rs` | `PlaybackCommand`, `ClientPlaybackSink` (runtime nonblocking overload shutdown, which is not reported as an error once the session is already closing, or legacy standalone admission), `SimulatedPlaybackSink` (simulates the actual playback ACK flow in virtual-time tests), `UnacknowledgedPlaybackSink` (for ACK timeout scenarios) |
 | `scenario.rs` | Scenario DSL runner. YAML → virtual-time execution → expectation evaluation |
-| `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, fresh ASR retry and identity mapping, bounded client output |
+| `runtime.rs` | `VoiceRuntime`, `SpeechProviders` injection and capability assembly, `RuntimePolicies`/`build_with_policies` host overrides (task and speculative tools, per-session interaction/slot factories, text analyzer, speech renderer), provider match arms gated by the `cartesia`/`together`/`qwen` features, per-session brains, owned supervisor/media/playback workers, nonblocking VAD/audio admission, manual commit timing (trailing-audio delay, idle commits during silence, and dropping their empty Finals), fresh ASR retry and identity mapping, one-second terminal drain after input closure to preserve fatal classification, bounded client output |
 | `protocol.rs` | `ClientControlMessage` / `ServerMessage`. Defines **what** is exchanged, not **how** it is transported |
 
 ## Per-session vs. shared
@@ -97,7 +102,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `RuntimeAgent` (task/speculative/interaction/deep) | **Per session** | Holds conversation memory and serializes root turns per runtime |
 | Task agent conversation memory | **Per session, owned by voice-live** | To reconcile replies with what was heard and roll back turns |
 | `InjectionQueue` | **Per session** | One client's input must not become another client's transcript |
-| `ReservationStore` | Shared | Models an external system (reservation backend) |
+| Host tools (`RuntimePolicies` task and speculative tools) | Shared | Model an external system; the browser example's reservation backend in `examples/browser/src/reservation.rs` is one such host tool set |
 | `Metrics` | Shared | Process-wide observability |
 
 ## Transport boundary
@@ -105,17 +110,17 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 The library has no web framework dependency. The runtime exposes only a pair of channels; the host connects them to a socket.
 
 ```text
-  voice-live (library)                full-duplex-demo (host)
+  voice-live (library)                examples/browser (host)
   ─────────────────────               ─────────────────────────
   VoiceRuntime::create_session(
-      client_tx: Sender<ServerMessage>  ◄── demo writes to WebSocket
+      client_tx: Sender<ServerMessage>  ◄── host writes to WebSocket
   ) -> GatewaySession {
-      input_tx: Sender<ClientInput>     ◄── demo reads from WebSocket
+      input_tx: Sender<ClientInput>     ◄── host reads from WebSocket
   }
 
   protocol.rs  message types only      src/gateway.rs  axum / ServeDir
   media.rs     binary frame format
 ```
 
-Switching to WebRTC requires replacing only `full-duplex-demo/src/gateway.rs`.
+Switching to WebRTC requires replacing only `examples/browser/src/gateway.rs`.
 **Adding a web dependency to the root `Cargo.toml` is an architectural regression.**

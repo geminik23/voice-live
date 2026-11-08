@@ -38,6 +38,7 @@ pub enum SpeechState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum UserSpeechState {
     #[default]
     Uncertain,
@@ -53,6 +54,7 @@ pub enum UserSpeechState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InteractionAction {
     KeepListening,
     HoldFloor,
@@ -97,6 +99,7 @@ pub struct InteractionDecisionEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InterruptionReason {
     HardStop,
     SemanticInterruption,

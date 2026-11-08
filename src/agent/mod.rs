@@ -1,3 +1,7 @@
+//! The task agent boundary: [`CognitiveAgent`], its turn stream, and the turn context the runtime supplies.
+//!
+//! With the `framework` feature the runtime builds agents from ai-agents YAML specs; `mock` provides a scripted agent for tests.
+
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -45,8 +49,15 @@ pub enum TurnResolution {
     Discard,
 }
 
+/// An event in a task agent's turn stream: tool invocation records, text, and the final reply.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum CognitiveEvent {
+    InvocationProof {
+        task_id: TaskId,
+        thought_epoch: u64,
+        proof: crate::speech::render::InvocationProof,
+    },
     Started,
     Content {
         text: String,
@@ -124,3 +135,5 @@ pub mod mock;
 
 #[cfg(feature = "framework")]
 pub mod framework;
+#[cfg(feature = "framework")]
+mod proof;

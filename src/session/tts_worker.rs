@@ -180,13 +180,14 @@ impl Response<'_> {
             mut control,
         } = session;
         // Input operations are nonblocking admissions; provider I/O runs independently of them.
-        let admitted = if events.next_event().now_or_never().is_some() {
-            Err(anyhow::anyhow!("tts output arrived before text admission"))
-        } else {
-            input
+        let admitted = match events.next_event().now_or_never() {
+            Some(Ok(Some(TtsEvent::Error { message, .. }))) => Err(anyhow::anyhow!(message)),
+            Some(Err(error)) => Err(error),
+            Some(_) => Err(anyhow::anyhow!("tts output arrived before text admission")),
+            None => input
                 .push_text(self.act.text.clone())
                 .and_then(|()| input.finish_input())
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from),
         };
         let result = match admitted {
             Ok(()) => {

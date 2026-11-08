@@ -2,6 +2,7 @@ pub mod cue;
 pub mod extractor;
 pub mod frame;
 pub mod partial_policy;
+pub mod text;
 
 pub use cue::SemanticCue;
 pub use extractor::{HeuristicKoreanSlotExtractor, SlotExtractor};
