@@ -1,6 +1,30 @@
 # Configuration reference (voice-runtime.yaml)
 
-All fields are optional and use defaults when omitted. The YAML below illustrates the Korean browser example config, not the library's neutral linguistic defaults. In a minimal configuration, text rules, automatic speech resources, `asr.locale`, and `tts.language` are empty. Task-agent replies are spoken as the model writes them; outcome rules only decide whether a named business outcome may be claimed. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
+Omitted fields use library defaults; enabling a network provider or another feature can require additional settings. The library's language defaults are neutral: text rules, automatic speech resources, `asr.locale`, and `tts.language` are empty. Task-agent replies are spoken as the model writes them; outcome rules only decide whether a named business outcome may be claimed. Secrets are not stored in this file; `api_key_env` looks them up only from environment variables on the built-in provider path.
+
+## Minimal keyless configuration
+
+```yaml
+version: 1
+asr:
+  provider: inject
+tts:
+  provider: mock
+speech:
+  mock_reply: "Ready."
+observability:
+  event_log: false
+dev:
+  allow_text_injection: true
+```
+
+This configuration accepts injected text and produces silent mock audio without an agent spec, semantic model, or network speech provider. It makes no model/provider requests even if credentials exist in the environment. The explicit `speech.mock_reply` supplies the reply; omitting it leaves the mock reply empty, which is rejected rather than replaced with an implicit phrase. A host must still start a session and acknowledge playback; see [the terminal quickstart](../examples/quickstart.rs).
+
+## Browser example configuration
+
+The fuller YAML below illustrates the [Korean browser configuration](../examples/browser/configs/ko/voice-runtime.yaml), not the library defaults. The [English configuration](../examples/browser/configs/en/voice-runtime.yaml) uses the same structure with explicit English selectors and spoken resources. Both enable semantic interpretation without Korean rule collections. Unlike the minimal example above, these browser configurations can call the LLM when `OPENAI_API_KEY` is available; see [external calls and charges](deployment.md#when-the-example-sends-data-out-and-can-incur-charges).
+
+Agent paths in this example are relative to `examples/browser/configs/<language>/`, as resolved by `VoiceRuntimeConfig::from_file`. Use the complete files at those locations rather than copying their relative paths into an unrelated directory.
 
 ```yaml
 version: 1
@@ -75,19 +99,19 @@ turn_control:
 agents:
   interaction:
     enabled: true           # sample setting; library default is false
-    spec: ../agents/voice-interaction.yaml
+    spec: ../../agents/voice-interaction.yaml
     minimum_interval_ms: 250
     timeout_ms: 1500        # library default 900; hosted models took 1.1-1.6 s
   task:
-    spec: ../agents/reservation.yaml
+    spec: ../../agents/reservation.yaml
     timeout_ms: 30000
   deep:
     enabled: false
-    spec: ../agents/deep-worker.yaml
+    spec: ../../agents/deep-worker.yaml
     timeout_ms: 60000
   speculative:
     enabled: false          # when true, run a read-only speculative task in a separate runtime instance
-    spec: ../agents/reservation-readonly.yaml
+    spec: ../../agents/reservation-readonly.yaml
     allowed_tools: [search_availability]
     minimum_intent_confidence: 0.85
     maximum_parallel_tasks: 1
@@ -95,6 +119,21 @@ agents:
     allow_pure_read: true
 
 speech:
+  mock_reply: "예약할 날짜와 시간, 인원을 알려 주세요."
+  backchannel_text: "네"
+  failure_text: "죄송합니다. 응답을 준비하지 못했어요. 다시 말씀해 주세요."
+  outcomes:
+    availability_checked:
+      operation: search_availability
+      class: factual
+      receipt_fields: {status: searched}
+      bindings: [date, time, party_size]
+    reserved:
+      operation: reserve_restaurant
+      class: transactional
+      receipt_fields: {status: committed}
+      bindings: [restaurant_id, date, time, party_size, customer_name, window_seat_requested]
+      argument_defaults: {window_seat_requested: false}
   hard_stop_ack_text: "네, 멈췄어요."
   playback_ack_timeout_ms: 15000  # release the speech queue if no playback ACK arrives; 0 disables this
   playback_stop_ack_timeout_ms: 1000 # bounded interrupted ACK wait after Abort
@@ -136,11 +175,14 @@ dev:
 
 ## Why the default configuration runs immediately
 
-The sample configuration runs without API keys.
+The minimal configuration above and the complete browser examples can run without API keys.
 
-- `asr.provider: inject` — a silent recognizer plus a text-injection channel
-- `dev.allow_text_injection: true` — the browser text box acts as the user's utterance
-- `tts.provider: mock` — deterministic silent PCM
+- `asr.provider: inject` supplies a silent recognizer while the runtime accepts injected text.
+- `dev.allow_text_injection: true` enables the host's text-injection path, including the browser text box.
+- `tts.provider: mock` produces deterministic silent PCM.
+- `speech.mock_reply` explicitly supplies the mock task reply; there is no implicit language-specific reply.
+
+The complete browser examples also configure task and semantic specs. Keep `OPENAI_API_KEY` unset for a mock-only browser run; mock speech providers alone do not prevent LLM requests. If `--config` is omitted, the browser executable selects its Korean example, not a Korean library default.
 
 When `allow_text_injection` is enabled, the runtime owns a per-session injection queue independently of the recognizer connection. Typed finals therefore keep flowing during ASR open failures and reconnects, without crossing between clients. `InjectableAsr` remains available as a standalone decorator; the runtime no longer ties injection delivery to that decorator's open.
 
@@ -155,9 +197,9 @@ When `allow_text_injection` is enabled, the runtime owns a per-session injection
 | `cartesia` (ASR) | Ink Whisper manual streaming recognition | Explicit Cartesia endpoint/model/env; provider-supported language selector, 16 kHz, `manual_commit: true`, `CARTESIA_API_KEY` |
 | `cartesia` (TTS) | Native incremental Sonic synthesis | Explicit Cartesia endpoint/model/env settings; `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID` (or `tts.voice`) |
 
-Each network provider is compiled only with its crate feature (`cartesia`, `together`, `qwen`, all on by default). Selecting a provider whose feature is disabled fails the build with an error naming the feature. Unknown provider names fail the built-in runtime build; they do not silently fall back to `mock`. The injected builder uses the host's factories instead of resolving these names.
+Each network provider is compiled only with its crate feature (`cartesia`, `together`, `qwen`, all on by default). Selecting a provider whose feature is disabled makes `VoiceRuntime::build` return an error naming the feature. Unknown provider names fail the built-in runtime build; they do not silently fall back to `mock`. The injected builder uses the host's factories instead of resolving these names.
 
-Validate each real provider with its individual ignored contract only after credential, cost, and external-transmission approval. Do not run all ignored tests as a keyless check. The Together and Cartesia STT contracts require a consented 16 kHz mono PCM WAV supplied through `VOICE_KOREAN_FIXTURE`; the Cartesia TTS contract sends synthetic Korean text and requires an approved voice. See [provider testing](testing.md#cartesia-provider-regressions-and-paid-contracts).
+Validate each real provider with its individual ignored contract only after credential, cost, and external-transmission approval. The Korean Together and Cartesia STT contracts require a consented 16 kHz mono PCM16 WAV through `VOICE_KOREAN_FIXTURE`; TTS contracts send synthetic text and require an approved voice, not an input WAV. The English Cartesia contracts generate and then reuse a synthetic WAV, so run English TTS before English STT as [documented](testing.md#english-provider-only-validation). Do not select the entire ignored suite as a setup check: it can invoke unrelated paid providers and does not enforce that fixture dependency. See [provider testing](testing.md#cartesia-provider-regressions-and-paid-contracts).
 
 ## Cartesia STT
 
@@ -165,7 +207,7 @@ With `manual_commit: true`, the runtime does not commit the moment local speech 
 
 While nobody speaks, the runtime also commits every `asr.idle_commit_ms` (default 2000), so the recognizer never holds a long stretch of silence. In a live check, after about 14 s of silence Ink Whisper split the next utterance at a short pause and returned an empty transcript for its end ("...강남에서" without "두 명이요") in 4 of 6 utterances; with idle commits every 2 s, 9 of 10 were complete, and 1 s was not better. An idle commit is not sent while local speech is on, while an onset is being confirmed, or while a speech commit is pending, and its empty Final is not forwarded as an utterance. Set `0` to disable.
 
-Use `examples/browser/configs/<language>/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together (Korean or English). Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, locale `ko-KR`, and `audio.input_sample_rate_hz: 16000`. The session selector is normalized to a primary language code, for example `fr-CA → fr`, `zh-Hant-TW → zh`, and `yue → yue`. There is no runtime language-membership allowlist. Unsupported model, rate, or automatic commit settings are still rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
+Use `examples/browser/configs/<language>/voice-runtime.cartesia.yaml` for Cartesia STT and TTS together (Korean or English). Set `asr.provider: cartesia`, endpoint `wss://api.cartesia.ai/stt/websocket`, model `ink-whisper`, `api_key_env: CARTESIA_API_KEY`, `manual_commit: true`, a session locale such as `en-US` or `ko-KR`, and `audio.input_sample_rate_hz: 16000`. The session selector is normalized to a primary language code, for example `fr-CA → fr`, `zh-Hant-TW → zh`, and `yue → yue`. There is no runtime language-membership allowlist. Unsupported model, rate, or automatic commit settings are still rejected rather than silently substituted. Provider-name changes alone retain Together defaults and are not a valid migration.
 
 | Key | Default | Validation and use |
 |---|---:|---|
@@ -188,7 +230,7 @@ Confirmed transcript deltas append verbatim; mutable tails replace, never append
 
 The full Cartesia sample selects both providers. `examples/browser/configs/ko/voice-runtime.cartesia-tts.yaml` remains available for typed input plus Cartesia TTS diagnosis. The keyless default sample remains inject ASR plus mock TTS.
 
-Set all provider-specific common fields explicitly: `tts.provider: cartesia`, endpoint `wss://api.cartesia.ai/tts/websocket`, model `sonic-3.6`, `api_key_env: CARTESIA_API_KEY`, `voice_env: CARTESIA_VOICE_ID`, language `ko`, and rate `24000`. Changing just the provider name keeps the Qwen defaults and is not a supported migration. The factory accepts `sonic-3.6`, `sonic-3.5`, `sonic-3`, and `sonic-latest`; model aliases and account/voice availability still require paid validation. Session language preserves the full selector, including region/script subtags such as `en-GB`, `fr-CA`, and `zh-Hant-TW`. Only historical word aliases `Korean → ko` and `English → en` are rewritten. This changes earlier `en-GB → en` and `ko-KR → ko` wire behavior and can affect pronunciation or provider compatibility. Code admission does not establish model/voice support or adapt agent prompts and text policies.
+Set all provider-specific common fields explicitly: `tts.provider: cartesia`, endpoint `wss://api.cartesia.ai/tts/websocket`, model `sonic-3.6`, `api_key_env: CARTESIA_API_KEY`, `voice_env: CARTESIA_VOICE_ID`, a session language such as `en` or `ko`, and rate `24000`. Changing just the provider name keeps the Qwen defaults and is not a supported migration. The factory accepts `sonic-3.6`, `sonic-3.5`, `sonic-3`, and `sonic-latest`; model aliases and account/voice availability still require paid validation. Session language preserves the full selector, including region/script subtags such as `en-GB`, `fr-CA`, and `zh-Hant-TW`. Only historical word aliases `Korean → ko` and `English → en` are rewritten. This changes earlier `en-GB → en` and `ko-KR → ko` wire behavior and can affect pronunciation or provider compatibility. Code admission does not establish model/voice support or adapt agent prompts and text policies.
 
 | Key | Default | Validation and use |
 |---|---|---|
@@ -203,7 +245,7 @@ The dedicated sample disables premade warmup and uses the reservation task spec.
 
 ## Language scope
 
-The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The browser example configures automatic resources per language directory (Korean and English) (backchannel, stop acknowledgement, failure, progress, and keyless mock reply) and enable semantic LLM interpretation without Korean rule collections. `asr.locale` and `tts.language` have no default; the built-in network providers refuse to start without them, and mock/inject providers do not need them. The task agent receives `tts.language` as `speech_language` in its turn brief; the demo task spec tells the model to reply in it, because the voice synthesizes one configured language per session. With `tts.language` unset the brief has no `speech_language` line and the demo spec replies in the user's language. The runtime does not detect or switch languages. If semantic inference is unavailable, neutral timing and conservative overlap control remain active. Multilingual end-to-end quality remains unverified.
+The library does not implicitly install a language grammar, slot heuristic, or spoken phrase. The browser example configures automatic resources per language directory (Korean and English) (backchannel, stop acknowledgement, failure, progress, and keyless mock reply) and enables semantic LLM interpretation without Korean rule collections. `asr.locale` and `tts.language` have no default; the built-in network providers refuse to start without them, and mock/inject providers do not need them. The task agent receives `tts.language` as `speech_language` in its turn brief; the demo task spec tells the model to reply in it, because the voice synthesizes one configured language per session. With `tts.language` unset the brief has no `speech_language` line and the demo spec replies in the user's language. The runtime does not detect or switch languages. If semantic inference is unavailable, neutral timing and conservative overlap control remain active. Limited Korean and English conversation checks are recorded in [testing](testing.md#evidence-available-so-far); they do not establish quality across arbitrary languages, voices, devices, or mixed-language sessions.
 
 Cartesia selectors are trimmed, limited to 63 ASCII bytes, and accept a 2–8 letter primary subtag followed by nonempty 1–8 alphanumeric subtags separated by `-`. `_` is accepted as a separator alias. Empty values, `auto`, malformed separators, control characters, and query delimiters are rejected. ASR lowercases the primary code; TTS retains the selector's case and region/script content. Factory and session validation use the same resolver. Together retains its encoded full locale and Qwen its provider-native language string. No discovery, language detection, translation, or silent provider/model fallback is performed.
 
@@ -234,7 +276,7 @@ While the assistant is speaking, a `backchannel` or `noise_or_echo` label discar
 
 A `stop` label is matched to the user's words (the same candidate text, utterance, and connection generation), not to the assistant's playback state, so it still applies when the reply has moved to its next clause or ducked while the model was judging. Once a stop is applied, the stop words are consumed: they do not become a task turn, and later labels for the same words cannot cut off the stop acknowledgement. Words that combine a stop with a new request (for example "stop, and book the other one") are consumed too; the user has to repeat the request.
 
-Host composition uses `VoiceRuntime::build_with_policies(config, optional_providers, RuntimePolicies)` or the direct builder. `RuntimePolicies::interaction_brain` and `slot_extractor` are per-session factories; existing exhaustive struct literals must add the new field or use `..Default::default()`. `InteractionSnapshot` now includes `heard_assistant` and `recent_user_turns`, and `SemanticFrame` includes `negated`; exhaustive struct literals require migration. `VoiceSessionBuilder::try_build` reports invalid configuration; the compatible `build` convenience method panics on invalid configuration.
+Host composition uses `VoiceRuntime::build_with_policies(config, optional_providers, RuntimePolicies)` or the direct builder. `RuntimePolicies::interaction_brain` and `slot_extractor` are per-session factories. `RuntimePolicies` is `#[non_exhaustive]`, so external crates must construct it with `RuntimePolicies::default()` and the `with_*` methods, not a struct literal or struct update syntax. `InteractionSnapshot` now includes `heard_assistant` and `recent_user_turns`, and `SemanticFrame` includes `negated`; exhaustive struct literals require migration. `VoiceSessionBuilder::try_build` reports invalid configuration; the compatible `build` convenience method panics on invalid configuration.
 
 ## Strict replies and outcomes
 
@@ -303,7 +345,7 @@ Together now uses the documented realtime endpoint and JSON/base64 messages rath
 ## Validation rules
 
 - `soft_silence_ms` must be less than `hard_silence_ms`.
-- Text rules are bounded and validated before session construction; invalid regexes and patterns matching empty input fail rather than silently disabling analysis. Hard-stop vocabulary is application-owned; the Korean sample omits "아니" without a core language-specific prohibition.
+- Text rules are bounded and validated before session construction; invalid regexes and patterns matching empty input fail rather than silently disabling analysis. Compatibility hard-stop vocabulary is application-owned; the core neither installs it implicitly nor prohibits a particular language's word.
 - Enabling `agents.speculative.enabled` requires a dedicated `spec`, a nonempty
   `allowed_tools` list, and `allow_pure_read: true`; every allowlisted tool must
   be `pure_read` in `tools.effects`.
@@ -323,12 +365,8 @@ them.
 
 With `framework` enabled and `agents.task.spec` present, runtime startup probes the spec and credentials; actual `RuntimeAgent` construction through `AgentBuilder` occurs separately for each session. Built-in development setups (`mock`/`inject` ASR plus `mock` TTS) use the explicit `speech.mock_reply` text on probe failure. Without it the mock reply is empty, which is rejected like any other empty reply (the user hears `speech.failure_text` if configured). Live built-in providers and injected providers fail strictly. An injected task spec without the `framework` feature is rejected rather than silently selecting the mock agent; omit the spec for an intentionally keyless injected setup.
 
-A new brain is created **for each session**. `RuntimeAgent` holds conversation memory, so sharing one would mix transcripts between clients. Only the host's tools, passed through `RuntimePolicies::with_task_tools` and `with_speculative_tools`, and the backend behind them are shared; the library ships no business tools.
-Interaction, Speculative, and Deep each create a **separate RuntimeAgent
-instance** because root turns on one runtime are serialized. Enabling
-Speculative requires a dedicated `spec`, a nonempty `allowed_tools` list, and
-`allow_pure_read: true`; every allowlisted tool must be declared `pure_read` in
-`tools.effects`.
+A new brain is created **for each session**. `RuntimeAgent` holds conversation memory, so sharing one would mix transcripts between clients. Host tool objects, passed through `RuntimePolicies::with_task_tools` and `with_speculative_tools`, and their backend are shared across sessions; the library ships no business tools. Shared speech factories and metrics are described in the [module reference](modules.md#per-session-vs-shared).
+Speculative and Deep use separate `RuntimeAgent` instances because root turns on one runtime are serialized. The configured semantic interpreter instead calls its selected LLM provider directly without conversation memory; an explicitly supplied legacy `RuntimeInteractionBrain` can still wrap a separate agent. Enabling Speculative requires a dedicated `spec`, a nonempty `allowed_tools` list, and `allow_pure_read: true`; every allowlisted tool must be declared `pure_read` in `tools.effects`.
 
 ## Task agent YAML contract
 

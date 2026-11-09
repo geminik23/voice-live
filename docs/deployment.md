@@ -21,7 +21,7 @@ cargo run -p browser-example -- --config examples/browser/configs/en/voice-runti
 # Open http://localhost:8080 → Start session
 ```
 
-`configs/en/` and `configs/ko/` are complete language sets: each holds the keyless `voice-runtime.yaml`, `voice-runtime.cartesia.yaml`, and the `restaurants.yaml` the demo reservation backend loads (`--restaurants <path>` overrides it). Both use the same language-neutral agent specs under `examples/browser/agents/`. For a library-only check without a browser, run `cargo run --example quickstart`.
+`configs/en/` and `configs/ko/` are complete language sets: each holds the keyless `voice-runtime.yaml`, `voice-runtime.cartesia.yaml`, and the `restaurants.yaml` the demo reservation backend loads (`--restaurants <path>` overrides it). Both use the same language-neutral agent specs under `examples/browser/agents/`. If `--config` is omitted, the browser executable selects `configs/ko/voice-runtime.yaml` under its own manifest directory; this example-program choice does not install Korean library defaults. For a library-only check without a browser, run `cargo run --example quickstart`.
 
 Paths are resolved as follows:
 
@@ -51,7 +51,7 @@ The web client sets `ws.binaryType = 'arraybuffer'` and decodes the `ArrayBuffer
 1. From the repository root, run the `cargo run -p browser-example -- --config ...` command above. Without real keys configured, the sample uses inject ASR, mock TTS, a mock task agent, and neutral semantic fallback. If `OPENAI_API_KEY` is set, the task agent or the independently configured semantic provider can call a real LLM and transmit transcript/context text. Use a separate shell without the key for a key-free check.
 2. On the same computer, open `http://localhost:8080` in a browser, then open developer tools to **Console** and **Network → WS → `/api/voice/ws` → Messages/Frames**.
 3. Click **Start session** and allow microphone access. The example opens the microphone even when using only text injection. A remote browser not on `localhost` requires HTTPS/WSS.
-4. Type `예약하고 싶어요` into the text input at the bottom and click **Send**. Check that received frames include `speech_started`, binary PCM chunks, and `speech_done` in that order. After playback ends, check sent frames for `playback_chunk_completed` and `playback_completed`. The Console should have no `TypeError`. Mock TTS is silent, so the chunks play without audible speech.
+4. Type `I'd like to book a table.` into the text input at the bottom and click **Send**. Check that received frames include `speech_started`, binary PCM chunks, and `speech_done` in that order. After playback ends, check sent frames for `playback_chunk_completed` and `playback_completed`. The Console should have no `TypeError`. Mock TTS is silent, so the chunks play without audible speech.
 5. If this fails, check Console errors, WS frames, `provider_error` in the server logs, and `target/voice-traces/<date>/<session>/events.jsonl`. Stop the test with Ctrl+C in the server terminal.
 
 This is a manual verification procedure, not a report of a completed run. Check real microphone input, device-specific sample rates, output devices, and barge-in separately for each OS/browser combination. Running the server on one OS does not validate browsers on other operating systems.
@@ -87,14 +87,17 @@ agents:
   interaction:
     enabled: true    # Semantic interpretation uses the configured model
   task:
-    spec: ../agents/reservation.yaml
+    spec: ../../agents/reservation.yaml
 ```
 
-First verify the provider adapters' wire fields with the paid contract tests:
+After approving provider access, external transmission, and charges, select the individual contracts for this Together/Qwen combination. The Together Korean STT contract additionally requires a consented `VOICE_KOREAN_FIXTURE`; the Qwen TTS contract sends synthetic text and needs an approved voice, not an input WAV. These tests check their fixed Korean inputs, not every language supported by a provider:
 
-```bash
-cargo test --test provider_contracts -- --ignored
+```sh
+cargo test --locked --test provider_contracts together_nemotron_korean_contract -- --ignored --exact --nocapture
+cargo test --locked --test provider_contracts qwen_tts_korean_streaming_contract -- --ignored --exact --nocapture
 ```
+
+Do not run the entire ignored suite to check one provider combination. In particular, the [English Cartesia contracts](testing.md#english-provider-only-validation) have a separate TTS-then-STT fixture dependency.
 
 For an unverified provider combination, start diagnosis with the `provider_error` events in the logs and `target/voice-traces/<date>/<session>/events.jsonl`.
 
@@ -112,7 +115,7 @@ A built-in network provider also needs an explicit `asr.locale` or `tts.language
 
 ## Cartesia streaming STT and TTS
 
-`examples/browser/configs/<language>/voice-runtime.cartesia.yaml` selects Cartesia Ink Whisper manual streaming STT and native Sonic TTS. The default configuration stays keyless. For typed-input TTS-only diagnosis, use `voice-runtime.cartesia-tts.yaml` instead; it deliberately keeps inject ASR.
+`examples/browser/configs/<language>/voice-runtime.cartesia.yaml` selects Cartesia Ink Whisper manual streaming STT and native Sonic TTS. The default configuration stays keyless. For typed-input TTS-only diagnosis, use `examples/browser/configs/ko/voice-runtime.cartesia-tts.yaml` instead; this Korean diagnostic configuration deliberately keeps inject ASR.
 
 Set `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID`, and `OPENAI_API_KEY` in your server environment, then run:
 
@@ -124,7 +127,9 @@ For Bash/Zsh/Git Bash, use `export CARTESIA_API_KEY=...` and `export CARTESIA_VO
 
 The Cartesia configs explicitly select `ink-whisper`, 16 kHz mono `pcm_s16le`, locale `ko-KR` or `en-US` (sent as the primary code `ko` or `en`), and `manual_commit: true`; local VAD enqueues finalizes without pausing PCM for acknowledgements. TTS selects `sonic-3.6`, raw mono PCM16 at 24 kHz, `ko` or `en`, and zero managed text buffering delay. Both use API version `2026-08-14`. Premade warmup is disabled; enabling it can incur synthesis costs at startup. STT traffic may begin at browser session start, before a complete utterance. Microphone audio and conversation text leave the host and can incur Cartesia/OpenAI charges. Approve account/voice use, cost limits, fixture consent, and data transmission before running; zero-data-retention is not assumed for a standard account.
 
-Run the individual [ignored STT and TTS contracts](testing.md#cartesia-provider-regressions-and-paid-contracts) only after approval, then validate both providers in the browser. STT requires a consented Korean WAV through `VOICE_KOREAN_FIXTURE`; TTS requires an approved voice. The tests do not call the LLM. Socket upgrade is send-readiness, not proof of model/voice compatibility. Offline tests cover both adapters in one runtime. English TTS and STT have also passed the limited synthetic-input checks recorded in [testing](testing.md#english-provider-only-validation). Korean provider checks, browser/microphone behavior, naturalness, and the broader silence/overlap/cancellation cases remain unverified. In particular, FIFO transcript/flush attribution is an explicit assumption to verify, not an established vendor guarantee. See [STT boundaries and limits](configuration.md#cartesia-stt) and [TTS continuations](configuration.md#cartesia-tts).
+Run individual [ignored STT and TTS contracts](testing.md#cartesia-provider-regressions-and-paid-contracts) only after approval, then validate the chosen combination in the browser. Korean STT requires a consented WAV through `VOICE_KOREAN_FIXTURE`; English STT reuses the WAV generated by the English TTS contract, which must run first. TTS requires an approved voice, not an input recording. These contracts do not call the LLM. Socket upgrade is send-readiness, not proof of model/voice compatibility.
+
+Offline tests cover both adapters in one runtime. Dated evidence includes the [English provider-only checks](testing.md#english-provider-only-validation), Korean microphone/speaker conversation on Windows Edge, and synthetic-input English conversation checks described in [platform validation](testing.md#evidence-available-so-far). These observations do not establish arbitrary language/voice quality, other devices or deployments, long-running stability, or all silence/overlap/cancellation cases. They also do not establish execution of the two named Korean ignored contracts. FIFO transcript/flush attribution remains an integration assumption, not a vendor guarantee. See [STT boundaries and limits](configuration.md#cartesia-stt) and [TTS continuations](configuration.md#cartesia-tts).
 
 ## Host-supplied speech providers
 
@@ -136,7 +141,7 @@ Together uses its documented `session.created` readiness and JSON/base64 PCM pro
 
 ## Host language and response policies
 
-Use `VoiceRuntime::build_with_policies(config, providers, RuntimePolicies)` to supply a pure shared `TextAnalyzer`, per-session slot-extractor factory, or trusted `SpeechRenderer`, and, with `framework`, the task and speculative tools (`with_task_tools`, `with_speculative_tools`). The library ships no business tools: a task spec that names a tool the host did not supply fails when the session's agent is built. `RuntimePolicies` is `#[non_exhaustive]`; build it from `RuntimePolicies::default()` and the `with_*` methods. Pass `None` for `providers` to retain built-in factories. Explicit host overrides take precedence; otherwise configured framework extraction and the declared fallback remain active. Direct sessions expose matching builder injection points and `try_build` validation. The library adds no locale negotiation or transport dependency.
+Use `VoiceRuntime::build_with_policies(config, providers, RuntimePolicies)` to supply a pure shared `TextAnalyzer`, per-session slot-extractor factory, or trusted `SpeechRenderer`, and, with `framework`, the task and speculative tools (`with_task_tools`, `with_speculative_tools`). The library ships no business tools: a task spec that names a tool the host did not supply fails when the session's agent is built. `RuntimePolicies` is `#[non_exhaustive]`; build it from `RuntimePolicies::default()` and the `with_*` methods. Pass `None` for `providers` to retain built-in factories. Explicit host overrides take precedence. Without a slot override, semantic mode uses model-proposed slot updates and does not install `slot_fallback`, even if the model is unavailable; compatibility mode uses the configured extractor or fallback. Direct sessions expose matching builder injection points and `try_build` validation. The library adds no locale negotiation or transport dependency.
 
 The browser example's task spec returns `{"text", "outcome", "question"}` replies for a bounded reservation example. All example agent specs use `gpt-5.4-mini`. The task spec gives the model the server-local date each turn through an ai-agents `builtin` `datetime` context, so relative dates such as "tomorrow" resolve correctly; it also tells the model to read only the last four characters of a confirmation ID, which the demo reservation tool returns as `confirmation_suffix` so the model does not cut them itself. Once the agent has asked whether to book one option and the user agrees, the spec books it instead of asking a second time; it asks only for a detail that is still missing, such as the name. It books only a restaurant and time that a search returned, and it never promises to check or come back later, because nothing runs after a reply until the user speaks again. When it repeats a result from an earlier turn without calling the tool again, it names no outcome; naming one would fail the outcome check and replace the repeat with the failure text. Its state transitions use ai-agents `timing: parallel`: the transition is judged beside the reply instead of after it, so a turn without a transition costs one model call. The judge sees only the current user message and the runtime context, not the conversation history, so slots given over several turns may keep the agent in an earlier state. The executing-to-completed transition depends on the tool result and still runs after the reply, and the `completed` state does not regenerate the reply. Only the `executing` state may call `reserve_restaurant`; the other states list `tools: [search_availability]`. Without this limit, live English runs sometimes booked without a name, which failed the write and replaced the reply with the failure text, or booked a second time after the booking had finished. With it, a finished booking is acknowledged as already booked. In a live check, turns took about 1–5 s with this layout; with transitions judged after the reply they took about 2–9 s, and 3 of 9 turns ended with an empty reply after two chained transitions. Another spec can return plain text, which is spoken unchecked; it needs its own `speech.outcomes` rules and `tools.effects` declarations before it can report business outcomes. Changing `tts.language` changes the `speech_language` the task agent is asked to reply in, but not the automatic resources (backchannel, stop acknowledgement, failure, progress), `asr.locale`, or any grammar; set those together. With `tts.language` unset, the brief has no `speech_language` and the shipped spec tells the agent to reply in the user's language. A custom framework agent using `VoiceAgentHooks` must register tools through `hooks.bind_tool`; unbound results cannot authorize strict business speech. The adapter uses a stable session actor and an immutable per-turn sender token for execution provenance, not as user authentication.
 
@@ -153,19 +158,19 @@ The browser example's task spec returns `{"text", "outcome", "question"}` replie
 | `CARTESIA_VOICE_ID` | Approved Cartesia voice; selected by `tts.voice_env` when `tts.voice` is empty | - |
 | `OPENAI_API_KEY` | Task/Interaction LLM | - |
 | `VOICE_WEB_DIR` | Override the browser example's client directory | `examples/browser/web` |
-| `VOICE_KOREAN_FIXTURE` | Together/Cartesia STT contracts: consented 16 kHz mono PCM16 WAV; the Cartesia contract sends a fixture of at most 15 seconds twice. The server does not read it | - |
+| `VOICE_KOREAN_FIXTURE` | Korean Together/Cartesia STT contracts only: consented 16 kHz mono PCM16 WAV; the Cartesia contract sends a fixture of at most 15 seconds twice. English contracts generate their own WAV; the server does not read this variable | - |
 
 All keys remain in the Rust gateway and are not sent to the browser.
 
 ## Observability
 
 - **JSONL event log**: `target/voice-traces/<date>/<session_id>/events.jsonl`
-  - Records every partial revision, commit, tool lifecycle event, TTS chunk, and playback ACK.
+  - Records partial revisions, commits, tool lifecycle events, TTS chunks, and playback ACKs on a best-effort basis. The bounded trace channel can drop events when full, so a missing log entry is not proof that an event never happened.
   - By default, redacts transcript text, agent replies, and tool results (which can carry customer data such as a reservation name), retaining only character counts. Tool names and success flags are kept; tool arguments are never logged.
   - Stores original text, tool results, and SessionClosed text only when `include_sensitive_payloads: true`.
   - Error messages (`agent_failed`, `provider_error`, and the matching `tracing` warnings) are logged as produced, because they are needed for operation. Tools and providers should not put customer data in error text.
-  - The writer drains the event channel until it closes, recording the final SessionClosed event.
-- **Metrics**: `Metrics` counters and latency series (P50/P95/P99) are recorded within each session under `voice_*` names.
+  - The writer drains successfully queued events until the channel closes, including SessionClosed if admitted; this is not a complete audit trail.
+- **Metrics**: a `VoiceRuntime` instance shares one registry of `voice_*` counters and latency series (P50/P95/P99) across its sessions. Hosts can inspect `runtime.metrics().snapshot()` and provide their own logging or exporter. The browser example does not automatically write snapshots to JSONL or expose a metrics endpoint; directly composed sessions can use a separately injected registry.
 - When the browser WebSocket disconnects, the session supervisor is canceled and all tasks and TTS are cleaned up.
 - When the ASR socket disconnects, a `provider_error` and internal `asr_stream_reset` are logged and reconnection uses exponential backoff from 250 ms to 8 s. Reconnect is fresh: pending PCM is discarded and audio during the disconnected interval may be lost; no lossless replay is claimed. Authentication/config rejections stop the recognizer without infinite retries, while enabled text injection remains usable.
 - ASR input saturation reports `voice_asr_input_overflow_total`; client or supervisor output saturation terminates the session rather than blocking VAD/control processing indefinitely. Built-in client output waits at most one second; external hosts still own the capacity and consumption of their channels.
@@ -173,13 +178,15 @@ All keys remain in the Rust gateway and are not sent to the browser.
 
 ## Multiple sessions
 
-A separate `RuntimeAgent` (task/speculative/interaction/deep) is created for each session. Conversation memory does not mix across clients, and root turns do not block each other, but session creation includes the cost of building agents. Only the host's tools, and whatever backend they wrap, are shared across the process; in the browser example that is the demo reservation store.
+Task, speculative, and deep agents use separate per-session `RuntimeAgent` instances when enabled; an explicit legacy interaction brain can also wrap its own agent. The configured semantic interpreter instead makes direct LLM-provider calls without conversation memory. Conversation memory does not mix across clients, and root turns do not block each other, but session creation includes agent/provider setup. Host tool objects and their backend are shared across sessions; in the browser example that backend is the reservation store. Metrics are also shared within each `VoiceRuntime` instance.
 
 ## What to watch in production event logs
 
+The counter names below refer to host-exported metrics snapshots, not automatic JSONL log records. Correlate them with the best-effort event trace and diagnostic logs.
+
 ```text
 voice_user_turn_committed_total     Frequency of valid commits
-voice_claim_rejected_total          Speech rejected for insufficient evidence (should be near 0)
+voice_claim_rejected_total          Rejected reply/claim admissions; does not count unchecked outcome-free claims
 voice_task_stale_result_dropped_total  Results dropped after correction (intentional)
 voice_self_echo_suppressed_total    Self-echo defenses triggered
 voice_tts_failed_total               TTS failures (should be 0; the queue recovers automatically)
@@ -189,12 +196,14 @@ voice_playback_ack_timeout_total     Missing playback ACKs (indicates client con
 voice_backchannel_emitted_total      Proactive backchannels spoken
 voice_deep_work_started_total        Host-initiated deep-work requests
 voice_turn_resolved_total            Turns settled in memory using the heard result
-voice_turn_heard_partially_total     Resolved turns heard only partially (interrupted, unplayed, or claim rejected)
+voice_turn_heard_partially_total     Audible resolutions whose heard text differs from the original agent Final
 voice_turn_discarded_total           Turns rolled back from memory (stale, failed, or superseded)
 voice_task_superseded_total          Turns canceled when the next turn commits during inference
 voice_semantic_timeout_total         Semantic interpretation requests that missed agents.interaction.timeout_ms
 ```
 
+`voice_turn_heard_partially_total` compares rendered heard text with the exact original Final. Fully played JSON replies, and even plain-text whitespace normalization, can increment it. It is not a standalone partial-playback or interruption-rate metric.
+
 Watch logs for `semantic interpretation unavailable` or `timed out` (turns fall back to neutral timing), `reply not found in memory` (memory retains the generated reply) and `previous turn was never resolved` (missing resolution, a bug signal; recovery occurs after 10 seconds).
 
-The `voice_false_interrupt` family of metrics is measured through scenario replay. For live sessions, observe it indirectly via the ratio of `playback_abort` to `user_turn_committed`.
+There is no built-in false-interruption metric. Use scenario expectations and inspect live speech-abort events alongside committed user turns; their ratio alone cannot distinguish intentional interruptions from incorrect classification.

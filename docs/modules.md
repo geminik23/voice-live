@@ -66,7 +66,7 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | `mod.rs` | `CognitiveAgent`/`AgentTurnStream` traits - boundary separating the runtime from the framework. `AgentTurnRequest` separates `input` (only committed utterances) from `context: TurnContext` (turn environment for the system prompt). `resolve_turn(task_id, TurnResolution::{Audible, Discard})` reconciles turn memory |
 | `mock.rs` | `FakeAgent` (scripted; `AgentRecorder` records received requests and resolutions) |
 | `proof.rs` | Framework-only `VoiceAgentHooks` and bound host tools (the hooks remember bound IDs so the adapter drops the SDK stream's duplicate completion; the hook's completion carries the bounded output); immutable SDK execution-scope origin, retry-safe turn tokens, bounded terminal proof projection, and no current-turn reassignment; canonical terminal retirement is independent of optional SDK stream chunks |
-| `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, `RuntimeSemanticBrain` (logs the first failure of a streak and its recovery), `RuntimeInteractionBrain` (legacy), stateless `RuntimeSemanticBrain`, `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*`. The slot extractor rejects a whole malformed response or a response over 16384 bytes, limits updates to 32 and slot names to 128 bytes, accepts only `set`, `replace`, and `clear`, and checks confidence in 0–1. As before, `old_value: null` is represented as a present JSON null |
+| `framework.rs` | `AiAgentsCognitiveAgent`. `with_turn_memory` serializes turns with host-owned memory, savepoints, and reconciliation; `new` leaves memory to the framework (for speculative work). `apply_resolution` (restore savepoint / replace that turn's reply text), `conversation_memory_for_spec` (honors YAML `memory.max_messages`), `VOICE_CONTEXT_KEY`, `VoiceAgentHooks`, stateless `RuntimeSemanticBrain` (direct provider calls, logging the first failure of a streak and its recovery), `RuntimeInteractionBrain` (legacy agent-backed decisions), `RuntimeSlotExtractor`, `RuntimeDeepWorker`, `build_runtime_agent*`. The slot extractor rejects a whole malformed response or a response over 16384 bytes, limits updates to 32 and slot names to 128 bytes, accepts only `set`, `replace`, and `clear`, and checks confidence in 0–1. As before, `old_value: null` is represented as a present JSON null |
 
 ## asr/ tts/
 
@@ -99,11 +99,12 @@ Module layout of `.`. The `framework` feature (enabled by default) pulls in the 
 | Resource | Scope | Reason |
 |---|---|---|
 | `StreamingAsr` / `StreamingTts` | Shared | Only factories; each session receives its own stream through `open`/`synthesize` |
-| `RuntimeAgent` (task/speculative/interaction/deep) | **Per session** | Holds conversation memory and serializes root turns per runtime |
+| `RuntimeAgent` (task/speculative/deep; explicit legacy interaction) | **Per session** | Holds conversation memory and serializes root turns per runtime |
+| Configured semantic interaction brain | **Per session** | Direct LLM inference from the current snapshot, without conversation memory |
 | Task agent conversation memory | **Per session, owned by voice-live** | To reconcile replies with what was heard and roll back turns |
 | `InjectionQueue` | **Per session** | One client's input must not become another client's transcript |
 | Host tools (`RuntimePolicies` task and speculative tools) | Shared | Model an external system; the browser example's reservation backend in `examples/browser/src/reservation.rs` is one such host tool set |
-| `Metrics` | Shared | Process-wide observability |
+| `Metrics` | Shared by sessions of one `VoiceRuntime` | Runtime-instance counters and latency series; direct session composition can inject its own registry |
 
 ## Transport boundary
 
@@ -122,5 +123,5 @@ The library has no web framework dependency. The runtime exposes only a pair of 
   media.rs     binary frame format
 ```
 
-Switching to WebRTC requires replacing only `examples/browser/src/gateway.rs`.
+Migrating the shipped example to WebRTC requires adapting both `examples/browser/src/gateway.rs` and the browser client while preserving or adapting PCM framing, control messages, and playback acknowledgements. The library can retain its channel boundary; a DataChannel bridge can preserve the existing PCM contract without requiring a codec change.
 **Adding a web dependency to the root `Cargo.toml` is an architectural regression.**

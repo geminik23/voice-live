@@ -284,8 +284,8 @@ pub struct TtsConfig {
     pub sample_rate_hz: u32,
     #[serde(default = "default_tts_chunk_ms")]
     pub chunk_ms: u64,
-    /// Language sent with synthesis and premade warmup requests. The default
-    /// keeps the existing Korean-focused behaviour.
+    /// Language sent with synthesis and premade warmup requests, and supplied to the task agent as its reply language.
+    /// Empty by default; built-in network TTS providers require an explicit value.
     #[serde(default = "default_tts_language")]
     pub language: String,
     /// Deadline for one text-session connect/auth/ready attempt.

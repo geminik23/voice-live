@@ -1,17 +1,13 @@
 # WebSocket protocol
 
-Transport contract between the browser client (`examples/browser/web/index.html`)
-and the Rust gateway.
+Transport contract between the browser client (`examples/browser/web/index.html`) and the Rust gateway.
 
-The message types live in the library (`src/protocol.rs`), while the WebSocket
-adapter lives in the browser example (`examples/browser/src/gateway.rs`). The library is
-transport-agnostic.
+The message types live in the library (`src/protocol.rs`), while the WebSocket adapter lives in the browser example (`examples/browser/src/gateway.rs`). The library is transport-agnostic.
 
 ## Overview
 
 - Endpoint: `GET /api/voice/ws` (WebSocket upgrade)
-- Static files: `/` → `AppState::web_dir` (the demo resolves this relative to the
-  config file; `VOICE_WEB_DIR` can override it)
+- Static files: `/` → `AppState::web_dir`. The browser example defaults to `web/` under its compile-time `CARGO_MANIFEST_DIR`, independently of the config file's location. `VOICE_WEB_DIR` overrides it; a relative override is resolved against the process working directory.
 - Audio input: the microphone's **actual** sample rate, 20 ms frames, mono
 - Audio output: mono PCM16 at the response's actual `speech_started.sample_rate` (built-in default 24 kHz)
 - All API keys stay on the server and are never sent to the browser.

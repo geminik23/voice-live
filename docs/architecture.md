@@ -210,13 +210,14 @@ Rejected speech is recorded in the `voice_claim_rejected_total` metric and settl
 
 ```text
 VAD onset → immediate Duck (gain 0.15, fade 60ms, preserve buffer)
-          → wait confirm_ms(240ms)
-          → classify:
-              backchannel      → ResumeAgent (discard partial)
+          → after speech ends, wait at least confirm_ms (default 240ms)
+          → use a semantic assessment or explicit compatibility analysis:
+              backchannel      → ResumeAgent (discard candidate)
               empty/echo       → ResumeAgent
               correction       → Abort + applicable slot updates
-              other            → Abort (SemanticInterruption)
-explicit hard stop → immediate Abort; speak an ACK only when configured;
+              interruption     → Abort (SemanticInterruption)
+              unknown          → bounded wait, then conservative Abort
+accepted hard stop → Abort; speak an ACK only when configured;
                      the stop words are consumed and never become a task turn
 ```
 
@@ -230,7 +231,7 @@ A classified backchannel or empty overlap resumes playback; a genuine interrupti
 | `AfterClause` | Already satisfied because acts are split by clause: do not start the next clause |
 | `Never` | Let the currently playing act finish; clear only the queued acts behind it (`voice_abort_deferred_total`) |
 
-However, **a hard stop takes precedence over `Never`**. Continuing to speak after the user explicitly says “그만” is a trap, not a feature.
+However, **an accepted hard stop takes precedence over `Never`**. Semantic stop recognition can take model time; this priority rule does not make a spoken keyword an instantaneous control command.
 
 The sample does not install language-specific hard-stop words. An explicitly configured compatibility analyzer may still use application-owned vocabulary; core validation does not prohibit a particular language's word.
 
@@ -238,17 +239,21 @@ The sample does not install language-specific hard-stop words. An explicitly con
 
 With semantic interaction enabled, one asynchronous request interprets a bounded current candidate and confirmed-heard context. At most one request is in flight; changes are coalesced into the latest next request. The session retains immediate VAD duck, explicit stop, playback, and hard-silence control. A recognized stop is delivered independently of a slow host slot extractor. During overlap the session waits for a bounded semantic result, resumes for backchannels, and otherwise aborts conservatively after at most two configured interaction timeouts. Empty overlap resumes without waiting for a model. If the model is unavailable or its response is invalid, no language heuristic is silently installed.
 
-An explicit host `TextAnalyzer` or legacy decision brain selects the compatibility path. There, the synchronous analyzer supplies advisory cues while the deterministic reflex policy owns timing and state decisions. Question hints come only from a reply's `question` field. The following examples describe explicitly selected Korean compatibility resources, not the shipped semantic sample or library defaults.
+An explicit host `TextAnalyzer` or legacy decision brain selects the compatibility path. There, the synchronous analyzer supplies advisory cues while the deterministic reflex policy owns timing and state decisions. Question hints come only from a reply's `question` field.
 
-- **Incomplete ending** (ends as-is): `-는데/-고/-면/-다가/그게/...` → KeepListening even past soft silence (prevents premature commit)
+### Explicit Korean compatibility example
+
+`TurnControlConfig::korean_example()` and `slot_fallback: korean_example` remain available as opt-in compatibility resources, including for deterministic regression tests. They are not the library defaults or the shipped browser examples' semantic interpretation path. Language-specific spoken text is configured separately under `speech`; selecting the turn-control helper alone does not install it. With the corresponding Korean resources configured, examples include:
+
+- **Incomplete ending**: configured suffixes such as `는데`, `하고`, `다가`, `그게`, or `...` → KeepListening past soft silence, until the hard-silence safety boundary
 - **Complete ending**: `-해 주세요/-할게요/-인가요?/-됩니다/-해줘`, etc. → commit at soft silence (500ms)
 - **“네” after a question**: if `assistant_asked_question`, treat it as an answer and commit immediately at the minimum answer silence (320ms)
 - **“네” during an explanation**: backchannel → duck, then resume; discard the partial
 - Hard silence (1100ms) always commits as a safety net
 
-`ReflexPolicy::classify_overlap` alone classifies overlap (backchannel / hard stop / correction / self-echo / unknown). `decide_on_tick` only turns that result into an action; it does not reclassify it.
+On the compatibility path, `ReflexPolicy::classify_overlap` classifies overlap (backchannel / hard stop / correction / self-echo / unknown). `decide_on_tick` turns that result into an action; it does not reclassify it. The semantic path instead uses the model's current validated assessment.
 
-### Invocation proof ownership
+## Invocation proof ownership
 
 The framework adapter supplies a fresh turn-scoped sender token using the published SDK actor-context API, while retaining a stable effective actor identity per adapter/session. `VoiceAgentHooks::bind_tool` reads the immutable sender from the executor context; it never infers turn ownership from arguments or the currently active turn when a record arrives. Built-in registered tools are wrapped automatically. Hosts constructing their own framework agent must bind their tools explicitly; unbound/MCP or otherwise uncorrelated outcomes remain unproven.
 
@@ -260,9 +265,11 @@ At most 128 origins and 128 total execution keys are retained per adapter, and 1
 
 Cancellation, timeout, or stream Drop may happen after an external effect but before its receipt is observed. Missing proof means unknown/unproven, not nonexecution or backend rollback. Conversation savepoint rollback does not undo an external effect and is not evidence that retry is safe. No automatic recovery/re-execution is added.
 
-### Proactive backchannel
+## Proactive backchannel
 
-When the assistant is silent, the user has **paused** (`floor == UserPausing`, mic closed), the candidate sentence ends incompletely, and silence is between the soft and hard thresholds, the assistant says “네” first. It is limited to `maximum_per_user_turn` times per turn with a `minimum_interval_ms` spacing.
+The semantic path can enqueue a backchannel when a current assessment reports `Incomplete` and silence has reached the soft threshold but not the hard-silence commit. The compatibility path checks configured incomplete endings while the assistant is silent and the user has paused (`floor == UserPausing`, mic closed).
+
+Both paths use `speech.backchannel_text`, not an implicit word: for example, the Korean browser configuration supplies “네” and the English one supplies “Mm-hm.” An empty text or disabled backchannel setting suppresses the act. Emission is limited by `maximum_per_user_turn` and `minimum_interval_ms`.
 
 Semantic requests are triggered by meaningful candidate or context changes, including final and injected text, not by every audio frame or control tick. `minimum_interval_ms` limits request starts; `timeout_ms` bounds each request; a timed-out request counts in `voice_semantic_timeout_total`, and the first timeout and the first provider failure of a streak are logged. Without an available semantic model, the configured semantic path retains neutral timing and does not fall back to the Korean example.
 
@@ -327,7 +334,7 @@ Decimation phase is computed from the **absolute stream index**. Using chunk-rel
 2. Do not stack partial requests on the same RuntimeAgent.
 3. Keep Transcript / Action / Audible commits separate.
 4. Never speak results from a different epoch.
-5. Never speak a claim without evidence.
+5. Require validated execution evidence for factual or transactional reply clauses; outcome-free reply text is not content-verified.
 6. Start barge-in with duck; abort only after confirmation.
 7. `Ok(None)` from `AsrSession::next_event` means "closed," not "no event right now."
 8. Do not share Task/Interaction brains across sessions.

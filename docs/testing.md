@@ -48,7 +48,17 @@ cargo test -p browser-example --test gateway_e2e
 
 ```
 
-Paid provider checks require API keys and a consented Korean 16 kHz mono PCM16 WAV file, and may incur charges. Set the fixture path for the host you are using.
+Paid provider contracts are ignored by default and must be selected individually after approving credentials, external transmission, and charges. Their input requirements differ:
+
+| Contract | Credentials and input |
+|---|---|
+| `together_nemotron_korean_contract` | Together key and a consented Korean 16 kHz mono PCM16 WAV through `VOICE_KOREAN_FIXTURE` |
+| `cartesia_stt_korean_streaming_contract` | Cartesia key and the consented Korean WAV described below |
+| `qwen_tts_korean_streaming_contract` | DashScope key and approved Qwen voice; sends synthetic Korean text, no input WAV |
+| `cartesia_tts_korean_streaming_contract` | Cartesia key and approved voice; sends synthetic Korean text, no input WAV |
+| English Cartesia TTS, then STT | Cartesia key and approved voice; TTS generates the WAV that STT reads, without `VOICE_KOREAN_FIXTURE` |
+
+For a Korean STT contract only, set the fixture path for the host you are using.
 
 Bash, Zsh, or Git Bash:
 
@@ -62,11 +72,13 @@ Windows PowerShell:
 $env:VOICE_KOREAN_FIXTURE = "C:/audio/korean-16k-mono.wav"
 ```
 
-After setting the environment variable, run:
+For example, after setting the fixture and approving Together usage, run only its named contract:
 
 ```sh
-cargo test --test provider_contracts -- --ignored
+cargo test --locked --test provider_contracts together_nemotron_korean_contract -- --ignored --exact --nocapture
 ```
+
+Cartesia-specific commands follow below. Do not use a blanket `--ignored` command to check one provider: it selects unrelated paid contracts and does not arrange English TTS before English STT. On a fresh checkout the English STT fixture does not exist until the TTS contract succeeds; a stale local fixture is not the output of the current run.
 
 ## Language-neutral policy and strict speech regressions
 
@@ -99,16 +111,16 @@ Paid contracts are still ignored by default. They use actual outer timeouts acro
 The ignored test `cartesia_tts_korean_streaming_contract` requires `CARTESIA_API_KEY` and an approved `CARTESIA_VOICE_ID`. It sends two synthetic Korean text fragments, requires valid first audio before finish, drains a normal terminal, and bounds open/request/cleanup. It does not use the LLM or `VOICE_KOREAN_FIXTURE`. Run only after account, cost, and external-transmission approval:
 
 ```sh
-cargo test --locked --test provider_contracts cartesia_tts_korean_streaming_contract -- --ignored --nocapture
+cargo test --locked --test provider_contracts cartesia_tts_korean_streaming_contract -- --ignored --exact --nocapture
 ```
 
 The ignored `cartesia_stt_korean_streaming_contract` requires `CARTESIA_API_KEY` and `VOICE_KOREAN_FIXTURE`, a consented mono 16 kHz signed PCM16 Korean WAV of at most 15 seconds. It transmits the fixture twice at real-time pace, continues PCM while flushes are pending, and requires two nonempty ordered utterance Finals, normal done/closure, and a nonempty partial before the first finalize admission. It reports first-partial/total elapsed time on the host's monotonic clock, not mixed client/server clocks. A failure of the pre-finalize partial requirement means the selected model/fixture has not established streaming UX; it must be investigated, not silently waived or replaced with another model.
 
 ```sh
-cargo test --locked --test provider_contracts cartesia_stt_korean_streaming_contract -- --ignored --nocapture
+cargo test --locked --test provider_contracts cartesia_stt_korean_streaming_contract -- --ignored --exact --nocapture
 ```
 
-The two Korean contracts compile in the default suite but remain ignored and have not been run against Cartesia. The adapter's FIFO association of finalizes and `flush_done` is an explicit integration assumption; fake-server success and even a finite live fixture run do not establish all vendor silence/overlap semantics. Inspect repeated utterances, silence auto-finalization, empty flushes, first-partial cadence/latency, and boundary attribution during subsequent live validation. PCM validity is not evidence that natural speech sounds correct; listening, real microphone input, physical interruption, actual LLM heard-memory, and browser playback need separate checks.
+The two named Korean contracts compile in the default suite but remain ignored; no endpoint run of either named test is recorded here. Separate Korean browser conversation observations below do not establish that these contracts ran. The adapter's FIFO association of finalizes and `flush_done` is an explicit integration assumption; fake-server success and even a finite live fixture run do not establish all vendor silence/overlap semantics. Inspect repeated utterances, silence auto-finalization, empty flushes, first-partial cadence/latency, and boundary attribution for each intended combination. PCM validity alone does not verify naturalness, physical playback, or model interpretation; see the distinct [dated conversation evidence](#evidence-available-so-far).
 
 ### English provider-only validation
 
@@ -134,7 +146,7 @@ On 2026-10-18 UTC, the English tests passed against Cartesia after explicitly en
 
 Synthetic input was: `This is a streaming speech test. Please check the appointment for Monday at ten.` Both recognized Finals were: `This is a streaming speech test. Please check the appointment for Monday at 10.` Leading provider whitespace is omitted here for display. These are individual observations, not latency percentiles; they exclude socket establishment from the first-audio/first-partial measurements. Actual billed amounts were not queried.
 
-This verifies the limited English provider flow, not the Korean contracts, physical microphone or speaker behavior, naturalness, browser E2E, English agent prompts/turn-taking, or every silence/overlap/FIFO case. English provider normalization does not change the Korean demo defaults or establish multilingual runtime validation.
+That 2026-10-18 run verifies the limited English provider flow, not the Korean contracts, physical microphone or speaker behavior, naturalness, browser E2E, English agent prompts/turn-taking, or every silence/overlap/FIFO case. It does not change application language settings or establish quality across languages. Later conversation checks are recorded separately below.
 
 ## Platform validation
 
@@ -161,9 +173,22 @@ The test applies `node --check` to the actual inline script in `examples/browser
 
 ### Evidence available so far
 
-The automated checks below ran locally on Windows; a user additionally reported the Windows Edge browser check on 2026-09-29. A subsequent Windows GitHub Actions lint run using Rust 1.98 reported `chunks_exact_to_as_chunks` as an error under `-D warnings`. The PCM decoder now uses `as_chunks::<2>()` without suppressing the lint. Local workspace Clippy passed with Rust 1.93.1 and 1.97.0 after this change; Rust 1.98 and the complete three-OS CI matrix still require a rerun.
+These are dated observations from earlier validation runs, not a statement that the current checkout or CI matrix has just been rerun. Supported targets, automatic test results, synthetic-input conversations, and physical microphone/speaker checks are different evidence.
 
-| Environment | Evidence available | Not yet verified |
+| Date | Scope | Recorded evidence | Limits |
+|---|---|---|---|
+| 2026-11-07 | Windows Edge, Korean Cartesia STT/TTS and OpenAI | Physical microphone/speaker reservation conversation, interruption and stop rechecks, and heard-memory observations | Several-second reply latency; short Korean replies such as “네” and “응” were still missed |
+| 2026-11-07 | Repeated conversations and operation checks | Synthetic-input conversation, injected STT/TTS/LLM failures, session isolation, and user checks of two tabs and refresh | Long-running checks, HTTPS, other OS/browser combinations, and CI were not included |
+| 2026-11-08 | Browser example release preparation | Synthetic-input English and Korean reservation conversations with Cartesia and OpenAI after the example/spec changes | Not a physical English microphone/speaker check or a broad language/voice-quality evaluation |
+| 2026-11-08 | Local automatic release-preparation checks | Formatting, workspace/core Clippy and tests, Node playback tests, documentation build, and publish dry-run were recorded passing | Paid contracts remained ignored in the normal suite; the complete three-OS CI matrix was not checked in that run |
+
+Physical Windows audio is therefore no longer wholly unverified, but none of these records establishes a new current-revision run, other native targets, every provider boundary case, or the two named Korean Cartesia ignored contracts. Long-running stability and HTTPS deployment still need separate evidence.
+
+#### Earlier automated checks
+
+The following preserves the earlier Windows report and its then-unverified items; its test counts and remaining checks are historical, not the latest totals or current physical-audio status. A user reported the Windows Edge browser check on 2026-09-29. A subsequent Windows GitHub Actions lint run using Rust 1.98 reported `chunks_exact_to_as_chunks` as an error under `-D warnings`. The PCM decoder now uses `as_chunks::<2>()` without suppressing the lint. Local workspace Clippy passed with Rust 1.93.1 and 1.97.0 after this change; that report left Rust 1.98 and the complete three-OS CI matrix for a rerun.
+
+| Environment | Evidence in the earlier report | Not verified in that report |
 |---|---|---|
 | Linux | Basic checks were reported passing in a previous environment | Rerun on the current revision; compatibility by distribution and target |
 | Windows `x86_64-pc-windows-msvc` | Basic checks passed with Rust 1.93.1: workspace 115 passed / 2 ignored; core 101 passed / 2 ignored. Script syntax and mock binary playback tests: 2 passed with Node 24. On 2026-09-29, a user reported Edge receiving `speech_started`, binary PCM and `speech_done`, sending both playback ACKs after text injection, with no Console errors; the browser reported 48 kHz capture and the server initialized 48 kHz → 16 kHz resampling | Rust 1.98 CI rerun and Node 20 results; microphone VAD/recognition, audible speech, other Windows targets and browsers |
@@ -209,7 +234,7 @@ timeline:
   - at_ms: 180
     event: { type: local_speech_ended }
 
-# FakeAgent script (times relative to the start of the turn)
+# FakeAgent script (sequential delays before each event; delays accumulate)
 agent_script:
   - after_ms: 100
     type: tool_started
@@ -226,7 +251,7 @@ agent_script:
     type: final
     text: "예약이 완료되었습니다."
 
-# Optional config overlay (merged with defaults)
+# Optional config (omitted fields take library defaults)
 config:
   tools:
     effects:
@@ -258,6 +283,10 @@ deep_work_summary: "..."      # Installs FakeDeepWorker when set
 deep_work_delay_ms: 200
 ```
 
+`timeline.at_ms` is an absolute offset from scenario start. In contrast, `agent_script.after_ms` is a sequential Tokio-time delay before that event is sent: `100, 200, 300, 400` gives approximately `100, 300, 600, 1000ms` from the script task's start, plus scheduling/channel delays. It is not a list of absolute turn-relative timestamps.
+
+`config` is deserialized as a complete `VoiceRuntimeConfig` with library defaults. In `run_with_config`, its sections replace the supplied base sections; it is not a recursive patch that preserves unspecified custom base values. The runner itself is neutral; Korean regression tests explicitly install their rules and spoken resources in their test harness.
+
 ### Turn-memory expectations
 
 Scenarios cannot inspect framework memory directly, so they check requests and resolutions recorded by `FakeAgent`. The resolution's `heard` text is what replaces the generated reply in memory. The fragment below is another catalogue of optional checks; select compatible conditions for a real scenario.
@@ -269,7 +298,7 @@ expect:
     heard_equals: "..."          # Optional
     heard_contains: "[voice-live:interrupted]"     # Optional
     heard_excludes: "가능합니다"   # Optional
-    heard_equals_final: false    # Optional; true means fully heard
+    heard_equals_final: false    # Optional; compares heard text with the exact original Final
   - type: turn_resolution_count
     exactly: 1
   - type: agent_input_equals     # User message for every main turn
@@ -277,6 +306,8 @@ expect:
   - type: agent_context_contains # Turn environment for every main turn
     text: "idempotency_key: voice-turn-"
 ```
+
+`heard_equals_final: true` requires exact string equality with the original agent Final; `false` requires inequality. This is not a format-independent playback-completeness assertion. A fully played `{"text":"Ready."}` has heard text `Ready.`, so it satisfies `false`; trimming and joining plain-text clauses can also produce a difference without interruption. Use explicit heard-text and lifecycle expectations for the behavior being tested.
 
 `tests/framework_memory.rs` uses `MockLLMProvider::call_history()` to verify what the model receives and what is stored in actual framework memory.
 
